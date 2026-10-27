@@ -12,6 +12,7 @@ export default defineConfig(() => {
       },
     },
     build: {
+      outDir: 'dist_dir',
       target: 'chrome108',
       rollupOptions: {
         input: {

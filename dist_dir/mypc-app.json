@@ -1,0 +1,18 @@
+{
+  "mypc": 1,
+  "id": "abyssal-evo",
+  "name": "Abyssal Evo",
+  "description": "3D AI Aquarium, TV Screensaver & Multi-Generation Fish Evolution Lab",
+  "type": "game",
+  "entry": "index.html",
+  "icon": "icon.svg",
+  "version": "1.0.0",
+  "scores": true,
+  "config": {
+    "allow_background_running": true,
+    "timeMultiplier": 1,
+    "defaultTankTier": 0,
+    "screensaverIdleSeconds": 90,
+    "startingCredits": 250
+  }
+}
