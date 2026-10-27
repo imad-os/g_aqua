@@ -1,0 +1,6 @@
+{
+  "name": "Abyssal Evo — 3D Aquarium & AI Evolution Lab",
+  "description": "A My PC 3D Aquarium game, multi-hour TV screensaver, and AI Fish Brain Trainer & Multi-Generation Evolution Lab.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
