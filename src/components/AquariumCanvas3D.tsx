@@ -1694,13 +1694,12 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       // Hide 3D cursor ring — food is sprinkled naturally on top of the water surface
       cursorGroup.visible = false;
 
-      // Sync Individual Sculpted 3D Fish Rigs
+      // Sync Individual Sculpted 3D Fish Rigs (Both Live Swimming Fishes & Dead / Starved Fishes)
       const activeIds = new Set<string>();
       let sampleTriCount = 0;
 
       for (let i = 0; i < eco.fishes.length; i++) {
         const fish = eco.fishes[i];
-        if (!fish.lineage.alive) continue;
         activeIds.add(fish.lineage.fishId);
 
         let rig = fishRigs.get(fish.lineage.fishId);
@@ -1737,9 +1736,53 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         }
 
         sampleTriCount = rig.triangleCount;
-
+        const fishSlice = getTankBoundsAtZ(tank, fish.state.z, isFramelessNow, camera.aspect);
         const scale =
           Math.max(0.55, fish.state.growthProgress) * fish.genetics.bodyScaleGene * 1.18;
+
+        if (!fish.lineage.alive) {
+          // DEAD FISH VISUAL: Float belly-up (roll = PI) near the top water surface with pale desaturated scales and motionless fins
+          const targetDeadY = fishSlice.surfaceY - 0.26 + Math.sin(elapsedTotal * 1.1 + i) * 0.03;
+          fish.state.y += (targetDeadY - fish.state.y) * Math.min(1, rawDt * 2.2);
+          fish.state.vx *= 0.92;
+          fish.state.vz *= 0.92;
+
+          rig.group.position.set(fish.state.x, fish.state.y, fish.state.z);
+          rig.group.scale.set(scale, scale, scale);
+          rig.group.rotation.set(0.06, fish.state.yaw, Math.PI, 'YXZ');
+
+          // Pale, desaturated gray-blue body & dim fins to clearly indicate death/starvation
+          rig.bodyMat.color.setHex(0x64748b);
+          rig.bodyMat.roughness = 0.75;
+          rig.finMat.emissiveIntensity = 0.02;
+          rig.finMat.opacity = 0.55;
+
+          // Zero out spine wave and fin rotations (motionless dead fish)
+          deformFishSpineSWave(rig, 0, 0);
+          rig.tailPeduncleGroup.rotation.y = 0;
+          rig.tailBladeMesh.rotation.y = 0;
+          rig.dorsalFinMesh.rotation.z = 0;
+          rig.analFinMesh.rotation.z = 0;
+          rig.pectoralLeftGroup.rotation.y = 0.15;
+          rig.pectoralLeftGroup.rotation.z = 0;
+          rig.pectoralRightGroup.rotation.y = -0.15;
+          rig.pectoralRightGroup.rotation.z = 0;
+          rig.gillLeftMesh.rotation.y = 0.18;
+          rig.gillRightMesh.rotation.y = -0.18;
+
+          rig.selectionRing.visible = selectedFishIdRef.current === fish.lineage.fishId;
+          rig.shadowDisc.position.set(fish.state.x, fishSlice.floorY + 0.04, fish.state.z);
+          rig.shadowDisc.scale.set(scale * 0.65, scale * 0.65, scale * 0.65);
+          continue;
+        }
+
+        // Restore live coloration if a fish was revived
+        _color.set('#ffffff');
+        _color.offsetHSL(fish.genetics.primaryHueShift / 360, 0, 0);
+        rig.bodyMat.color.copy(_color);
+        rig.bodyMat.roughness = 0.24;
+        rig.finMat.opacity = 0.92;
+
         rig.group.position.set(fish.state.x, fish.state.y, fish.state.z);
         rig.group.scale.set(scale, scale, scale);
         rig.group.rotation.set(
@@ -1776,18 +1819,16 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
           0.24 +
           Math.sin(elapsedTotal * 3 + i) * 0.16 * fish.genetics.luminancePulseGene;
 
-        // Real aquarium simulation: never draw sci-fi selection rings around individual fish
-        rig.selectionRing.visible = false;
+        rig.selectionRing.visible = selectedFishIdRef.current === fish.lineage.fishId;
 
         // Grounded contact shadow on the sloped frustum seabed at the fish's Z depth
-        const fishSlice = getTankBoundsAtZ(tank, fish.state.z, isFramelessNow, camera.aspect);
         rig.shadowDisc.position.set(fish.state.x, fishSlice.floorY + 0.04, fish.state.z);
         const heightAboveFloor = Math.max(0.1, fish.state.y - fishSlice.floorY);
         const shadowScale = Math.max(0.3, scale * (1.1 - heightAboveFloor * 0.05));
         rig.shadowDisc.scale.set(shadowScale, shadowScale, shadowScale);
       }
 
-      // Dispose rigs of deceased or removed fishes
+      // Dispose rigs of removed fishes
       for (const [id, rig] of fishRigs.entries()) {
         if (!activeIds.has(id)) {
           fishContainer.remove(rig.group);

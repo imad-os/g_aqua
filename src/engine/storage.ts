@@ -21,6 +21,7 @@ import {
 
 const ECOSYSTEM_SAVE_KEY = 'ecosystem_v2';
 const ACTIVE_LEASE_STORAGE_KEY = 'abyssal_evo_active_game_leases';
+const FORCE_OFFLINE_OVERRIDE_KEY = 'abyssal_evo_force_offline_override';
 
 export function createInitialEcosystemState(
   startingCredits = 250,
@@ -79,6 +80,7 @@ export function createInitialEcosystemState(
 
   return {
     version: 2,
+    lastSavedAtMs: Date.now(),
     simHoursTotal: 1.5,
     timeMultiplier,
     paused: false,
@@ -126,6 +128,103 @@ export function createInitialEcosystemState(
     modelRegistry,
     experiments: [],
   };
+}
+
+/**
+ * Resets all fishes, deceased archive, and aquarium population back to 2 fresh starter fishes
+ * while preserving 100% of trained Base Models (`modelRegistry`), edited Species properties (`speciesList`),
+ * Evolution rules, and Graphics settings.
+ */
+export function resetFishesKeepBaseModels(currentState: SavedEcosystemState): SavedEcosystemState {
+  const preservedSpeciesList = JSON.parse(JSON.stringify(currentState.speciesList || []));
+  const preservedModelRegistry: ModelVersionRecord[] = JSON.parse(
+    JSON.stringify(currentState.modelRegistry || [])
+  );
+  const preservedEvoConfig = JSON.parse(
+    JSON.stringify(currentState.evolutionConfig || DEFAULT_EVOLUTION_CONFIG)
+  );
+  const preservedGraphics = currentState.graphicsSettings
+    ? { ...currentState.graphicsSettings }
+    : {
+        fishPolygonQuality: 'high' as const,
+        environmentQuality: 'high' as const,
+        showCaustics: true,
+        showParticles: true,
+        antiAliasing: true,
+        framelessTvMode: true,
+        lightIntensity: 0.95,
+        backgroundBrightness: 0.22,
+      };
+  const preservedExperiments = JSON.parse(JSON.stringify(currentState.experiments || []));
+
+  const starterSpecies = preservedSpeciesList[0] || DEFAULT_SPECIES_LIST[0];
+  const promotedModel = preservedModelRegistry.find(
+    (m) => m.speciesId === starterSpecies.id && m.isPromotedBase
+  );
+
+  let customBrain = undefined;
+  if (promotedModel && promotedModel.weights?.length) {
+    const base = createBaseBrainInstance(promotedModel.brainConfig, Date.now() & 0xffff);
+    base.inheritedWeights = promotedModel.weights.map((w) => [...w]);
+    base.inheritedBiases = promotedModel.biases.map((b) => [...b]);
+    customBrain = base;
+  }
+
+  const starterTankTier = currentState.activeTankTier || 0;
+  const starterTank = TANK_TIERS[starterTankTier] || TANK_TIERS[0];
+
+  const freshFishes = [
+    spawnFoundingFish(starterSpecies, starterTankTier, 0, 0, customBrain),
+    spawnFoundingFish(starterSpecies, starterTankTier, 0, 1, customBrain),
+  ];
+
+  const nextState: SavedEcosystemState = {
+    version: 2,
+    lastSavedAtMs: Date.now(),
+    simHoursTotal: 1.5,
+    timeMultiplier: 1,
+    paused: false,
+    bioCredits: currentState.bioCredits ?? 250,
+    ownerLevel: currentState.ownerLevel || 1,
+    ownerXp: currentState.ownerXp ?? 20,
+    unlockedTankTiers: currentState.unlockedTankTiers?.length
+      ? [...currentState.unlockedTankTiers]
+      : [0],
+    activeTankTier: starterTankTier,
+    autoFeederCountByTank: {
+      ...(currentState.autoFeederCountByTank || {}),
+      [starterTank.id]: currentState.autoFeederCountByTank?.[starterTank.id] ?? 1,
+    },
+    graphicsSettings: preservedGraphics,
+    speciesList: preservedSpeciesList,
+    evolutionConfig: preservedEvoConfig,
+    fishes: freshFishes,
+    deceasedArchive: [],
+    generationHistory: [
+      {
+        generation: 1,
+        simHourReached: 1.5,
+        populationAlive: 2,
+        birthsCount: 2,
+        starvationDeaths: 0,
+        oldAgeDeaths: 0,
+        predationDeaths: 0,
+        avgSpeedGene: 1.0,
+        avgMetabolismGene: 1.0,
+        avgSensorRangeGene: 1.0,
+        avgStressToleranceGene: 1.0,
+        avgForagingEfficiency: 68.4,
+        avgHarmAvoidance: 64.2,
+        avgEnergyManagement: 70.1,
+        dominantMutations: ['FoundingInstinct'],
+      },
+    ],
+    modelRegistry: preservedModelRegistry,
+    experiments: preservedExperiments,
+  };
+
+  saveEcosystemState(nextState);
+  return nextState;
 }
 
 function normalizeLoadedEcosystem(parsed: SavedEcosystemState): SavedEcosystemState {
@@ -217,6 +316,7 @@ export function loadEcosystemState(): SavedEcosystemState {
 export function saveEcosystemState(state: SavedEcosystemState): void {
   const mypc = getMyPC();
   try {
+    state.lastSavedAtMs = Date.now();
     mypc.save(ECOSYSTEM_SAVE_KEY, state);
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(`mypc:abyssal-evo:${ECOSYSTEM_SAVE_KEY}`, JSON.stringify(state));
@@ -227,12 +327,42 @@ export function saveEcosystemState(state: SavedEcosystemState): void {
 }
 
 /**
+ * Allows the Trainer to force-simulate the owner closing the game (even if a game tab is open in background),
+ * or clear the override when the owner interacts with the game.
+ */
+export function setForceOfflineOverride(forceOffline: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    if (forceOffline) {
+      localStorage.setItem(FORCE_OFFLINE_OVERRIDE_KEY, '1');
+      localStorage.removeItem(ACTIVE_LEASE_STORAGE_KEY);
+    } else {
+      localStorage.removeItem(FORCE_OFFLINE_OVERRIDE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function isForceOfflineOverrideActive(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    return localStorage.getItem(FORCE_OFFLINE_OVERRIDE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Heartbeat lease management so the AI Trainer's Offline Fish Service knows which tanks/fishes
  * are currently being played with in `index.html` and NEVER interrupts their brain updates.
  */
 export function publishActiveGameSessionLease(tankId: string, active: boolean): void {
   if (typeof localStorage === 'undefined') return;
   try {
+    if (active && isForceOfflineOverrideActive()) {
+      return;
+    }
     const raw = localStorage.getItem(ACTIVE_LEASE_STORAGE_KEY);
     const leases: Record<string, number> = raw ? JSON.parse(raw) : {};
     if (active) {
@@ -247,18 +377,19 @@ export function publishActiveGameSessionLease(tankId: string, active: boolean): 
 }
 
 /**
- * Returns the list of tankIds currently locked by an active game session (heartbeat < 4500ms).
+ * Returns the list of tankIds currently locked by an active game session (heartbeat < 4000ms).
  */
 export function getActiveGameSessionTankIds(): string[] {
   if (typeof localStorage === 'undefined') return [];
   try {
+    if (isForceOfflineOverrideActive()) return [];
     const raw = localStorage.getItem(ACTIVE_LEASE_STORAGE_KEY);
     if (!raw) return [];
     const leases: Record<string, number> = JSON.parse(raw);
     const now = Date.now();
     const activeIds: string[] = [];
     for (const [tankId, ts] of Object.entries(leases)) {
-      if (now - ts < 4500) {
+      if (now - ts < 4000) {
         activeIds.push(tankId);
       }
     }
@@ -267,3 +398,4 @@ export function getActiveGameSessionTankIds(): string[] {
     return [];
   }
 }
+

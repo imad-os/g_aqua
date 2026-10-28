@@ -20,6 +20,7 @@ import {
   fetchAllUserBrainRecordsFromFirestore,
   fetchBaseModelsFromFirestore,
   removeAdminFromFirestore,
+  resetAllUserFishesInFirestore,
   saveExperimentToFirestore,
   saveModelVersionToFirestore,
   signInWithGmailPopup,
@@ -33,6 +34,7 @@ import {
 import { getMyPC } from '../engine/mypc';
 import {
   evaluateBrainOnBenchmarks,
+  reproduceOffspringFish,
   runAcceleratedHeadlessTraining,
   runControlledExperiment,
   spawnFoundingFish,
@@ -40,13 +42,17 @@ import {
 } from '../engine/simulation';
 import {
   getActiveGameSessionTankIds,
+  isForceOfflineOverrideActive,
   loadEcosystemState,
   publishActiveGameSessionLease,
+  resetFishesKeepBaseModels,
   saveEcosystemState,
+  setForceOfflineOverride,
 } from '../engine/storage';
 import {
   ActivationType,
   AdminUserRecord,
+  FishEntity,
   FoodPellet,
   ModelVersionRecord,
   OfflineServiceTelemetry,
@@ -171,11 +177,17 @@ export const TrainerApp: React.FC = () => {
   const cancelTrainingRef = useRef<boolean>(false);
 
   // Tab 2: 24/7 Dynamic Offline Fish Keeper Service State
+  // Default time speed is 1x, and default feeder is the fish's Owner Feeder (trainerOverrideFeederEnabled = false)
   const [serviceRunning, setServiceRunning] = useState<boolean>(true);
   const [visualModeEnabled, setVisualModeEnabled] = useState<boolean>(false);
-  const [serviceSpeed, setServiceSpeed] = useState<number>(12);
-  // When false, Keeper checks and uses the owner's own auto-feeder!
+  const [serviceSpeed, setServiceSpeed] = useState<number>(1);
+  // When false (default), Keeper checks and uses the owner's own auto-feeder!
   const [trainerOverrideFeederEnabled, setTrainerOverrideFeederEnabled] = useState<boolean>(false);
+  const [disableAllFeedersInKeeper, setDisableAllFeedersInKeeper] = useState<boolean>(false);
+  const [selectedFishId, setSelectedFishId] = useState<string | null>(
+    () => ecosystem.fishes[0]?.lineage.fishId || null
+  );
+  const [fishListFilter, setFishListFilter] = useState<'all' | 'offline' | 'dead'>('all');
   const [cloudUsers, setCloudUsers] = useState<CloudUserBrainRecord[]>([]);
   const [activeSessionTankIds, setActiveSessionTankIds] = useState<string[]>(() =>
     getActiveGameSessionTankIds()
@@ -193,14 +205,14 @@ export const TrainerApp: React.FC = () => {
   const [serviceStats, setServiceStats] = useState<OfflineServiceTelemetry>({
     running: true,
     visualModeEnabled: false,
-    speedMultiplier: 12,
+    speedMultiplier: 1,
     cpuUsageLimitPct: 25,
     activeInGameTankIds: [],
     offlineLiveFishCount: 0,
     offlineDeceasedFishCount: 0,
     skippedActivePlayFishCount: 0,
     totalBrainUpdatesExecuted: 0,
-    ticksPerSecond: 12,
+    ticksPerSecond: 1,
     simHoursElapsedInService: 0,
     autoFeederEnabledInService: false,
     lastDeathEvent: null,
@@ -354,32 +366,53 @@ export const TrainerApp: React.FC = () => {
     let lastDeathMsg = serviceStats.lastDeathEvent;
 
     const timer = window.setInterval(async () => {
-      const eco = ecosystemRef.current;
-      const prevMultiplier = eco.timeMultiplier;
-      const prevPaused = eco.paused;
-      eco.paused = false;
-      eco.timeMultiplier = serviceSpeed;
-
       // Dynamically check which tanks are currently open in an active player game session
       const localActiveTankIds = getActiveGameSessionTankIds();
       setActiveSessionTankIds(localActiveTankIds);
 
-      // Step local offline fishes:
-      // - Fishes in `localActiveTankIds` are dynamically REMOVED from the Keeper so they live in the player's open game!
-      // - When `trainerOverrideFeederEnabled` is false, `useOwnerAutoFeederWhenOverrideOff: true` checks the owner's own auto-feeder!
-      const stepRes = stepEcosystemSimulation(eco, pelletsRef.current, [], 0.4, {
-        allowAutoFeeders: trainerOverrideFeederEnabled,
-        useOwnerAutoFeederWhenOverrideOff: true,
-        onlyOfflineFish: true,
-        activeSessionTankIds: localActiveTankIds,
-        onDeath: (fish, reason) => {
-          lastDeathMsg = `${fish.lineage.name} (Gen ${fish.lineage.generation}) died of ${reason} at ${fish.state.ageSimHours.toFixed(1)}h`;
-        },
-      });
+      const currentEco = ecosystemRef.current;
+      const activeTank = TANK_TIERS[currentEco.activeTankTier] || TANK_TIERS[0];
+      const isOwnerOnlineInGame = localActiveTankIds.includes(activeTank.id);
 
-      eco.timeMultiplier = prevMultiplier;
-      eco.paused = prevPaused;
+      let stepRes = {
+        liveFishUpdated: 0,
+        birthsThisStep: 0,
+        deathsThisStep: 0,
+        simHoursDelta: 0,
+      };
 
+      // STRICT SINGLE-LOCATION RULE:
+      // A fish must run in ONLY ONE place: either in its owner's open game OR in this Trainer Keeper.
+      // When the owner has the game open, Keeper does NOT step or overwrite localStorage — instead it reads the live state.
+      if (isOwnerOnlineInGame) {
+        const latestFromGame = loadEcosystemState();
+        ecosystemRef.current = latestFromGame;
+        setEcosystem(latestFromGame);
+      } else {
+        const eco = ecosystemRef.current;
+        const prevMultiplier = eco.timeMultiplier;
+        const prevPaused = eco.paused;
+        eco.paused = false;
+        eco.timeMultiplier = serviceSpeed;
+
+        stepRes = stepEcosystemSimulation(eco, pelletsRef.current, [], 0.4, {
+          allowAutoFeeders: !disableAllFeedersInKeeper && trainerOverrideFeederEnabled,
+          useOwnerAutoFeederWhenOverrideOff: !disableAllFeedersInKeeper,
+          onlyOfflineFish: true,
+          activeSessionTankIds: localActiveTankIds,
+          onDeath: (fish, reason) => {
+            lastDeathMsg = `${fish.lineage.name} (Gen ${fish.lineage.generation}) died of ${reason} at ${fish.state.ageSimHours.toFixed(1)}h`;
+          },
+        });
+
+        eco.timeMultiplier = prevMultiplier;
+        eco.paused = prevPaused;
+
+        saveEcosystemState(eco);
+        setEcosystem({ ...eco });
+      }
+
+      const eco = ecosystemRef.current;
       ticksCounter++;
       totalUpdates += stepRes.liveFishUpdated;
       simHoursAccum += stepRes.simHoursDelta;
@@ -389,8 +422,8 @@ export const TrainerApp: React.FC = () => {
       let skippedActive = 0;
 
       for (const f of eco.fishes) {
-        const isOnlineInGame = localActiveTankIds.includes(f.lineage.tankId);
-        if (isOnlineInGame) {
+        const isOnline = localActiveTankIds.includes(f.lineage.tankId);
+        if (isOnline) {
           if (f.lineage.alive) skippedActive++;
         } else {
           if (f.lineage.alive) offlineLive++;
@@ -402,6 +435,8 @@ export const TrainerApp: React.FC = () => {
       let cloudOfflineLiveCount = 0;
       let cloudOnlineSkippedCount = 0;
       const nowMs = Date.now();
+      const cloudSimHoursDelta =
+        stepRes.simHoursDelta > 0 ? stepRes.simHoursDelta : (0.4 * serviceSpeed) / 60;
 
       for (const cu of cloudUsers) {
         if (cu.username === profileName) continue;
@@ -414,8 +449,8 @@ export const TrainerApp: React.FC = () => {
           // User is offline — Keeper keeps their fishes alive & checks cu.autoFeederStock when trainerOverrideFeederEnabled is false
           const cloudStep = await stepAndSyncCloudUserOfflineFishes(
             cu,
-            stepRes.simHoursDelta,
-            trainerOverrideFeederEnabled
+            cloudSimHoursDelta,
+            !disableAllFeedersInKeeper && trainerOverrideFeederEnabled
           );
           cloudOfflineLiveCount += cloudStep.updatedLiveCount;
           totalUpdates += cloudStep.updatedLiveCount;
@@ -425,7 +460,6 @@ export const TrainerApp: React.FC = () => {
         }
       }
 
-      const activeTank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
       const ownerFeederCount = eco.autoFeederCountByTank[activeTank.id] || 0;
 
       setServiceStats({
@@ -440,19 +474,17 @@ export const TrainerApp: React.FC = () => {
         totalBrainUpdatesExecuted: totalUpdates,
         ticksPerSecond: Number(((1000 / intervalMs) * Math.max(1, offlineLive)).toFixed(1)),
         simHoursElapsedInService: Number(simHoursAccum.toFixed(3)),
-        autoFeederEnabledInService: trainerOverrideFeederEnabled || ownerFeederCount > 0,
+        autoFeederEnabledInService:
+          !disableAllFeedersInKeeper && (trainerOverrideFeederEnabled || ownerFeederCount > 0),
         lastDeathEvent: lastDeathMsg,
       });
 
-      saveEcosystemState(eco);
-      setEcosystem({ ...eco });
-
-      if (ticksCounter % 8 === 0) {
+      if (!isOwnerOnlineInGame && ticksCounter % 8 === 0) {
         syncUserBrainsToFirestore(
           profileName,
           profileId,
           eco.fishes,
-          localActiveTankIds.length > 0,
+          false,
           ownerFeederCount
         ).then((ok) => {
           setFirestoreSyncStatus(
@@ -473,6 +505,7 @@ export const TrainerApp: React.FC = () => {
     serviceSpeed,
     cpuUsageLimitPct,
     trainerOverrideFeederEnabled,
+    disableAllFeedersInKeeper,
     visualModeEnabled,
     cloudUsers,
     profileName,
@@ -687,6 +720,185 @@ export const TrainerApp: React.FC = () => {
     );
   };
 
+  // ============================================================================
+  // RESET ALL FISHES (KEEP BASE MODELS ONLY) & INDIVIDUAL FISH ACTIONS
+  // ============================================================================
+  const handleResetAllFishesKeepBaseModels = async () => {
+    pelletsRef.current.length = 0;
+    const freshEco = resetFishesKeepBaseModels(ecosystemRef.current);
+    ecosystemRef.current = freshEco;
+    setEcosystem(freshEco);
+    setSelectedFishId(freshEco.fishes[0]?.lineage.fishId || null);
+
+    const activeTank = TANK_TIERS[freshEco.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = freshEco.autoFeederCountByTank[activeTank.id] || 0;
+
+    await resetAllUserFishesInFirestore(
+      profileName,
+      profileId,
+      freshEco.fishes,
+      ownerFeederCount
+    );
+
+    setStatusBanner(
+      `Reset Complete: Cleared all evolved & dead fishes and spawned ${freshEco.fishes.length} fresh Gen 1 starter fishes while keeping all ${freshEco.modelRegistry.length} trained Base Models & ${freshEco.speciesList.length} Species intact!`
+    );
+  };
+
+  // Starve a specific fish (or currently selected fish) so when the user opens the game it appears DEAD from starvation
+  const handleStarveFish = async (targetFishId?: string) => {
+    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+    const candidateId = targetFishId || selectedFishId;
+    let target = next.fishes.find((f) => f.lineage.fishId === candidateId && f.lineage.alive);
+    if (!target) {
+      target = next.fishes.find((f) => f.lineage.alive);
+    }
+    if (!target) {
+      setStatusBanner('No live fish found to starve.');
+      return;
+    }
+
+    target.state.energy = 0;
+    target.state.hunger = 100;
+    target.state.health = 0;
+    target.state.stress = 100;
+    target.lineage.alive = false;
+    target.lineage.causeOfDeath = 'starvation';
+    target.lineage.deathSimHour = next.simHoursTotal;
+
+    const alreadyInArchive = next.deceasedArchive.some(
+      (d) => d.fishId === target!.lineage.fishId
+    );
+    if (!alreadyInArchive) {
+      next.deceasedArchive.unshift({ ...target.lineage });
+    }
+
+    saveEcosystemState(next);
+    ecosystemRef.current = next;
+    setEcosystem(next);
+    setSelectedFishId(target.lineage.fishId);
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await syncUserBrainsToFirestore(
+      profileName,
+      profileId,
+      next.fishes,
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount
+    );
+
+    setStatusBanner(
+      `Fish "${target.lineage.name}" (Gen ${target.lineage.generation}) died from STARVATION! When the owner opens the game, "${target.lineage.name}" will appear floating dead in the aquarium.`
+    );
+  };
+
+  // Reproduce a specific fish (make it have a baby immediately)
+  const handleReproduceFish = async (targetFishId?: string) => {
+    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+    const candidateId = targetFishId || selectedFishId;
+    let parentFish = next.fishes.find((f) => f.lineage.fishId === candidateId && f.lineage.alive);
+    if (!parentFish) {
+      parentFish = next.fishes.find((f) => f.lineage.alive);
+    }
+    if (!parentFish) {
+      setStatusBanner('Select a live fish to reproduce (dead fishes cannot have babies).');
+      return;
+    }
+
+    const sp =
+      next.speciesList.find((s) => s.id === parentFish!.lineage.speciesId) ||
+      next.speciesList[0] ||
+      DEFAULT_SPECIES_LIST[0];
+
+    const coParent =
+      next.fishes.find(
+        (f) =>
+          f.lineage.alive &&
+          f.lineage.fishId !== parentFish!.lineage.fishId &&
+          f.lineage.speciesId === parentFish!.lineage.speciesId
+      ) || null;
+
+    const babyFish = reproduceOffspringFish(
+      parentFish,
+      coParent,
+      sp,
+      next.evolutionConfig,
+      next.simHoursTotal
+    );
+
+    parentFish.state.metrics.offspringProduced += 1;
+    parentFish.state.reproductionCooldownHours = sp.lifespan.reproductionIntervalHours;
+    next.fishes.push(babyFish);
+
+    saveEcosystemState(next);
+    ecosystemRef.current = next;
+    setEcosystem(next);
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await syncUserBrainsToFirestore(
+      profileName,
+      profileId,
+      next.fishes,
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount
+    );
+
+    setStatusBanner(
+      `"${parentFish.lineage.name}" reproduced! New baby "${babyFish.lineage.name}" (Gen ${babyFish.lineage.generation}, Juvenile) was born into the tank.`
+    );
+  };
+
+  // Feed a single selected fish
+  const handleFeedSingleFish = async (targetFishId?: string) => {
+    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+    const candidateId = targetFishId || selectedFishId;
+    const target = next.fishes.find((f) => f.lineage.fishId === candidateId && f.lineage.alive);
+    if (!target) {
+      setStatusBanner('Select a live fish to feed.');
+      return;
+    }
+    target.state.energy = Math.min(100, target.state.energy + 50);
+    target.state.hunger = Math.max(0, 100 - target.state.energy);
+    target.state.health = Math.min(100, target.state.health + 20);
+    saveEcosystemState(next);
+    ecosystemRef.current = next;
+    setEcosystem(next);
+    setStatusBanner(`Fed "${target.lineage.name}" (+50% Energy, Health ${target.state.health.toFixed(0)}%).`);
+  };
+
+  // Revive a dead fish
+  const handleReviveFish = async (targetFishId?: string) => {
+    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+    const candidateId = targetFishId || selectedFishId;
+    const target = next.fishes.find((f) => f.lineage.fishId === candidateId && !f.lineage.alive);
+    if (!target) return;
+    target.lineage.alive = true;
+    target.lineage.causeOfDeath = null;
+    target.lineage.deathSimHour = null;
+    target.state.energy = 85;
+    target.state.hunger = 15;
+    target.state.health = 100;
+    target.state.stress = 5;
+    next.deceasedArchive = next.deceasedArchive.filter((d) => d.fishId !== target.lineage.fishId);
+    saveEcosystemState(next);
+    ecosystemRef.current = next;
+    setEcosystem(next);
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await syncUserBrainsToFirestore(
+      profileName,
+      profileId,
+      next.fishes,
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount
+    );
+
+    setStatusBanner(`Revived "${target.lineage.name}" with 85% Energy and 100% Health!`);
+  };
+
   // Offline Fish Actions
   const handleFeedOfflineFishes = () => {
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
@@ -705,7 +917,14 @@ export const TrainerApp: React.FC = () => {
   const handleToggleSimulatedOwnerOnlineState = () => {
     const currentTank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
     const isCurrentlyOnline = activeSessionTankIds.includes(currentTank.id);
-    publishActiveGameSessionLease(currentTank.id, !isCurrentlyOnline);
+    if (isCurrentlyOnline) {
+      // Force owner offline so Keeper immediately brings fishes alive in Keeper
+      setForceOfflineOverride(true);
+      publishActiveGameSessionLease(currentTank.id, false);
+    } else {
+      setForceOfflineOverride(false);
+      publishActiveGameSessionLease(currentTank.id, true);
+    }
     const updated = getActiveGameSessionTankIds();
     setActiveSessionTankIds(updated);
     setStatusBanner(
@@ -716,37 +935,20 @@ export const TrainerApp: React.FC = () => {
   };
 
   const handleStarvationTest = () => {
-    setTrainerOverrideFeederEnabled(false);
-    pelletsRef.current.length = 0;
-    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
-    // Also set owner auto-feeder to 0 on active tank for the starvation test
-    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
-    next.autoFeederCountByTank[activeTank.id] = 0;
-    const target = next.fishes.find((f) => f.lineage.alive);
-    if (target) {
-      target.state.energy = 0.01;
-      target.state.health = 0.05;
-      target.state.hunger = 99.9;
-    }
-    saveEcosystemState(next);
-    ecosystemRef.current = next;
-    setEcosystem(next);
-    setStatusBanner(
-      'Withheld both Trainer & Owner Auto-Feeders: starving offline fish energy dropped to 0% — fish died and brain updates stopped.'
-    );
+    handleStarveFish(selectedFishId || undefined);
   };
 
   const handleAddOfflinePair = () => {
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
     const sp = next.speciesList[0] || DEFAULT_SPECIES_LIST[0];
-    next.fishes.push(
-      spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length),
-      spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length + 1)
-    );
+    const f1 = spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length);
+    const f2 = spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length + 1);
+    next.fishes.push(f1, f2);
     saveEcosystemState(next);
     ecosystemRef.current = next;
     setEcosystem(next);
-    setStatusBanner('Added 2 live fishes to the offline simulation tank.');
+    setSelectedFishId(f1.lineage.fishId);
+    setStatusBanner('Added 2 live fishes to the tank.');
   };
 
   // ============================================================================
@@ -1063,9 +1265,19 @@ export const TrainerApp: React.FC = () => {
           </button>
         </div>
 
-        <span className="text-xs font-mono text-slate-400 hidden xl:inline">
-          {firestoreSyncStatus}
-        </span>
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={handleResetAllFishesKeepBaseModels}
+            className="px-3.5 py-2 rounded-lg bg-rose-500/20 border border-rose-400/60 text-rose-200 hover:bg-rose-500 hover:text-white text-xs font-bold transition-colors whitespace-nowrap shadow-sm"
+            title="Reset all fishes to fresh Gen 1 starters while keeping all trained Base Models and Species properties intact"
+          >
+            Reset All Fishes (Keep Base Models)
+          </button>
+          <span className="text-xs font-mono text-slate-400 hidden xl:inline">
+            {firestoreSyncStatus}
+          </span>
+        </div>
       </nav>
 
       {statusBanner && (
@@ -1403,343 +1615,704 @@ export const TrainerApp: React.FC = () => {
           {/* =====================================================================
               TAB 2: DYNAMIC 24/7 OFFLINE FISH KEEPER (WITH OWNER AUTO-FEEDER CHECK)
              ===================================================================== */}
-          {activeTab === 'offline_service' && (
-            <div className="space-y-6">
-              {/* Top Explanation & Controls Card */}
-              <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 space-y-5">
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="max-w-2xl">
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-base font-bold text-white">
-                        Dynamic 24/7 Fish Keeper Service
-                      </h2>
-                      <button
-                        type="button"
-                        onClick={() => setActiveHelp(TRAINER_HELP.offline_24_7_service)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold"
-                      >
-                        ?
-                      </button>
-                    </div>
-                    <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                      When an owner opens the game, their fishes are{' '}
-                      <strong className="text-amber-300">
-                        dynamically removed from this Keeper
-                      </strong>{' '}
-                      so they live inside the owner&rsquo;s live aquarium. When the owner goes
-                      offline, their fishes{' '}
-                      <strong className="text-emerald-300">
-                        dynamically return to this Keeper
-                      </strong>
-                      ! When the Trainer Override Auto-Feeder is disabled, the Keeper checks and
-                      uses each owner&rsquo;s own installed Auto-Feeder.
-                    </p>
-                  </div>
+          {activeTab === 'offline_service' && (() => {
+            const displayedFishes: FishEntity[] =
+              fishListFilter === 'offline'
+                ? localOfflineKeeperFishes
+                : fishListFilter === 'dead'
+                ? deadFishes
+                : ecosystem.fishes;
 
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => setServiceRunning((v) => !v)}
-                      className={`px-4 py-2 rounded-xl text-xs font-bold ${
-                        serviceRunning
-                          ? 'bg-emerald-400 text-slate-950'
-                          : 'bg-rose-500 text-white'
-                      }`}
-                    >
-                      {serviceRunning ? '24/7 Keeper: RUNNING' : '24/7 Keeper: PAUSED'}
-                    </button>
+            const activeSelectedFish: FishEntity | null =
+              ecosystem.fishes.find((f) => f.lineage.fishId === selectedFishId) ||
+              displayedFishes[0] ||
+              ecosystem.fishes[0] ||
+              null;
 
-                    <button
-                      type="button"
-                      onClick={() => setTrainerOverrideFeederEnabled((v) => !v)}
-                      className={`px-4 py-2 rounded-xl text-xs font-bold border ${
-                        trainerOverrideFeederEnabled
-                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200'
-                          : 'bg-amber-500/20 border-amber-400 text-amber-200'
-                      }`}
-                    >
-                      {trainerOverrideFeederEnabled
-                        ? 'Trainer Override Auto-Feeder: ON'
-                        : `Trainer Feeder OFF → Using Owner Feeder (${ownerAutoFeederCount} Installed)`}
-                    </button>
+            const selectedFishSpecies = activeSelectedFish
+              ? ecosystem.speciesList.find((s) => s.id === activeSelectedFish.lineage.speciesId) ||
+                ecosystem.speciesList[0]
+              : null;
 
-                    <button
-                      type="button"
-                      onClick={() => setVisualModeEnabled((v) => !v)}
-                      className={`px-3.5 py-2 rounded-xl text-xs font-bold border ${
-                        visualModeEnabled
-                          ? 'bg-cyan-400 text-slate-950 border-cyan-300'
-                          : 'bg-slate-900 text-slate-300 border-slate-700'
-                      }`}
-                    >
-                      {visualModeEnabled ? '3D Visuals: ON' : '3D Visuals: OFF (Low CPU)'}
-                    </button>
-                  </div>
-                </div>
+            const isSelectedFishOnlineInGame = activeSelectedFish
+              ? activeSessionTankIds.includes(activeSelectedFish.lineage.tankId)
+              : false;
 
-                {/* Live Summary Counters */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
-                    <div className="text-xs text-slate-400">
-                      Offline Fishes Active in Keeper
-                    </div>
-                    <div className="text-2xl font-mono font-bold text-emerald-400 mt-1 tabular-nums">
-                      {serviceStats.offlineLiveFishCount}
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400 mt-1">
-                      Living here while owner is away
-                    </div>
-                  </div>
-
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
-                    <div className="text-xs text-slate-400">
-                      Online Fishes in Owner Game
-                    </div>
-                    <div className="text-2xl font-mono font-bold text-amber-300 mt-1 tabular-nums">
-                      {serviceStats.skippedActivePlayFishCount}
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400 mt-1">
-                      Removed from Keeper (Owner Online)
-                    </div>
-                  </div>
-
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
-                    <div className="text-xs text-slate-400">Active Feeder Source</div>
-                    <div className="text-sm font-mono font-bold text-cyan-300 mt-2">
-                      {trainerOverrideFeederEnabled
-                        ? 'Trainer Global Feeder'
-                        : ownerAutoFeederCount > 0
-                        ? `Owner Auto-Feeder (#${ownerAutoFeederCount})`
-                        : 'NONE (Starvation Risk)'}
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400 mt-1">
-                      Checks owner feeder when override is OFF
-                    </div>
-                  </div>
-
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
-                    <div className="text-xs text-slate-400">Keeper Time &amp; CPU</div>
-                    <div className="text-2xl font-mono font-bold text-white mt-1 tabular-nums">
-                      {serviceStats.simHoursElapsedInService.toFixed(1)}h
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400 mt-1">
-                      CPU Limit: {cpuUsageLimitPct === 100 ? 'MAX' : `${cpuUsageLimitPct}%`}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Action Bar */}
-                <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleToggleSimulatedOwnerOnlineState}
-                      className="px-3.5 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300"
-                    >
-                      {activeSessionTankIds.includes(currentTank.id)
-                        ? 'Simulate Owner Closing Game → Return Fishes to Keeper'
-                        : 'Simulate Owner Opening Game → Remove Fishes from Keeper'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleFeedOfflineFishes}
-                      className="px-3.5 py-2 rounded-lg bg-emerald-400 text-slate-950 text-xs font-bold hover:bg-emerald-300"
-                    >
-                      Feed Offline Fishes Now (+35% Energy)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleAddOfflinePair}
-                      className="px-3.5 py-2 rounded-lg bg-cyan-500/20 border border-cyan-400/50 text-cyan-200 text-xs font-bold hover:bg-cyan-500/30"
-                    >
-                      + Add 2 Fishes to Tank
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleStarvationTest}
-                      className="px-3.5 py-2 rounded-lg bg-rose-500/20 border border-rose-500/40 text-rose-200 text-xs font-semibold hover:bg-rose-500/30"
-                    >
-                      Test Starvation (Disable Both Feeders)
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="text-slate-400">Keeper Sim Speed:</span>
-                    {[1, 6, 12, 24].map((spd) => (
-                      <button
-                        key={spd}
-                        type="button"
-                        onClick={() => setServiceSpeed(spd)}
-                        className={`px-2.5 py-1 rounded font-mono font-bold ${
-                          serviceSpeed === spd
-                            ? 'bg-cyan-400 text-slate-950'
-                            : 'bg-slate-900 text-slate-300 border border-slate-800'
-                        }`}
-                      >
-                        {spd}x
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Optional 3D Visual Peek Window */}
-              {visualModeEnabled && (
-                <div className="h-80 rounded-2xl overflow-hidden border border-cyan-500/40 relative">
-                  <AquariumCanvas3D
-                    ecosystemRef={ecosystemRef}
-                    pelletsRef={pelletsRef}
-                    threatsRef={threatsRef}
-                    cursorPosRef={cursorPosRef}
-                    cameraOrbitRef={cameraOrbitRef}
-                    selectedFishId={null}
-                    screensaverMode={true}
-                    qualityTier="mid"
-                    fishPolygonQuality="high"
-                    activeTankTier={ecosystem.activeTankTier}
-                    isPaused={!serviceRunning}
-                    onTickSimulation={() => {}}
-                  />
-                  <div className="absolute top-3 left-3 px-3 py-1.5 rounded bg-black/70 text-xs font-mono text-cyan-300">
-                    Live 3D Peek · Offline Fish Keeper Tank
-                  </div>
-                </div>
-              )}
-
-              {/* Live Dynamic Hand-Off Lists: Keeper Fishes vs Online In-Game Fishes */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div className="p-5 rounded-2xl bg-[#101827] border border-slate-800 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold text-white">
-                      Fishes Currently Inside 24/7 Fish Keeper ({localOfflineKeeperFishes.length})
-                    </h3>
-                    <span className="text-xs font-mono text-emerald-300">
-                      Owner Offline · Keeper Active
-                    </span>
-                  </div>
-
-                  {localOfflineKeeperFishes.length === 0 ? (
-                    <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-amber-200">
-                      0 local fishes in the Keeper right now because the Owner currently has the
-                      game open ({localOnlineInGameFishes.length} fishes are living inside the
-                      owner&rsquo;s active game!). Close the game tab or click &ldquo;Simulate
-                      Owner Closing Game&rdquo; above to watch them return here immediately.
-                    </div>
-                  ) : (
-                    <div className="space-y-2.5 max-h-80 overflow-y-auto lab-scroll pr-1">
-                      {localOfflineKeeperFishes.map((f) => (
-                        <div
-                          key={f.lineage.fishId}
-                          className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between gap-4"
+            return (
+              <div className="space-y-6">
+                {/* Top Explanation & Controls Card */}
+                <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 space-y-5">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="max-w-2xl">
+                      <div className="flex items-center gap-2">
+                        <h2 className="text-base font-bold text-white">
+                          Dynamic 24/7 Fish Keeper Service (Single-Location Exclusive Execution)
+                        </h2>
+                        <button
+                          type="button"
+                          onClick={() => setActiveHelp(TRAINER_HELP.offline_24_7_service)}
+                          className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold"
                         >
-                          <div>
-                            <div className="text-xs font-bold text-white">
-                              {f.lineage.name}{' '}
-                              <span className="font-mono text-cyan-300">
-                                · Gen {f.lineage.generation}
-                              </span>
-                            </div>
-                            <div className="text-[11px] font-mono text-slate-400">
-                              Age: {f.state.ageSimHours.toFixed(1)}h · Brain Decisions:{' '}
-                              {f.state.metrics.decisionsMade} · Feeder:{' '}
-                              {trainerOverrideFeederEnabled
-                                ? 'Trainer Override'
-                                : ownerAutoFeederCount > 0
-                                ? `Owner Auto-Feeder (${ownerAutoFeederCount})`
-                                : 'Unfed'}
-                            </div>
-                          </div>
-
-                          <div className="w-32">
-                            <div className="flex justify-between text-[11px] font-mono mb-1">
-                              <span className="text-slate-400">Energy</span>
-                              <span
-                                className={
-                                  f.state.energy < 25 ? 'text-rose-400' : 'text-emerald-300'
-                                }
-                              >
-                                {f.state.energy.toFixed(0)}%
-                              </span>
-                            </div>
-                            <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                              <div
-                                className={`h-full ${
-                                  f.state.energy < 25 ? 'bg-rose-500' : 'bg-emerald-400'
-                                }`}
-                                style={{ width: `${Math.min(100, f.state.energy)}%` }}
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Right Column: Online Owners (Removed from Keeper) & Cloud Users */}
-                <div className="p-5 rounded-2xl bg-[#101827] border border-slate-800 space-y-3">
-                  <h3 className="text-sm font-bold text-white">
-                    Dynamic Hand-Off Status &amp; Cloud Owners ({cloudUsers.length} Synced)
-                  </h3>
-
-                  {localOnlineInGameFishes.length > 0 && (
-                    <div className="p-3.5 rounded-xl bg-amber-950/35 border border-amber-500/40 space-y-1.5">
-                      <div className="text-xs font-bold text-amber-300">
-                        Owner &ldquo;{profileName}&rdquo; is ONLINE in Game —{' '}
-                        {localOnlineInGameFishes.length} Fishes Handed Off to Game
+                          ?
+                        </button>
                       </div>
-                      <p className="text-[11px] text-slate-300">
-                        Fishes ({localOnlineInGameFishes.map((f) => f.lineage.name).join(', ')})
-                        are currently removed from the Keeper and swimming live in the player&rsquo;s
-                        open aquarium.
+                      <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                        Each fish runs in{' '}
+                        <strong className="text-cyan-300">only one place at a time</strong>: when an
+                        owner opens the game, their fishes are{' '}
+                        <strong className="text-amber-300">
+                          removed from this Keeper
+                        </strong>{' '}
+                        and run exclusively inside the owner&rsquo;s game. When the owner closes the
+                        game, their offline fishes{' '}
+                        <strong className="text-emerald-300">
+                          automatically come alive here in the Keeper
+                        </strong>
+                        . Default time speed is <strong className="text-white">1x</strong> and
+                        default feeder is{' '}
+                        <strong className="text-white">Their Owner&rsquo;s Feeder</strong>.
                       </p>
                     </div>
-                  )}
 
-                  <div className="space-y-2 max-h-60 overflow-y-auto lab-scroll pr-1">
-                    {cloudUsers.map((cu) => {
-                      const isOnline =
-                        cu.isActivelyPlaying &&
-                        Date.now() - (cu.lastGameHeartbeatMs || 0) < 15000;
-                      const liveCount = cu.fishBrains.filter((b) => b.alive).length;
-                      return (
-                        <div
-                          key={cu.username}
-                          className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between text-xs"
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => setServiceRunning((v) => !v)}
+                        className={`px-4 py-2 rounded-xl text-xs font-bold ${
+                          serviceRunning
+                            ? 'bg-emerald-400 text-slate-950'
+                            : 'bg-rose-500 text-white'
+                        }`}
+                      >
+                        {serviceRunning ? '24/7 Keeper: RUNNING' : '24/7 Keeper: PAUSED'}
+                      </button>
+
+                      {/* Feeder Mode Selector (Default = Owner's Feeder) */}
+                      <div className="flex items-center rounded-xl bg-slate-950 p-1 border border-slate-800 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTrainerOverrideFeederEnabled(false);
+                            setDisableAllFeedersInKeeper(false);
+                          }}
+                          className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                            !trainerOverrideFeederEnabled && !disableAllFeedersInKeeper
+                              ? 'bg-amber-400 text-slate-950'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
                         >
-                          <div>
-                            <div className="font-bold text-white">{cu.username}</div>
-                            <div className="text-[11px] font-mono text-slate-400">
-                              {liveCount} Live Fishes · Owner Auto-Feeder:{' '}
-                              {cu.autoFeederStock > 0
-                                ? `Installed (${cu.autoFeederStock})`
-                                : 'None'}
-                            </div>
-                          </div>
-                          <span
-                            className={`text-[11px] font-mono font-bold ${
-                              isOnline ? 'text-amber-300' : 'text-emerald-300'
-                            }`}
-                          >
-                            {isOnline
-                              ? 'IN GAME (Removed from Keeper)'
-                              : 'OFFLINE (Active in Keeper)'}
-                          </span>
-                        </div>
-                      );
-                    })}
+                          Owner Feeder (Default: {ownerAutoFeederCount})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTrainerOverrideFeederEnabled(true);
+                            setDisableAllFeedersInKeeper(false);
+                          }}
+                          className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                            trainerOverrideFeederEnabled && !disableAllFeedersInKeeper
+                              ? 'bg-cyan-400 text-slate-950'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          Trainer Override Feeder
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTrainerOverrideFeederEnabled(false);
+                            setDisableAllFeedersInKeeper(true);
+                          }}
+                          className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                            disableAllFeedersInKeeper
+                              ? 'bg-rose-500 text-white'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          No Feeder (Starve)
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setVisualModeEnabled((v) => !v)}
+                        className={`px-3.5 py-2 rounded-xl text-xs font-bold border ${
+                          visualModeEnabled
+                            ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                            : 'bg-slate-900 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        {visualModeEnabled ? '3D Visuals: ON' : '3D Visuals: OFF (Low CPU)'}
+                      </button>
+                    </div>
                   </div>
 
-                  {deadFishes.length > 0 && (
-                    <div className="pt-2 border-t border-slate-800 text-xs text-rose-300 font-mono">
-                      Deceased Archive: {deadFishes.length} fishes (Brain updates permanently
-                      stopped).
+                  {/* Live Summary Counters */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+                      <div className="text-xs text-slate-400">
+                        Offline Fishes Alive in Keeper
+                      </div>
+                      <div className="text-2xl font-mono font-bold text-emerald-400 mt-1 tabular-nums">
+                        {localOfflineKeeperFishes.length}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 mt-1">
+                        Running exclusively in Keeper
+                      </div>
                     </div>
-                  )}
+
+                    <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+                      <div className="text-xs text-slate-400">
+                        Online Fishes in Owner Game
+                      </div>
+                      <div className="text-2xl font-mono font-bold text-amber-300 mt-1 tabular-nums">
+                        {localOnlineInGameFishes.length}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 mt-1">
+                        Paused here · Running in Owner Game
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+                      <div className="text-xs text-slate-400">Active Feeder (Default: Owner)</div>
+                      <div className="text-sm font-mono font-bold text-cyan-300 mt-2">
+                        {disableAllFeedersInKeeper
+                          ? 'DISABLED (Starving)'
+                          : trainerOverrideFeederEnabled
+                          ? 'Trainer Global Feeder'
+                          : ownerAutoFeederCount > 0
+                          ? `Owner Feeder (${ownerAutoFeederCount} Active)`
+                          : 'Owner Has 0 Feeders (Starvation Risk)'}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 mt-1">
+                        Dead / Starved Fishes: {deadFishes.length}
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+                      <div className="text-xs text-slate-400">Keeper Time &amp; Speed</div>
+                      <div className="text-2xl font-mono font-bold text-white mt-1 tabular-nums">
+                        {serviceSpeed}x · {serviceStats.simHoursElapsedInService.toFixed(2)}h
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 mt-1">
+                        Default 1x · CPU Limit:{' '}
+                        {cpuUsageLimitPct === 100 ? 'MAX' : `${cpuUsageLimitPct}%`}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Action Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleToggleSimulatedOwnerOnlineState}
+                        className="px-3.5 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300"
+                      >
+                        {activeSessionTankIds.includes(currentTank.id)
+                          ? 'Bring Fishes into Keeper (Simulate Owner Offline)'
+                          : 'Return Fishes to Owner Game (Simulate Owner Online)'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleStarveFish(activeSelectedFish?.lineage.fishId)}
+                        className="px-3.5 py-2 rounded-lg bg-rose-600 text-white text-xs font-bold hover:bg-rose-500 shadow"
+                      >
+                        Die from Starvation (Starve Selected Fish)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleReproduceFish(activeSelectedFish?.lineage.fishId)}
+                        className="px-3.5 py-2 rounded-lg bg-fuchsia-500 text-white text-xs font-bold hover:bg-fuchsia-400 shadow"
+                      >
+                        Reproduce Selected Fish (Have a Baby)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleFeedOfflineFishes}
+                        className="px-3.5 py-2 rounded-lg bg-emerald-400 text-slate-950 text-xs font-bold hover:bg-emerald-300"
+                      >
+                        Feed All Offline (+35% Energy)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleAddOfflinePair}
+                        className="px-3.5 py-2 rounded-lg bg-cyan-500/20 border border-cyan-400/50 text-cyan-200 text-xs font-bold hover:bg-cyan-500/30"
+                      >
+                        + Add 2 Fishes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleResetAllFishesKeepBaseModels}
+                        className="px-3.5 py-2 rounded-lg bg-rose-500/20 border border-rose-400/60 text-rose-200 text-xs font-bold hover:bg-rose-500 hover:text-white"
+                      >
+                        Reset All Fishes (Keep Base Models)
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-slate-400">Keeper Time Speed (Default 1x):</span>
+                      {[1, 2, 6, 12, 24].map((spd) => (
+                        <button
+                          key={spd}
+                          type="button"
+                          onClick={() => setServiceSpeed(spd)}
+                          className={`px-2.5 py-1 rounded font-mono font-bold ${
+                            serviceSpeed === spd
+                              ? 'bg-cyan-400 text-slate-950'
+                              : 'bg-slate-900 text-slate-300 border border-slate-800'
+                          }`}
+                        >
+                          {spd}x
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Optional 3D Visual Peek Window */}
+                {visualModeEnabled && (
+                  <div className="h-80 rounded-2xl overflow-hidden border border-cyan-500/40 relative">
+                    <AquariumCanvas3D
+                      ecosystemRef={ecosystemRef}
+                      pelletsRef={pelletsRef}
+                      threatsRef={threatsRef}
+                      cursorPosRef={cursorPosRef}
+                      cameraOrbitRef={cameraOrbitRef}
+                      selectedFishId={activeSelectedFish?.lineage.fishId || null}
+                      screensaverMode={true}
+                      qualityTier="mid"
+                      fishPolygonQuality="high"
+                      activeTankTier={ecosystem.activeTankTier}
+                      isPaused={!serviceRunning}
+                      onTickSimulation={() => {}}
+                    />
+                    <div className="absolute top-3 left-3 px-3 py-1.5 rounded bg-black/70 text-xs font-mono text-cyan-300">
+                      Live 3D Peek · Offline Fish Keeper Tank (Dead fishes float belly-up at surface)
+                    </div>
+                  </div>
+                )}
+
+                {/* =================================================================
+                    INTERACTIVE FISHES LIST (WITH SELECT HIGHLIGHT) +
+                    SELECTED FISH DETAILS & ACTIONS INSPECTOR
+                   ================================================================= */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  {/* Left 7 Columns: Selectable Fishes List with Clear Highlight */}
+                  <div className="lg:col-span-7 p-5 rounded-2xl bg-[#101827] border border-slate-800 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-sm font-bold text-white">
+                          Fishes List — Click a Fish to Select &amp; Run Actions (
+                          {displayedFishes.length})
+                        </h3>
+                        <p className="text-[11px] text-slate-400">
+                          {localOfflineKeeperFishes.length} Offline in Keeper ·{' '}
+                          {localOnlineInGameFishes.length} Online in Owner Game ·{' '}
+                          {deadFishes.length} Dead
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setFishListFilter('all')}
+                          className={`px-2.5 py-1 rounded-lg font-bold ${
+                            fishListFilter === 'all'
+                              ? 'bg-cyan-400 text-slate-950'
+                              : 'bg-slate-900 text-slate-300'
+                          }`}
+                        >
+                          All ({ecosystem.fishes.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFishListFilter('offline')}
+                          className={`px-2.5 py-1 rounded-lg font-bold ${
+                            fishListFilter === 'offline'
+                              ? 'bg-emerald-400 text-slate-950'
+                              : 'bg-slate-900 text-slate-300'
+                          }`}
+                        >
+                          Offline in Keeper ({localOfflineKeeperFishes.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFishListFilter('dead')}
+                          className={`px-2.5 py-1 rounded-lg font-bold ${
+                            fishListFilter === 'dead'
+                              ? 'bg-rose-500 text-white'
+                              : 'bg-slate-900 text-slate-300'
+                          }`}
+                        >
+                          Dead ({deadFishes.length})
+                        </button>
+                      </div>
+                    </div>
+
+                    {localOnlineInGameFishes.length > 0 && (
+                      <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/40 flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <span className="text-amber-200">
+                          Owner currently has the game open ({localOnlineInGameFishes.length} live
+                          fishes are running in the Owner Game).
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleToggleSimulatedOwnerOnlineState}
+                          className="px-3 py-1 rounded-lg bg-amber-400 text-slate-950 font-bold hover:bg-amber-300"
+                        >
+                          Bring Offline into Keeper Now
+                        </button>
+                      </div>
+                    )}
+
+                    {displayedFishes.length === 0 ? (
+                      <div className="p-6 rounded-xl bg-slate-900/80 border border-slate-800 text-center text-xs text-slate-400">
+                        No fishes match the current filter. Click &ldquo;All&rdquo; or &ldquo;+ Add
+                        2 Fishes&rdquo; above.
+                      </div>
+                    ) : (
+                      <div className="space-y-2.5 max-h-[460px] overflow-y-auto lab-scroll pr-1">
+                        {displayedFishes.map((f) => {
+                          const isSelected =
+                            activeSelectedFish?.lineage.fishId === f.lineage.fishId;
+                          const isOnline = activeSessionTankIds.includes(f.lineage.tankId);
+                          const sp =
+                            ecosystem.speciesList.find((s) => s.id === f.lineage.speciesId) ||
+                            ecosystem.speciesList[0];
+
+                          return (
+                            <div
+                              key={f.lineage.fishId}
+                              onClick={() => setSelectedFishId(f.lineage.fishId)}
+                              className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
+                                isSelected
+                                  ? 'bg-cyan-950/60 border-2 border-cyan-400 ring-2 ring-cyan-400/30 shadow-lg'
+                                  : !f.lineage.alive
+                                  ? 'bg-rose-950/25 border-rose-500/40 hover:border-rose-400/70'
+                                  : 'bg-slate-900/90 border-slate-800 hover:border-slate-600'
+                              }`}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div className="space-y-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {isSelected && (
+                                      <span className="px-2 py-0.5 rounded bg-cyan-400 text-slate-950 text-[10px] font-mono font-bold uppercase">
+                                        SELECTED
+                                      </span>
+                                    )}
+                                    <span className="text-sm font-bold text-white">
+                                      {f.lineage.name}
+                                    </span>
+                                    <span className="text-xs font-mono text-cyan-300">
+                                      Gen {f.lineage.generation}
+                                    </span>
+                                    <span className="text-[11px] font-mono text-slate-400">
+                                      ({sp?.name || f.lineage.speciesId} · {f.state.lifeStage})
+                                    </span>
+                                    {!f.lineage.alive ? (
+                                      <span className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-mono font-bold uppercase">
+                                        DEAD ({f.lineage.causeOfDeath || 'starvation'})
+                                      </span>
+                                    ) : isOnline ? (
+                                      <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/50 text-amber-300 text-[10px] font-mono font-bold uppercase">
+                                        IN OWNER GAME
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 text-[10px] font-mono font-bold uppercase">
+                                        ALIVE IN KEEPER
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="text-[11px] font-mono text-slate-400">
+                                    Age: {f.state.ageSimHours.toFixed(1)}h /{' '}
+                                    {sp?.lifespan.lifespanSimHours || 24}h · Babies:{' '}
+                                    {f.state.metrics.offspringProduced} · Brain Decisions:{' '}
+                                    {f.state.metrics.decisionsMade}
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center gap-3">
+                                  <div className="w-28">
+                                    <div className="flex justify-between text-[11px] font-mono mb-1">
+                                      <span className="text-slate-400">Energy</span>
+                                      <span
+                                        className={
+                                          !f.lineage.alive || f.state.energy < 25
+                                            ? 'text-rose-400 font-bold'
+                                            : 'text-emerald-300'
+                                        }
+                                      >
+                                        {f.lineage.alive ? `${f.state.energy.toFixed(0)}%` : '0%'}
+                                      </span>
+                                    </div>
+                                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${
+                                          !f.lineage.alive || f.state.energy < 25
+                                            ? 'bg-rose-500'
+                                            : 'bg-emerald-400'
+                                        }`}
+                                        style={{
+                                          width: `${
+                                            f.lineage.alive ? Math.min(100, f.state.energy) : 0
+                                          }%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+
+                                  {/* Quick Row Actions */}
+                                  <div
+                                    className="flex items-center gap-1.5"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    {f.lineage.alive ? (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setSelectedFishId(f.lineage.fishId);
+                                            handleStarveFish(f.lineage.fishId);
+                                          }}
+                                          className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-bold"
+                                          title="Kill this fish by starvation so it appears dead in the owner's game"
+                                        >
+                                          Starve
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setSelectedFishId(f.lineage.fishId);
+                                            handleReproduceFish(f.lineage.fishId);
+                                          }}
+                                          className="px-2.5 py-1.5 rounded-lg bg-fuchsia-500 hover:bg-fuchsia-400 text-white text-[11px] font-bold"
+                                          title="Make this fish have a baby immediately"
+                                        >
+                                          Reproduce
+                                        </button>
+                                      </>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSelectedFishId(f.lineage.fishId);
+                                          handleReviveFish(f.lineage.fishId);
+                                        }}
+                                        className="px-2.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-bold"
+                                      >
+                                        Revive
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right 5 Columns: Selected Fish Details & Actions Inspector */}
+                  <div className="lg:col-span-5 space-y-5">
+                    <div className="p-5 rounded-2xl bg-[#101827] border-2 border-cyan-500/50 space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                        <div>
+                          <span className="text-[10px] font-mono font-bold uppercase text-cyan-300">
+                            Selected Fish Inspector &amp; Actions
+                          </span>
+                          <h3 className="text-base font-bold text-white mt-0.5">
+                            {activeSelectedFish
+                              ? `${activeSelectedFish.lineage.name} (Gen ${activeSelectedFish.lineage.generation})`
+                              : 'No Fish Selected'}
+                          </h3>
+                        </div>
+                        {activeSelectedFish && (
+                          <span
+                            className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold ${
+                              !activeSelectedFish.lineage.alive
+                                ? 'bg-rose-600 text-white'
+                                : isSelectedFishOnlineInGame
+                                ? 'bg-amber-400 text-slate-950'
+                                : 'bg-emerald-400 text-slate-950'
+                            }`}
+                          >
+                            {!activeSelectedFish.lineage.alive
+                              ? `DEAD (${activeSelectedFish.lineage.causeOfDeath || 'starvation'})`
+                              : isSelectedFishOnlineInGame
+                              ? 'IN OWNER GAME'
+                              : 'IN KEEPER'}
+                          </span>
+                        )}
+                      </div>
+
+                      {activeSelectedFish ? (
+                        <>
+                          {/* Actions Panel for Selected Fish */}
+                          <div className="p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 space-y-2.5">
+                            <div className="text-xs font-mono font-bold text-cyan-300 uppercase">
+                              Fish Actions ({activeSelectedFish.lineage.name})
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                disabled={!activeSelectedFish.lineage.alive}
+                                onClick={() => handleStarveFish(activeSelectedFish.lineage.fishId)}
+                                className="py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white text-xs font-bold transition-colors shadow"
+                              >
+                                Starve (Kill by Starvation)
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!activeSelectedFish.lineage.alive}
+                                onClick={() =>
+                                  handleReproduceFish(activeSelectedFish.lineage.fishId)
+                                }
+                                className="py-2.5 px-3 rounded-xl bg-fuchsia-500 hover:bg-fuchsia-400 disabled:opacity-40 text-white text-xs font-bold transition-colors shadow"
+                              >
+                                Reproduce (Have a Baby)
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!activeSelectedFish.lineage.alive}
+                                onClick={() =>
+                                  handleFeedSingleFish(activeSelectedFish.lineage.fishId)
+                                }
+                                className="py-2 px-3 rounded-xl bg-emerald-500/20 border border-emerald-400/50 hover:bg-emerald-500/30 disabled:opacity-40 text-emerald-200 text-xs font-bold transition-colors"
+                              >
+                                Feed Fish (+50% Energy)
+                              </button>
+                              <button
+                                type="button"
+                                disabled={activeSelectedFish.lineage.alive}
+                                onClick={() => handleReviveFish(activeSelectedFish.lineage.fishId)}
+                                className="py-2 px-3 rounded-xl bg-cyan-500/20 border border-cyan-400/50 hover:bg-cyan-500/30 disabled:opacity-40 text-cyan-200 text-xs font-bold transition-colors"
+                              >
+                                Revive Dead Fish
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Detailed Vitals & Genetics Breakdown */}
+                          <div className="grid grid-cols-2 gap-2.5 text-xs font-mono">
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">Species &amp; Stage</div>
+                              <div className="text-white font-bold mt-0.5">
+                                {selectedFishSpecies?.name || activeSelectedFish.lineage.speciesId}{' '}
+                                ({activeSelectedFish.state.lifeStage})
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">Age / Lifespan</div>
+                              <div className="text-white font-bold mt-0.5">
+                                {activeSelectedFish.state.ageSimHours.toFixed(2)}h /{' '}
+                                {selectedFishSpecies?.lifespan.lifespanSimHours || 24}h
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">Energy / Hunger</div>
+                              <div
+                                className={`font-bold mt-0.5 ${
+                                  !activeSelectedFish.lineage.alive ||
+                                  activeSelectedFish.state.energy < 25
+                                    ? 'text-rose-400'
+                                    : 'text-emerald-300'
+                                }`}
+                              >
+                                {activeSelectedFish.state.energy.toFixed(1)}% /{' '}
+                                {activeSelectedFish.state.hunger.toFixed(1)}%
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">Health / Stress</div>
+                              <div className="text-cyan-300 font-bold mt-0.5">
+                                {activeSelectedFish.state.health.toFixed(1)}% /{' '}
+                                {activeSelectedFish.state.stress.toFixed(1)}%
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">
+                                Babies / Food Eaten
+                              </div>
+                              <div className="text-fuchsia-300 font-bold mt-0.5">
+                                {activeSelectedFish.state.metrics.offspringProduced} Babies ·{' '}
+                                {activeSelectedFish.state.metrics.foodPelletsEaten} Pellets
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+                              <div className="text-[10px] text-slate-400">
+                                Brain Model &amp; Topology
+                              </div>
+                              <div className="text-amber-300 font-bold mt-0.5">
+                                {activeSelectedFish.lineage.modelVersion} [
+                                {activeSelectedFish.brain.architecture.hiddenLayers.join(', ')}]
+                              </div>
+                            </div>
+                            <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 col-span-2">
+                              <div className="text-[10px] text-slate-400">
+                                Genetics &amp; Lineage ID
+                              </div>
+                              <div className="text-slate-200 mt-0.5 text-[11px]">
+                                ID: <code>{activeSelectedFish.lineage.fishId}</code> · Mutations:{' '}
+                                {activeSelectedFish.lineage.inheritedMutations.length} · Speed:{' '}
+                                {activeSelectedFish.genetics.maxSpeedGene.toFixed(2)}x · Size:{' '}
+                                {activeSelectedFish.genetics.bodyScaleGene.toFixed(2)}x
+                              </div>
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="text-xs text-slate-400">
+                          Click any fish in the list on the left to inspect its details and run
+                          actions.
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Cloud Owners Status Card */}
+                    <div className="p-5 rounded-2xl bg-[#101827] border border-slate-800 space-y-3">
+                      <h3 className="text-sm font-bold text-white">
+                        Cloud Owners Synced ({cloudUsers.length})
+                      </h3>
+                      <div className="space-y-2 max-h-40 overflow-y-auto lab-scroll pr-1">
+                        {cloudUsers.map((cu) => {
+                          const isOnline =
+                            cu.isActivelyPlaying &&
+                            Date.now() - (cu.lastGameHeartbeatMs || 0) < 15000;
+                          const liveCount = cu.fishBrains.filter((b) => b.alive).length;
+                          return (
+                            <div
+                              key={cu.username}
+                              className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between text-xs"
+                            >
+                              <div>
+                                <div className="font-bold text-white">{cu.username}</div>
+                                <div className="text-[11px] font-mono text-slate-400">
+                                  {liveCount} Live · Owner Feeder:{' '}
+                                  {cu.autoFeederStock > 0
+                                    ? `Installed (${cu.autoFeederStock})`
+                                    : 'None'}
+                                </div>
+                              </div>
+                              <span
+                                className={`text-[11px] font-mono font-bold ${
+                                  isOnline ? 'text-amber-300' : 'text-emerald-300'
+                                }`}
+                              >
+                                {isOnline ? 'IN OWNER GAME' : 'OFFLINE IN KEEPER'}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* =====================================================================
               TAB 3: BASE MODEL PROPERTY & LIFESPAN EDITOR + 50 FAMOUS FISHES CATALOG

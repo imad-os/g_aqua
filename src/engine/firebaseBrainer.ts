@@ -785,6 +785,41 @@ export async function stepAndSyncCloudUserOfflineFishes(
 }
 
 /**
+ * Resets all user fish brain records in Firestore (`mypc_user_brains`) while keeping
+ * `base_models` and `admins` untouched.
+ */
+export async function resetAllUserFishesInFirestore(
+  username: string,
+  profileId: string,
+  freshFishes: FishEntity[],
+  autoFeederStock: number
+): Promise<boolean> {
+  try {
+    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(25));
+    const snap = await getDocs(q);
+    const primaryDocId = sanitizeKey(username);
+    const deletePromises: Promise<void>[] = [];
+    snap.forEach((d) => {
+      if (d.id !== primaryDocId) {
+        deletePromises.push(deleteDoc(doc(aiFirestore, 'mypc_user_brains', d.id)));
+      }
+    });
+    if (deletePromises.length > 0) {
+      await Promise.allSettled(deletePromises);
+    }
+    return await syncUserBrainsToFirestore(
+      username,
+      profileId,
+      freshFishes,
+      false,
+      autoFeederStock
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Saves an AI Trainer benchmark/experiment report to Firestore (`mypc_ai_experiments`).
  */
 export async function saveExperimentToFirestore(
@@ -803,3 +838,4 @@ export async function saveExperimentToFirestore(
     return false;
   }
 }
+

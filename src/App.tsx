@@ -22,9 +22,11 @@ import {
 } from './engine/simulation';
 import {
   createInitialEcosystemState,
+  isForceOfflineOverrideActive,
   loadEcosystemState,
   publishActiveGameSessionLease,
   saveEcosystemState,
+  setForceOfflineOverride,
 } from './engine/storage';
 import {
   FishBrainInstance,
@@ -266,39 +268,66 @@ export default function App() {
   // DYNAMIC 24/7 FISH KEEPER HAND-OFF (ONLINE WHEN OPEN, OFFLINE WHEN CLOSED)
   // ============================================================================
   useEffect(() => {
+    const syncLatestFromStorage = () => {
+      const latest = loadEcosystemState();
+      latest.timeMultiplier = 1;
+      ecosystemRef.current = latest;
+      setEcosystem({ ...latest });
+    };
+
     const eco = ecosystemRef.current;
     const currentTank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
     const username = mypc.info()?.profile?.name || 'Keeper';
     const profileId = mypc.info()?.profile?.id || 'local-caretaker';
     const feederCount = eco.autoFeederCountByTank[currentTank.id] || 0;
-    const isOnlineNow = screenState === 'playing';
+    const isVisibleAndPlaying =
+      screenState === 'playing' &&
+      (typeof document === 'undefined' || document.visibilityState === 'visible') &&
+      !isForceOfflineOverrideActive();
 
-    // Publish local lease AND Firestore online flag so the Fish Keeper dynamically removes this user's fishes immediately
-    publishActiveGameSessionLease(currentTank.id, isOnlineNow);
-    setUserOnlineStatusInFirestore(username, profileId, isOnlineNow, feederCount);
-    if (isOnlineNow) {
-      syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+    if (isVisibleAndPlaying) {
+      // Reload latest Keeper state before claiming the active lease so offline starvation/babies are preserved
+      const latest = loadEcosystemState();
+      latest.timeMultiplier = 1;
+      ecosystemRef.current = latest;
+      setEcosystem({ ...latest });
+
+      publishActiveGameSessionLease(currentTank.id, true);
+      setUserOnlineStatusInFirestore(username, profileId, true, feederCount);
+      syncUserBrainsToFirestore(username, profileId, latest.fishes, true, feederCount);
+    } else {
+      publishActiveGameSessionLease(currentTank.id, false);
+      setUserOnlineStatusInFirestore(username, profileId, false, feederCount);
     }
 
-    const handleVisibilityOrUnload = () => {
+    const handleVisibilityOrFocus = () => {
       const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
       const uName = mypc.info()?.profile?.name || 'Keeper';
       const pId = mypc.info()?.profile?.id || 'local-caretaker';
-      const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
       const visible =
         typeof document !== 'undefined' &&
         document.visibilityState === 'visible' &&
-        screenStateRef.current === 'playing';
+        screenStateRef.current === 'playing' &&
+        !isForceOfflineOverrideActive();
 
-      publishActiveGameSessionLease(tankNow.id, visible);
-      setUserOnlineStatusInFirestore(uName, pId, visible, fCount);
-      syncUserBrainsToFirestore(
-        uName,
-        pId,
-        ecosystemRef.current.fishes,
-        visible,
-        fCount
-      );
+      if (visible) {
+        // First load any state changes made by the 24/7 Keeper while away
+        const latest = loadEcosystemState();
+        latest.timeMultiplier = 1;
+        ecosystemRef.current = latest;
+        setEcosystem({ ...latest });
+        const fCount = latest.autoFeederCountByTank[tankNow.id] || 0;
+        publishActiveGameSessionLease(tankNow.id, true);
+        setUserOnlineStatusInFirestore(uName, pId, true, fCount);
+        syncUserBrainsToFirestore(uName, pId, latest.fishes, true, fCount);
+      } else {
+        // Save current state and hand off to Keeper immediately
+        saveEcosystemState(ecosystemRef.current);
+        const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
+        publishActiveGameSessionLease(tankNow.id, false);
+        setUserOnlineStatusInFirestore(uName, pId, false, fCount);
+        syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount);
+      }
     };
 
     const handlePageHide = () => {
@@ -306,37 +335,49 @@ export default function App() {
       const uName = mypc.info()?.profile?.name || 'Keeper';
       const pId = mypc.info()?.profile?.id || 'local-caretaker';
       const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
+      saveEcosystemState(ecosystemRef.current);
       publishActiveGameSessionLease(tankNow.id, false);
       setUserOnlineStatusInFirestore(uName, pId, false, fCount);
       syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount);
     };
 
+    const handleStorageEvent = (ev: StorageEvent) => {
+      if (!ev.key || ev.key.includes('ecosystem_v2') || ev.key.includes('abyssal_evo')) {
+        syncLatestFromStorage();
+      }
+    };
+
     window.addEventListener('beforeunload', handlePageHide);
     window.addEventListener('pagehide', handlePageHide);
-    document.addEventListener('visibilitychange', handleVisibilityOrUnload);
-
-    if (!isOnlineNow) {
-      return () => {
-        window.removeEventListener('beforeunload', handlePageHide);
-        window.removeEventListener('pagehide', handlePageHide);
-        document.removeEventListener('visibilitychange', handleVisibilityOrUnload);
-      };
-    }
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    window.addEventListener('storage', handleStorageEvent);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
 
     const timer = window.setInterval(() => {
       const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
       const uName = mypc.info()?.profile?.name || 'Keeper';
       const pId = mypc.info()?.profile?.id || 'local-caretaker';
       const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
-      publishActiveGameSessionLease(tankNow.id, true);
-      setUserOnlineStatusInFirestore(uName, pId, true, fCount);
-    }, 2500);
+      const activelyPlayingNow =
+        screenStateRef.current === 'playing' &&
+        (typeof document === 'undefined' || document.visibilityState === 'visible') &&
+        !isForceOfflineOverrideActive();
+
+      if (activelyPlayingNow) {
+        publishActiveGameSessionLease(tankNow.id, true);
+        setUserOnlineStatusInFirestore(uName, pId, true, fCount);
+      } else {
+        publishActiveGameSessionLease(tankNow.id, false);
+      }
+    }, 1800);
 
     return () => {
       window.clearInterval(timer);
       window.removeEventListener('beforeunload', handlePageHide);
       window.removeEventListener('pagehide', handlePageHide);
-      document.removeEventListener('visibilitychange', handleVisibilityOrUnload);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      window.removeEventListener('storage', handleStorageEvent);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
       publishActiveGameSessionLease(currentTank.id, false);
       setUserOnlineStatusInFirestore(username, profileId, false, feederCount);
     };
@@ -559,7 +600,68 @@ export default function App() {
     }
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
+    const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+    const username = mypc.info()?.profile?.name || 'Keeper';
+    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    syncUserBrainsToFirestore(
+      username,
+      profileId,
+      eco.fishes,
+      true,
+      eco.autoFeederCountByTank[tank.id] || 0
+    );
     showToast('Added a new pair of starter fishes to your aquarium.');
+  };
+
+  // Remove a single dead fish body from the aquarium
+  const handleRemoveDeadFish = (fishId: string) => {
+    const eco = ecosystemRef.current;
+    const target = eco.fishes.find((f) => f.lineage.fishId === fishId);
+    if (target && !target.lineage.alive) {
+      if (!eco.deceasedArchive.some((d) => d.fishId === target.lineage.fishId)) {
+        eco.deceasedArchive.unshift({ ...target.lineage });
+      }
+      eco.fishes = eco.fishes.filter((f) => f.lineage.fishId !== fishId);
+      saveEcosystemState(eco);
+      setEcosystem({ ...eco });
+      const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+      const username = mypc.info()?.profile?.name || 'Keeper';
+      const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+      syncUserBrainsToFirestore(
+        username,
+        profileId,
+        eco.fishes,
+        true,
+        eco.autoFeederCountByTank[tank.id] || 0
+      );
+      showToast(`Removed deceased fish (${target.lineage.name}) from your tank.`);
+    }
+  };
+
+  // Clear all dead fish bodies from the aquarium
+  const handleClearAllDeadFishes = () => {
+    const eco = ecosystemRef.current;
+    const deadList = eco.fishes.filter((f) => !f.lineage.alive);
+    if (deadList.length === 0) return;
+    for (const df of deadList) {
+      if (!eco.deceasedArchive.some((d) => d.fishId === df.lineage.fishId)) {
+        eco.deceasedArchive.unshift({ ...df.lineage });
+      }
+    }
+    eco.fishes = eco.fishes.filter((f) => f.lineage.alive);
+    saveEcosystemState(eco);
+    setEcosystem({ ...eco });
+    const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+    const username = mypc.info()?.profile?.name || 'Keeper';
+    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    syncUserBrainsToFirestore(
+      username,
+      profileId,
+      eco.fishes,
+      true,
+      eco.autoFeederCountByTank[tank.id] || 0
+    );
+    showToast(`Cleared ${deadList.length} deceased fish(es) from your aquarium.`);
   };
 
   // Update 3D Fish Polygon Quality or Graphics settings
@@ -647,9 +749,23 @@ export default function App() {
 
   const handleStartAquarium = useCallback(() => {
     audioEngine.initOrResume();
-    ecosystemRef.current.timeMultiplier = 1;
+    // Clear any trainer force-offline simulation override and reload latest state from 24/7 Keeper
+    setForceOfflineOverride(false);
+    const latest = loadEcosystemState();
+    latest.timeMultiplier = 1;
+    ecosystemRef.current = latest;
+    setEcosystem({ ...latest });
     setScreenState('playing');
-  }, []);
+
+    const deadNow = latest.fishes.filter((f) => !f.lineage.alive);
+    if (deadNow.length > 0) {
+      showToast(
+        `Warning: ${deadNow.map((d) => d.lineage.name).join(', ')} died from ${
+          deadNow[0].lineage.causeOfDeath || 'starvation'
+        } while away!`
+      );
+    }
+  }, [showToast]);
 
   // ============================================================================
   // TV REMOTE & KEYBOARD CONTROLLER LISTENER ("Play/Pause", "+", "Select", "Start")
@@ -816,19 +932,53 @@ export default function App() {
             cloudRecord.fishBrains.length > 0
           ) {
             const eco = ecosystemRef.current;
-            for (const cb of cloudRecord.fishBrains) {
-              const localFish = eco.fishes.find((f) => f.lineage.fishId === cb.fishId);
-              if (localFish) {
-                localFish.brain = cb.brain;
-                localFish.lineage.alive = cb.alive;
-                localFish.lineage.causeOfDeath = (cb.causeOfDeath as any) || null;
-                localFish.state.energy = cb.energy;
-                localFish.state.hunger = cb.hunger;
-                localFish.state.ageSimHours = cb.ageSimHours;
+            // Only overwrite from Firestore if cloudRecord is newer than our local ecosystem state
+            if ((cloudRecord.updatedAtMs || 0) > (eco.lastSavedAtMs || 0)) {
+              for (const cb of cloudRecord.fishBrains) {
+                const localFish = eco.fishes.find((f) => f.lineage.fishId === cb.fishId);
+                if (localFish) {
+                  localFish.brain = cb.brain;
+                  localFish.lineage.alive = cb.alive;
+                  localFish.lineage.causeOfDeath = (cb.causeOfDeath as any) || null;
+                  localFish.state.energy = cb.energy;
+                  localFish.state.hunger = cb.hunger;
+                  localFish.state.ageSimHours = cb.ageSimHours;
+                  if (!cb.alive) {
+                    localFish.state.health = 0;
+                  }
+                } else {
+                  // Reconstruct newly hatched baby fish from Keeper cloud sync
+                  const sp =
+                    eco.speciesList.find((s) => s.id === cb.speciesId) ||
+                    eco.speciesList[0] ||
+                    DEFAULT_SPECIES_LIST[0];
+                  const spawned = spawnFoundingFish(
+                    sp,
+                    eco.activeTankTier,
+                    eco.simHoursTotal,
+                    eco.fishes.length,
+                    cb.brain
+                  );
+                  spawned.lineage.fishId = cb.fishId;
+                  spawned.lineage.name = cb.name;
+                  spawned.lineage.generation = cb.generation;
+                  spawned.lineage.modelVersion = cb.modelVersion;
+                  spawned.lineage.motherId = cb.motherId;
+                  spawned.lineage.fatherId = cb.fatherId;
+                  spawned.lineage.alive = cb.alive;
+                  spawned.lineage.causeOfDeath = (cb.causeOfDeath as any) || null;
+                  spawned.state.energy = cb.energy;
+                  spawned.state.hunger = cb.hunger;
+                  spawned.state.ageSimHours = cb.ageSimHours;
+                  spawned.state.lifeStage =
+                    cb.ageSimHours < sp.lifespan.sexualMaturityAgeHours ? 'juvenile' : 'adult';
+                  if (!cb.alive) spawned.state.health = 0;
+                  eco.fishes.push(spawned);
+                }
               }
+              saveEcosystemState(eco);
+              setEcosystem({ ...eco });
             }
-            saveEcosystemState(eco);
-            setEcosystem({ ...eco });
           }
         });
 
@@ -1080,7 +1230,14 @@ export default function App() {
         }
       }
 
-      if (screenStateRef.current !== 'playing') return;
+      // Strict Single-Place Rule: Only run fish simulation in the Owner Game when playing, visible, and not forced offline in Keeper
+      if (
+        screenStateRef.current !== 'playing' ||
+        (typeof document !== 'undefined' && document.visibilityState === 'hidden') ||
+        isForceOfflineOverrideActive()
+      ) {
+        return;
+      }
 
       const eco = ecosystemRef.current;
       // Lock player time multiplier to 1x real-time
@@ -1163,6 +1320,7 @@ export default function App() {
   const t = I18N[lang] || I18N.en;
   const currentTank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
   const aliveFishes = ecosystem.fishes.filter((f) => f.lineage.alive);
+  const deadFishes = ecosystem.fishes.filter((f) => !f.lineage.alive);
   const adultFishes = aliveFishes.filter(
     (f) => f.state.lifeStage === 'adult' || f.state.lifeStage === 'elder'
   );
@@ -1324,6 +1482,7 @@ export default function App() {
               <span>
                 Space: {adultFishes.length}/{currentTank.maxFishCapacity} Fishes
                 {babyFishes.length > 0 ? ` (+${babyFishes.length} Babies)` : ''}
+                {deadFishes.length > 0 ? ` · ${deadFishes.length} Dead` : ''}
               </span>
               <span className="text-slate-500">·</span>
               <span className="text-violet-300 font-semibold">
@@ -1429,6 +1588,46 @@ export default function App() {
             </div>
           </div>
 
+          {/* Dead / Starved Fish Alert Banner on Game Screen */}
+          {deadFishes.length > 0 && (
+            <div className="pointer-events-auto mx-auto max-w-3xl w-full px-4 py-3 rounded-xl bg-rose-950/90 border border-rose-500/70 text-xs text-rose-100 shadow-2xl flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="font-bold text-rose-300">
+                  {deadFishes.length} Fish{deadFishes.length > 1 ? 'es' : ''} Appeared Dead in Your
+                  Aquarium ({deadFishes.map((f) => f.lineage.name).join(', ')})
+                </div>
+                <div className="text-[11px] text-rose-200/90 font-mono mt-0.5">
+                  Cause of Death:{' '}
+                  {deadFishes
+                    .map((f) => (f.lineage.causeOfDeath || 'starvation').toUpperCase())
+                    .join(', ')}{' '}
+                  · Floating belly-up near top water surface
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-tv-focusable="true"
+                  onClick={() => {
+                    setSettingsTab('fish_stats');
+                    setSettingsOpen(true);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-rose-500/30 border border-rose-400 text-white font-bold hover:bg-rose-500/40"
+                >
+                  Inspect Dead Fish
+                </button>
+                <button
+                  type="button"
+                  data-tv-focusable="true"
+                  onClick={handleClearAllDeadFishes}
+                  className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 font-semibold hover:bg-slate-800"
+                >
+                  Remove Dead Body
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Toast Feedback Banner */}
           {toastMessage && (
             <div className="mx-auto px-4 py-2 rounded-lg bg-[#071324]/95 border border-cyan-400/60 text-xs font-medium text-cyan-200 shadow-lg">
@@ -1506,8 +1705,9 @@ export default function App() {
                     : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
                 }`}
               >
-                1. My Fishes ({aliveFishes.length} Live · Space {adultFishes.length}/
-                {currentTank.maxFishCapacity})
+                1. My Fishes ({aliveFishes.length} Live
+                {deadFishes.length > 0 ? ` · ${deadFishes.length} Dead` : ''} · Space{' '}
+                {adultFishes.length}/{currentTank.maxFishCapacity})
               </button>
               <button
                 type="button"
@@ -1586,26 +1786,38 @@ export default function App() {
                   )}
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {aliveFishes.map((fish) => {
+                    {ecosystem.fishes.map((fish) => {
                       const sp =
                         ecosystem.speciesList.find((s) => s.id === fish.lineage.speciesId) ||
                         DEFAULT_SPECIES_LIST[0];
-                      const satisfaction = Math.round(
-                        Math.max(
-                          0,
-                          Math.min(100, fish.state.energy * 0.65 + (100 - fish.state.stress) * 0.35)
-                        )
-                      );
+                      const isDead = !fish.lineage.alive;
+                      const satisfaction = isDead
+                        ? 0
+                        : Math.round(
+                            Math.max(
+                              0,
+                              Math.min(
+                                100,
+                                fish.state.energy * 0.65 + (100 - fish.state.stress) * 0.35
+                              )
+                            )
+                          );
                       return (
                         <div
                           key={fish.lineage.fishId}
-                          className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3"
+                          className={`p-4 rounded-xl border space-y-3 ${
+                            isDead
+                              ? 'bg-rose-950/35 border-rose-500/60'
+                              : 'bg-slate-900/90 border-slate-800'
+                          }`}
                         >
                           <div className="flex items-center justify-between border-b border-slate-800 pb-2">
                             <div className="flex items-center gap-2.5">
                               <span
                                 className="w-3.5 h-3.5 rounded-full shrink-0 border border-white/30"
-                                style={{ backgroundColor: sp.primaryColorHex }}
+                                style={{
+                                  backgroundColor: isDead ? '#64748b' : sp.primaryColorHex,
+                                }}
                               />
                               <div>
                                 <div className="text-sm font-bold text-white">
@@ -1622,8 +1834,14 @@ export default function App() {
                                 </div>
                               </div>
                             </div>
-                            <span className="text-xs font-mono text-cyan-300">
-                              {fish.state.isGravid
+                            <span
+                              className={`text-xs font-mono font-bold ${
+                                isDead ? 'text-rose-400' : 'text-cyan-300'
+                              }`}
+                            >
+                              {isDead
+                                ? `DEAD (${(fish.lineage.causeOfDeath || 'starvation').toUpperCase()})`
+                                : fish.state.isGravid
                                 ? 'Expecting Babies'
                                 : fish.state.lifeStage.toUpperCase()}
                             </span>
@@ -1635,18 +1853,24 @@ export default function App() {
                                 <span className="text-slate-400">Fullness / Energy</span>
                                 <span
                                   className={
-                                    fish.state.energy < 30 ? 'text-rose-400' : 'text-emerald-400'
+                                    isDead || fish.state.energy < 30
+                                      ? 'text-rose-400'
+                                      : 'text-emerald-400'
                                   }
                                 >
-                                  {fish.state.energy.toFixed(0)}%
+                                  {isDead ? '0% (Starved)' : `${fish.state.energy.toFixed(0)}%`}
                                 </span>
                               </div>
                               <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
                                 <div
                                   className={`h-full rounded-full ${
-                                    fish.state.energy < 30 ? 'bg-rose-500' : 'bg-emerald-400'
+                                    isDead || fish.state.energy < 30
+                                      ? 'bg-rose-500'
+                                      : 'bg-emerald-400'
                                   }`}
-                                  style={{ width: `${Math.min(100, fish.state.energy)}%` }}
+                                  style={{
+                                    width: `${isDead ? 0 : Math.min(100, fish.state.energy)}%`,
+                                  }}
                                 />
                               </div>
                             </div>
@@ -1654,7 +1878,9 @@ export default function App() {
                             <div>
                               <div className="flex justify-between font-mono mb-1">
                                 <span className="text-slate-400">Satisfaction &amp; Comfort</span>
-                                <span className="text-cyan-300">{satisfaction}%</span>
+                                <span className={isDead ? 'text-rose-400' : 'text-cyan-300'}>
+                                  {satisfaction}%
+                                </span>
                               </div>
                               <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
                                 <div
@@ -1674,6 +1900,22 @@ export default function App() {
                             <div>Babies Hatched: {fish.state.metrics.offspringProduced}</div>
                             <div>Speed Gene: {fish.genetics.maxSpeedGene}x</div>
                           </div>
+
+                          {isDead && (
+                            <div className="pt-2 border-t border-rose-500/30 flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-mono text-rose-300">
+                                Died of {fish.lineage.causeOfDeath || 'starvation'}
+                              </span>
+                              <button
+                                type="button"
+                                data-tv-focusable="true"
+                                onClick={() => handleRemoveDeadFish(fish.lineage.fishId)}
+                                className="px-3 py-1 rounded-lg bg-rose-500/30 border border-rose-400/60 text-xs font-bold text-rose-100 hover:bg-rose-500/50"
+                              >
+                                Remove Dead Fish
+                              </button>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
