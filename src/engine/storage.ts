@@ -14,6 +14,11 @@ import {
   SavedEcosystemState,
 } from './types';
 
+import {
+  createSpeciesConfigFromFamousFish,
+  FAMOUS_AQUARIUM_FISHES_50,
+} from './famousFishCatalog';
+
 const ECOSYSTEM_SAVE_KEY = 'ecosystem_v2';
 const ACTIVE_LEASE_STORAGE_KEY = 'abyssal_evo_active_game_leases';
 
@@ -22,7 +27,7 @@ export function createInitialEcosystemState(
   defaultTankTier = 0,
   timeMultiplier = 1
 ): SavedEcosystemState {
-  const speciesList = DEFAULT_SPECIES_LIST.map((s) => ({
+  const baseSpecies = DEFAULT_SPECIES_LIST.map((s) => ({
     ...s,
     lifespan: { ...s.lifespan },
     baseBrainConfig: {
@@ -30,6 +35,17 @@ export function createInitialEcosystemState(
       hiddenLayers: [...s.baseBrainConfig.hiddenLayers],
     },
   }));
+
+  // Also include the top 12 famous aquarium fishes across Owner Levels 1-6 so the shop has a rich selection out of the box
+  const extraFamous = FAMOUS_AQUARIUM_FISHES_50.slice(0, 12).map((tpl) =>
+    createSpeciesConfigFromFamousFish(tpl)
+  );
+  const speciesList = [...baseSpecies];
+  for (const ef of extraFamous) {
+    if (!speciesList.some((s) => s.id === ef.id)) {
+      speciesList.push(ef);
+    }
+  }
 
   const evolutionConfig = JSON.parse(JSON.stringify(DEFAULT_EVOLUTION_CONFIG));
 
@@ -45,6 +61,7 @@ export function createInitialEcosystemState(
       isPromotedBase: true,
       notes: 'Initial calibrated founding species base model.',
       brainConfig: { ...sp.baseBrainConfig },
+      speciesConfig: { ...sp },
       weights: baseBrain.inheritedWeights,
       biases: baseBrain.inheritedBiases,
       benchmark: bench,
@@ -66,6 +83,8 @@ export function createInitialEcosystemState(
     timeMultiplier,
     paused: false,
     bioCredits: startingCredits,
+    ownerLevel: 1,
+    ownerXp: 20,
     unlockedTankTiers: [0],
     activeTankTier: defaultTankTier,
     autoFeederCountByTank: {
@@ -77,6 +96,9 @@ export function createInitialEcosystemState(
       showCaustics: true,
       showParticles: true,
       antiAliasing: true,
+      framelessTvMode: true,
+      lightIntensity: 0.95,
+      backgroundBrightness: 0.22,
     },
     speciesList,
     evolutionConfig,
@@ -106,6 +128,51 @@ export function createInitialEcosystemState(
   };
 }
 
+function normalizeLoadedEcosystem(parsed: SavedEcosystemState): SavedEcosystemState {
+  if (!parsed.ownerLevel || parsed.ownerLevel < 1) {
+    parsed.ownerLevel = 1;
+  }
+  if (typeof parsed.ownerXp !== 'number' || parsed.ownerXp < 0) {
+    parsed.ownerXp = 20;
+  }
+  if (!parsed.graphicsSettings) {
+    parsed.graphicsSettings = {
+      fishPolygonQuality: 'high',
+      environmentQuality: 'high',
+      showCaustics: true,
+      showParticles: true,
+      antiAliasing: true,
+      framelessTvMode: true,
+      lightIntensity: 0.95,
+      backgroundBrightness: 0.22,
+    };
+  } else {
+    if (parsed.graphicsSettings.framelessTvMode === undefined) {
+      parsed.graphicsSettings.framelessTvMode = true;
+    }
+    if (typeof parsed.graphicsSettings.lightIntensity !== 'number') {
+      parsed.graphicsSettings.lightIntensity = 0.95;
+    }
+    if (typeof parsed.graphicsSettings.backgroundBrightness !== 'number') {
+      parsed.graphicsSettings.backgroundBrightness = 0.22;
+    }
+  }
+  // Ensure famous starter species are present in speciesList
+  const extraFamous = FAMOUS_AQUARIUM_FISHES_50.slice(0, 12).map((tpl) =>
+    createSpeciesConfigFromFamousFish(tpl)
+  );
+  for (const sp of [...DEFAULT_SPECIES_LIST, ...extraFamous]) {
+    const existing = parsed.speciesList.find((s) => s.id === sp.id);
+    if (!existing) {
+      parsed.speciesList.push(sp);
+    } else {
+      if (!existing.requiredOwnerLevel) existing.requiredOwnerLevel = sp.requiredOwnerLevel || 1;
+      if (!existing.shopPriceCredits) existing.shopPriceCredits = sp.shopPriceCredits || 45;
+    }
+  }
+  return parsed;
+}
+
 /**
  * Loads the player's progress (fishes, bought tanks, equipment, bio-credits) via `MyPC.load`
  * and mirrors to localStorage so the standalone AI Trainer (`trainer.html`) shares the state.
@@ -126,13 +193,13 @@ export function loadEcosystemState(): SavedEcosystemState {
     if (sharedRaw) {
       const parsed = JSON.parse(sharedRaw) as SavedEcosystemState;
       if (parsed && Array.isArray(parsed.fishes) && parsed.speciesList?.length) {
-        return parsed;
+        return normalizeLoadedEcosystem(parsed);
       }
     }
 
     const fromMyPC = mypc.load<SavedEcosystemState | null>(ECOSYSTEM_SAVE_KEY, null);
     if (fromMyPC && Array.isArray(fromMyPC.fishes) && fromMyPC.speciesList?.length) {
-      return fromMyPC;
+      return normalizeLoadedEcosystem(fromMyPC);
     }
   } catch (e) {
     mypc.report(e, { stage: 'loadEcosystemState' });

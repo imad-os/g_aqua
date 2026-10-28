@@ -152,6 +152,94 @@ export function inheritGenetics(
   return { genetics, traitMutations: muts };
 }
 
+const TAN_HALF_FOV_48 = Math.tan((48 * Math.PI) / 360);
+
+export interface TankFrustumSliceBounds {
+  halfW: number;
+  halfH: number;
+  halfD: number;
+  minY: number;
+  maxY: number;
+  centerY: number;
+  floorY: number;
+  surfaceY: number;
+  camZ: number;
+  frustumHalfW: number;
+  frustumHalfH: number;
+}
+
+/**
+ * Computes the 3D aquarium boundaries at depth `z`.
+ * - In Framed Mode (`framelessTvMode === false`), the tank is a rectangular box.
+ * - In Full-Screen TV Mode (`framelessTvMode !== false`), the tank is a 3D perspective frustum
+ *   (smaller in the front `z > 0`, larger in the back `z < 0`) matched to the 3D camera frustum
+ *   so fishes at the front never hide off the front-left/front-right sides and the full tank
+ *   fills the TV screen edge-to-edge without looking zoomed out.
+ */
+export function getTankBoundsAtZ(
+  tank: { width: number; height: number; depth: number },
+  z: number,
+  framelessTvMode: boolean = true,
+  aspect: number = 16 / 9
+): TankFrustumSliceBounds {
+  if (!framelessTvMode) {
+    const halfW = tank.width * 0.44;
+    const halfH = tank.height * 0.38;
+    const halfD = tank.depth * 0.42;
+    const floorY = -tank.height * 0.42;
+    const surfaceY = halfH * 0.92;
+    return {
+      halfW,
+      halfH,
+      halfD,
+      minY: -halfH,
+      maxY: halfH,
+      centerY: 0,
+      floorY,
+      surfaceY,
+      camZ: tank.width * 0.68 + 4.8,
+      frustumHalfW: tank.width * 0.5,
+      frustumHalfH: tank.height * 0.5,
+    };
+  }
+
+  const halfD = tank.depth * 0.44;
+  const camZ = tank.depth * 1.06;
+  const clampedZ = Math.max(-halfD, Math.min(halfD, z));
+  const distFromCam = Math.max(2.0, camZ - clampedZ);
+  const safeAspect = Math.max(1.2, Math.min(2.4, aspect));
+
+  const frustumHalfH = distFromCam * TAN_HALF_FOV_48;
+  const frustumHalfW = frustumHalfH * safeAspect;
+
+  // Depth interpolation t: 0 at front glass (z = +halfD), 1 at back reef wall (z = -halfD)
+  const t = (halfD - clampedZ) / Math.max(0.001, 2 * halfD);
+
+  // Sloped frustum seabed floor and top water surface that track the TV screen's top & bottom edges
+  const floorY = -frustumHalfH * (0.82 - 0.12 * t);
+  const surfaceY = frustumHalfH * (0.84 - 0.06 * t);
+
+  const minY = floorY + 0.42;
+  const maxY = surfaceY - 0.35;
+  const centerY = (minY + maxY) * 0.5;
+  const halfH = Math.max(0.8, (maxY - minY) * 0.5);
+  const halfW = frustumHalfW * 0.86;
+
+  return {
+    halfW,
+    halfH,
+    halfD,
+    minY,
+    maxY,
+    centerY,
+    floorY,
+    surfaceY,
+    camZ,
+    frustumHalfW,
+    frustumHalfH,
+  };
+}
+
 export function spawnFoundingFish(
   species: SpeciesConfig,
   tankTierIndex: number,
@@ -175,9 +263,9 @@ export function spawnFoundingFish(
     rng
   );
 
-  const halfW = tank.width * 0.38;
-  const halfH = tank.height * 0.34;
   const halfD = tank.depth * 0.35;
+  const spawnZ = (rng() - 0.5) * halfD * 2;
+  const sliceBounds = getTankBoundsAtZ(tank, spawnZ, true);
 
   const name =
     FISH_NAMES[(indexInFounderGroup + Math.floor(rng() * FISH_NAMES.length)) % FISH_NAMES.length] +
@@ -220,9 +308,9 @@ export function spawnFoundingFish(
       gestationHoursRemaining: 0,
       gravidPartnerId: null,
       independenceHoursRemaining: 0,
-      x: (rng() - 0.5) * halfW * 2,
-      y: (rng() - 0.5) * halfH * 1.5,
-      z: (rng() - 0.5) * halfD * 2,
+      x: (rng() - 0.5) * sliceBounds.halfW * 1.6,
+      y: sliceBounds.centerY + (rng() - 0.5) * sliceBounds.halfH * 1.3,
+      z: spawnZ,
       vx: (rng() - 0.5) * 1.2,
       vy: (rng() - 0.5) * 0.3,
       vz: (rng() - 0.5) * 1.2,
@@ -376,6 +464,28 @@ export function reproduceOffspringFish(
   };
 }
 
+export function awardOwnerXp(ecosystem: SavedEcosystemState, xpAmount: number): {
+  leveledUp: boolean;
+  newLevel: number;
+} {
+  if (!ecosystem.ownerLevel || ecosystem.ownerLevel < 1) {
+    ecosystem.ownerLevel = 1;
+  }
+  if (typeof ecosystem.ownerXp !== 'number' || ecosystem.ownerXp < 0) {
+    ecosystem.ownerXp = 0;
+  }
+  const prevLevel = ecosystem.ownerLevel;
+  ecosystem.ownerXp += xpAmount;
+  while (ecosystem.ownerXp >= 100) {
+    ecosystem.ownerXp -= 100;
+    ecosystem.ownerLevel += 1;
+  }
+  return {
+    leveledUp: ecosystem.ownerLevel > prevLevel,
+    newLevel: ecosystem.ownerLevel,
+  };
+}
+
 // Pre-allocated sensory input vector to avoid per-frame allocations
 const _sensoryInputs = new Float32Array(32);
 
@@ -392,6 +502,7 @@ export function stepEcosystemSimulation(
   realDtSeconds: number,
   options?: {
     allowAutoFeeders?: boolean;
+    useOwnerAutoFeederWhenOverrideOff?: boolean;
     onlyOfflineFish?: boolean;
     activeSessionTankIds?: string[];
     onBirth?: (child: FishEntity, mother: FishEntity) => void;
@@ -410,61 +521,75 @@ export function stepEcosystemSimulation(
 
   // 1 real-world hour = 3600 real seconds.
   // At 1x speed, 1 sim-hour = 3600 real seconds.
-  // In interactive play, we also allow a base clock scale so players can observe hours pass smoothly
-  // while strictly honoring the configured timeMultiplier ratio (e.g. 24x is 24 times faster than 1x).
   const simHoursDelta = (realDtSeconds / 3600) * Math.max(0.1, ecosystem.timeMultiplier);
   ecosystem.simHoursTotal += simHoursDelta;
 
   const tank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
-  const halfW = tank.width * 0.44;
-  const halfH = tank.height * 0.38;
-  const halfD = tank.depth * 0.42;
+  const isFrameless = ecosystem.graphicsSettings?.framelessTvMode !== false;
+  const centerBounds = getTankBoundsAtZ(tank, 0, isFrameless);
+  const halfD = centerBounds.halfD;
 
-  // Update food pellets: float at the top water surface first, then slowly drift downward
-  const topSurfaceY = halfH * 0.92;
+  // Update food pellets: float at the top water surface at their Z depth first, then slowly drift downward
   for (let i = pellets.length - 1; i >= 0; i--) {
     const p = pellets[i];
+    const pBounds = getTankBoundsAtZ(tank, p.z, isFrameless);
     p.ageSeconds += realDtSeconds;
     if (p.ageSeconds < 3.5) {
       // Float on top water surface with gentle ripple bobbing
-      p.y = topSurfaceY + Math.sin(p.ageSeconds * 3.2 + i) * 0.04;
-    } else if (p.y > -halfH + 0.25) {
-      p.y = Math.max(-halfH + 0.25, p.y + p.vy * realDtSeconds);
+      p.y = pBounds.surfaceY + Math.sin(p.ageSeconds * 3.2 + i) * 0.04;
+    } else if (p.y > pBounds.floorY + 0.22) {
+      p.y = Math.max(pBounds.floorY + 0.22, p.y + p.vy * realDtSeconds);
     }
+    // Keep pellet X within the frustum width at its Z depth
+    p.x = Math.max(-pBounds.halfW * 0.94, Math.min(pBounds.halfW * 0.94, p.x));
     if (p.ageSeconds > 180) {
       pellets.splice(i, 1);
     }
   }
 
-  // Update active threats
+  // Update active threats within frustum bounds
   for (let i = threats.length - 1; i >= 0; i--) {
     const th = threats[i];
     th.activeSecondsRemaining -= realDtSeconds;
     th.x += th.vx * realDtSeconds;
     th.y += th.vy * realDtSeconds;
     th.z += th.vz * realDtSeconds;
-    if (Math.abs(th.x) > halfW) th.vx = -th.vx;
-    if (Math.abs(th.y) > halfH) th.vy = -th.vy;
+    const thBounds = getTankBoundsAtZ(tank, th.z, isFrameless);
+    if (Math.abs(th.x) > thBounds.halfW) th.vx = -th.vx;
+    if (th.y > thBounds.maxY || th.y < thBounds.minY) th.vy = -th.vy;
     if (Math.abs(th.z) > halfD) th.vz = -th.vz;
     if (th.activeSecondsRemaining <= 0) {
       threats.splice(i, 1);
     }
   }
 
-  // Automatic feeders sprinkle pellets onto the top water surface periodically
-  const activeFeederCount = ecosystem.autoFeederCountByTank[tank.id] || 0;
-  if (
-    options?.allowAutoFeeders !== false &&
-    activeFeederCount > 0 &&
-    pellets.length < activeFeederCount * 6
-  ) {
-    const spawnChance = simHoursDelta * activeFeederCount * 3.5 * ecosystem.evolutionConfig.environment.foodAbundance;
-    if (Math.random() < spawnChance) {
+  // Automatic feeders sprinkle pellets onto the top water surface periodically.
+  // In the 24/7 Fish Keeper, when the Trainer's global auto-feeder is disabled (`allowAutoFeeders: false`),
+  // if `useOwnerAutoFeederWhenOverrideOff: true` is passed, we check the owner's own auto-feeder (`activeFeederCount > 0`).
+  const ownerFeederCount = ecosystem.autoFeederCountByTank[tank.id] || 0;
+  const effectiveFeederCount =
+    options?.allowAutoFeeders === true
+      ? Math.max(1, ownerFeederCount)
+      : options?.allowAutoFeeders === false
+      ? options?.useOwnerAutoFeederWhenOverrideOff
+        ? ownerFeederCount
+        : 0
+      : ownerFeederCount;
+
+  if (effectiveFeederCount > 0 && pellets.length < effectiveFeederCount * 6) {
+    const spawnChance =
+      simHoursDelta *
+      effectiveFeederCount *
+      3.5 *
+      ecosystem.evolutionConfig.environment.foodAbundance;
+    if (Math.random() < spawnChance || (options?.onlyOfflineFish && pellets.length === 0 && simHoursDelta > 0)) {
+      const pelletZ = (Math.random() - 0.5) * halfD * 1.4;
+      const pelletBounds = getTankBoundsAtZ(tank, pelletZ, isFrameless);
       pellets.push({
         id: nextEntityId('pellet'),
-        x: (Math.random() - 0.5) * halfW * 1.3,
-        y: topSurfaceY,
-        z: (Math.random() - 0.5) * halfD * 1.3,
+        x: (Math.random() - 0.5) * pelletBounds.halfW * 1.5,
+        y: pelletBounds.surfaceY,
+        z: pelletZ,
         vy: -0.28,
         nutrition: 28,
         ageSeconds: 0,
@@ -480,6 +605,22 @@ export function stepEcosystemSimulation(
 
   const liveCountTotal = ecosystem.fishes.reduce(
     (acc, f) => acc + (f.lineage.alive ? 1 : 0),
+    0
+  );
+  const adultCountTotal = ecosystem.fishes.reduce(
+    (acc, f) =>
+      acc +
+      (f.lineage.alive && (f.state.lifeStage === 'adult' || f.state.lifeStage === 'elder')
+        ? 1
+        : 0),
+    0
+  );
+  const babyCountTotal = ecosystem.fishes.reduce(
+    (acc, f) =>
+      acc +
+      (f.lineage.alive && (f.state.lifeStage === 'egg' || f.state.lifeStage === 'juvenile')
+        ? 1
+        : 0),
     0
   );
 
@@ -664,6 +805,8 @@ export function stepEcosystemSimulation(
       }
     }
 
+    const fishSliceBounds = getTankBoundsAtZ(tank, fish.state.z, isFrameless);
+
     _sensoryInputs.fill(0);
     _sensoryInputs[0] = foodDirX * fish.genetics.foragingDriveGene;
     _sensoryInputs[1] = foodDirY * fish.genetics.foragingDriveGene;
@@ -674,7 +817,7 @@ export function stepEcosystemSimulation(
     _sensoryInputs[6] = threatProximity;
     _sensoryInputs[7] = fish.state.hunger / 100;
     _sensoryInputs[8] = fish.state.energy / 100;
-    _sensoryInputs[9] = fish.state.y / Math.max(1, halfH);
+    _sensoryInputs[9] = (fish.state.y - fishSliceBounds.centerY) / Math.max(1, fishSliceBounds.halfH);
 
     const outputs = forwardFishBrain(
       fish.brain,
@@ -683,15 +826,17 @@ export function stepEcosystemSimulation(
     );
     fish.state.metrics.decisionsMade++;
 
-    // 4. Kinematics, Smooth 3D Cruising & Natural Turn Banking
+    // 4. Kinematics, Smooth 3D Frustum Cruising & Natural Turn Banking
     const maxSpeed = 2.2 * fish.genetics.maxSpeedGene * (fish.state.lifeStage === 'egg' ? 0.1 : 1.0);
 
-    // Organic 3D cruising vector so fish gracefully patrol the entire tank volume when not chasing a pellet
+    // Organic 3D cruising vector shaped to the perspective frustum (narrower in front, wider in back)
     const cruisePhase =
       (ecosystem.simHoursTotal * 1800 + idx * 1.85) * (0.45 + fish.state.personality.curiosity * 0.35);
-    const cruiseTargetX = Math.sin(cruisePhase * 0.7) * (halfW * 0.72);
-    const cruiseTargetY = Math.sin(cruisePhase * 1.1 + idx) * (halfH * 0.58);
-    const cruiseTargetZ = Math.cos(cruisePhase * 0.55 + idx * 0.7) * (halfD * 0.72);
+    const cruiseTargetZ = Math.cos(cruisePhase * 0.55 + idx * 0.7) * (halfD * 0.76);
+    const cruiseBounds = getTankBoundsAtZ(tank, cruiseTargetZ, isFrameless);
+    const cruiseTargetX = Math.sin(cruisePhase * 0.7) * (cruiseBounds.halfW * 0.76);
+    const cruiseTargetY =
+      cruiseBounds.centerY + Math.sin(cruisePhase * 1.1 + idx) * (cruiseBounds.halfH * 0.62);
 
     const toCruiseX = cruiseTargetX - fish.state.x;
     const toCruiseY = cruiseTargetY - fish.state.y;
@@ -718,14 +863,31 @@ export function stepEcosystemSimulation(
       fish.state.metrics.threatsEvaded++;
     }
 
-    // Soft curved boundary steering inside aquarium glass
-    const marginX = halfW * 0.82;
-    const marginY = halfH * 0.78;
+    // Soft curved frustum boundary steering inside aquarium walls (smaller in front, wider in back)
+    const sliceHalfW = fishSliceBounds.halfW;
+    const sliceHalfH = fishSliceBounds.halfH;
+    const marginX = sliceHalfW * 0.82;
+    const marginTopY = fishSliceBounds.centerY + sliceHalfH * 0.78;
+    const marginBotY = fishSliceBounds.centerY - sliceHalfH * 0.78;
     const marginZ = halfD * 0.82;
-    if (fish.state.x > marginX) targetVx -= ((fish.state.x - marginX) / (halfW * 0.18)) * maxSpeed * 1.4;
-    if (fish.state.x < -marginX) targetVx += ((-marginX - fish.state.x) / (halfW * 0.18)) * maxSpeed * 1.4;
-    if (fish.state.y > marginY) targetVy -= ((fish.state.y - marginY) / (halfH * 0.22)) * maxSpeed * 1.1;
-    if (fish.state.y < -marginY) targetVy += ((-marginY - fish.state.y) / (halfH * 0.22)) * maxSpeed * 1.1;
+
+    if (fish.state.x > marginX) {
+      const push = (fish.state.x - marginX) / Math.max(0.2, sliceHalfW * 0.18);
+      targetVx -= push * maxSpeed * 1.5;
+      // In frustum mode, gently guide fish swimming against the angled front-side wall slightly deeper (-Z)
+      if (isFrameless && fish.state.z > 0) targetVz -= push * maxSpeed * 0.35;
+    }
+    if (fish.state.x < -marginX) {
+      const push = (-marginX - fish.state.x) / Math.max(0.2, sliceHalfW * 0.18);
+      targetVx += push * maxSpeed * 1.5;
+      if (isFrameless && fish.state.z > 0) targetVz -= push * maxSpeed * 0.35;
+    }
+    if (fish.state.y > marginTopY) {
+      targetVy -= ((fish.state.y - marginTopY) / Math.max(0.2, sliceHalfH * 0.22)) * maxSpeed * 1.15;
+    }
+    if (fish.state.y < marginBotY) {
+      targetVy += ((marginBotY - fish.state.y) / Math.max(0.2, sliceHalfH * 0.22)) * maxSpeed * 1.15;
+    }
     if (fish.state.z > marginZ) targetVz -= ((fish.state.z - marginZ) / (halfD * 0.18)) * maxSpeed * 1.4;
     if (fish.state.z < -marginZ) targetVz += ((-marginZ - fish.state.z) / (halfD * 0.18)) * maxSpeed * 1.4;
 
@@ -734,9 +896,16 @@ export function stepEcosystemSimulation(
     fish.state.vy += (targetVy - fish.state.vy) * steerRate;
     fish.state.vz += (targetVz - fish.state.vz) * steerRate;
 
-    fish.state.x = Math.max(-halfW, Math.min(halfW, fish.state.x + fish.state.vx * realDtSeconds));
-    fish.state.y = Math.max(-halfH, Math.min(halfH, fish.state.y + fish.state.vy * realDtSeconds));
     fish.state.z = Math.max(-halfD, Math.min(halfD, fish.state.z + fish.state.vz * realDtSeconds));
+    const nextSliceBounds = getTankBoundsAtZ(tank, fish.state.z, isFrameless);
+    fish.state.x = Math.max(
+      -nextSliceBounds.halfW,
+      Math.min(nextSliceBounds.halfW, fish.state.x + fish.state.vx * realDtSeconds)
+    );
+    fish.state.y = Math.max(
+      nextSliceBounds.minY,
+      Math.min(nextSliceBounds.maxY, fish.state.y + fish.state.vy * realDtSeconds)
+    );
 
     const horizSpeed = Math.sqrt(fish.state.vx * fish.state.vx + fish.state.vz * fish.state.vz);
     if (horizSpeed > 0.03) {
@@ -766,6 +935,7 @@ export function stepEcosystemSimulation(
       fish.state.metrics.foragingAttempts++;
       fish.state.metrics.foodRoutineHits++;
       ecosystem.bioCredits += 4;
+      awardOwnerXp(ecosystem, 8);
       stepReward += 0.85;
 
       // Record food location in episodic memory ring buffer
@@ -794,13 +964,19 @@ export function stepEcosystemSimulation(
     }
 
     // 6. Gravid Gestation & Reproduction Check
-    // A fish must be able to reproduce before it dies when mature and sufficiently fed
+    // Adult tank capacity is 3 / 4 / 5 / 6, and babies (egg/juvenile) are allowed to exist OVER the max capacity!
+    // When babies mature into adults over the capacity, they stay in the tank and new breeding pauses until count drops below capacity.
+    const canSpawnBabyOverMax =
+      adultCountTotal <= tank.maxFishCapacity &&
+      babyCountTotal + newlyBorn.length < 2 &&
+      liveCountTotal + newlyBorn.length < tank.maxFishCapacity + 2;
+
     if (fish.state.isGravid) {
       fish.state.gestationHoursRemaining -= fishSimHoursDelta;
       if (fish.state.gestationHoursRemaining <= 0) {
         fish.state.isGravid = false;
         fish.state.reproductionCooldownHours = lifeCfg.reproductionIntervalHours;
-        if (liveCountTotal + newlyBorn.length < tank.maxFishCapacity) {
+        if (canSpawnBabyOverMax) {
           const father =
             ecosystem.fishes.find((f) => f.lineage.fishId === fish.state.gravidPartnerId) || null;
           const child = reproduceOffspringFish(
@@ -814,6 +990,7 @@ export function stepEcosystemSimulation(
           if (father) father.state.metrics.offspringProduced++;
           fish.state.energy = Math.max(25, fish.state.energy - 14);
           ecosystem.bioCredits += 18;
+          awardOwnerXp(ecosystem, 35);
           newlyBorn.push(child);
           birthsThisStep++;
           options?.onBirth?.(child, fish);
@@ -825,7 +1002,7 @@ export function stepEcosystemSimulation(
       fish.state.ageSimHours <= lifeCfg.maxReproductiveAgeHours &&
       fish.state.reproductionCooldownHours <= 0 &&
       fish.state.energy >= lifeCfg.minEnergyToReproduceRatio * 100 &&
-      liveCountTotal + newlyBorn.length < tank.maxFishCapacity
+      canSpawnBabyOverMax
     ) {
       // Find a mature mate of the same species (or self-fertilize if sole survivor in tank)
       const mate =
@@ -1154,6 +1331,7 @@ export function runAcceleratedHeadlessTraining(
           currentBase?.versionId || 'baseline'
         } by +${promotionThresholdDelta})`,
     brainConfig: { ...species.baseBrainConfig },
+    speciesConfig: { ...species },
     weights: bestBrain.inheritedWeights.map((w) => [...w]),
     biases: bestBrain.inheritedBiases.map((b) => [...b]),
     benchmark: bestScore,

@@ -1,0 +1,30 @@
+TVgame part : 
+it does not support game controller or TV remote controlelr , it must be supporting them
+it should open menu on "play/pause" for tv controller and on "+" or "select" or "start" buttons for game controllers
+
+trainer : 
+1- trainer is over simplified , bring back some advanced features
+
+also i want to edit base models propetiers like lifespan ...
+
+add more generations in training option .
+
+for new modal brain add a collection containing  50 top famous auarium fishes with there properties so i can choose from
+
+
+make sishe keeper , be dynamic like when a user opens the game the fish should be removed from  fish keeper so it lives into the user  game, and when he goes off the fish go back to the keeper
+
+use cant accelerate time , but add fishes to the shop he can buy as many as the active aquaruim infrastructure supports
+
+
+in keepr : the auto feeder when disabled it will uses the user own autofeeder , so it should cehck the owner feeder 
+
+
+
+
+the base aquarium tank should allow for 3 only , 
+the next is 4 
+the next is 5 
+the next is 6 
+
+max should be 6 , and allow for babies to exist over the max .

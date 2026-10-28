@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { DEFAULT_SPECIES_LIST, TANK_TIERS } from '../engine/defaults';
+import { getTankBoundsAtZ } from '../engine/simulation';
 import {
   FishEntity,
   FishPolygonQuality,
@@ -30,6 +31,7 @@ export interface AquariumCanvas3DProps {
   screensaverMode: boolean;
   qualityTier: 'low' | 'mid' | 'high';
   fishPolygonQuality?: FishPolygonQuality;
+  framelessTvMode?: boolean;
   activeTankTier: number;
   isPaused: boolean;
   onTickSimulation: (dt: number) => void;
@@ -844,6 +846,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
   screensaverMode,
   qualityTier,
   fishPolygonQuality = 'high',
+  framelessTvMode = true,
   activeTankTier,
   isPaused,
   onTickSimulation,
@@ -862,6 +865,9 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
   const fishPolygonQualityRef = useRef<FishPolygonQuality>(fishPolygonQuality);
   fishPolygonQualityRef.current = fishPolygonQuality;
+
+  const framelessTvModeRef = useRef<boolean>(framelessTvMode);
+  framelessTvModeRef.current = framelessTvMode;
 
   const isPausedRef = useRef(isPaused);
   isPausedRef.current = isPaused;
@@ -966,20 +972,209 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     scene.add(habitatGroup);
 
     let causticOverlayPlane: THREE.Mesh | null = null;
+    let activeFrustumWallsMat: THREE.MeshBasicMaterial | null = null;
+    let activeWaterSurfaceMat: THREE.MeshBasicMaterial | null = null;
     let kelpInstancedMesh: THREE.InstancedMesh | null = null;
     let kelpCountCurrent = 0;
     const kelpBasePositions: Array<{ x: number; y: number; z: number; scaleY: number; phase: number }> = [];
     let builtTankTier = -1;
+    let builtFramelessMode: boolean | null = null;
+    let builtAspect = camera.aspect;
+    const _abyssBlack = new THREE.Color(0x010409);
+    const _baseWaterColor = new THREE.Color();
+    const _ambientWaterColor = new THREE.Color();
+    const _computedBgColor = new THREE.Color();
 
-    function buildTankEnvironment(tierIdx: number) {
+    function computeUserBackgroundColor(
+      tank: { waterTintHex: string; ambientLightColorHex: string },
+      bgBrightness: number
+    ): THREE.Color {
+      const b = Math.max(0, Math.min(1, bgBrightness));
+      _baseWaterColor.set(tank.waterTintHex);
+      _ambientWaterColor.set(tank.ambientLightColorHex);
+      if (b <= 0.35) {
+        // 0.00 = pitch abyss (#010409), 0.22 (default) = deep dark midnight ocean, 0.35 = base waterTint
+        const t = b / 0.35;
+        return _computedBgColor.copy(_abyssBlack).lerp(_baseWaterColor, t);
+      } else {
+        // 0.35 .. 1.00 = smoothly brighten from base waterTint toward ambient reef blue
+        const t = ((b - 0.35) / 0.65) * 0.52;
+        return _computedBgColor.copy(_baseWaterColor).lerp(_ambientWaterColor, t);
+      }
+    }
+
+    /**
+     * Builds a custom 3D Trapezoidal Perspective-Frustum surface mesh (smaller width in front `z > 0`,
+     * wider width in back `z < 0`, sloped along the camera frustum's bottom or top ray) so Full-Screen
+     * TV Mode shows 100% of the tank's contents edge-to-edge without hiding front sides or seeing outside.
+     */
+    function buildTrapezoidalFrustumSurfaceGeometry(
+      tank: { width: number; height: number; depth: number },
+      aspect: number,
+      mode: 'floor' | 'caustic' | 'surface',
+      widthScale: number = 1.12
+    ): THREE.BufferGeometry {
+      const segX = 24;
+      const segZ = 18;
+      const cols = segX + 1;
+      const rows = segZ + 1;
+      const positions = new Float32Array(cols * rows * 3);
+      const uvs = new Float32Array(cols * rows * 2);
+
+      const halfD = tank.depth * 0.44;
+      const zFront = halfD * 1.12;
+      const zBack = -halfD * 1.16;
+
+      let ptr = 0;
+      let uvPtr = 0;
+      for (let iz = 0; iz <= segZ; iz++) {
+        const v = iz / segZ; // 0 = front (close to camera, narrower), 1 = back (far from camera, wider)
+        const z = zFront + (zBack - zFront) * v;
+        const slice = getTankBoundsAtZ(tank, z, true, aspect);
+        const spanW = slice.frustumHalfW * 2 * widthScale;
+
+        for (let ix = 0; ix <= segX; ix++) {
+          const u = ix / segX; // 0 = left, 1 = right
+          const centeredU = u - 0.5;
+          const x = centeredU * spanW;
+          const duneRipple =
+            mode !== 'surface'
+              ? Math.sin(centeredU * Math.PI * 3) * Math.cos(v * Math.PI * 2) * 0.06
+              : 0;
+          const y =
+            mode === 'floor'
+              ? slice.floorY + duneRipple
+              : mode === 'caustic'
+              ? slice.floorY + 0.035 + duneRipple
+              : slice.surfaceY;
+
+          positions[ptr++] = x;
+          positions[ptr++] = y;
+          positions[ptr++] = z;
+
+          uvs[uvPtr++] = u;
+          uvs[uvPtr++] = v;
+        }
+      }
+
+      const indices: number[] = [];
+      for (let iz = 0; iz < segZ; iz++) {
+        for (let ix = 0; ix < segX; ix++) {
+          const a = iz * cols + ix;
+          const b = (iz + 1) * cols + ix;
+          const c = (iz + 1) * cols + (ix + 1);
+          const d = iz * cols + (ix + 1);
+          // Winding so normal points +Y (upward into the tank)
+          indices.push(a, d, b);
+          indices.push(b, d, c);
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      return geo;
+    }
+
+    /**
+     * Builds the 3D Trapezoidal Frustum Side & Back Sanctuary Walls for Full-Screen TV Mode
+     * with vertical depth vertex shading (darker at the bottom abyss, slightly lighter near top surface)
+     * so the viewer never sees outside the aquarium volume and the back wall never glares.
+     */
+    function buildFrustumEnclosureWallsGeometry(
+      tank: { width: number; height: number; depth: number },
+      aspect: number
+    ): THREE.BufferGeometry {
+      const halfD = tank.depth * 0.44;
+      const zFront = halfD * 1.12;
+      const zBack = -halfD * 1.16;
+      const frontSlice = getTankBoundsAtZ(tank, zFront, true, aspect);
+      const backSlice = getTankBoundsAtZ(tank, zBack, true, aspect);
+
+      const wf = frontSlice.frustumHalfW * 1.08;
+      const wb = backSlice.frustumHalfW * 1.08;
+      const yfBot = frontSlice.floorY - 0.25;
+      const yfTop = frontSlice.surfaceY + 0.25;
+      const ybBot = backSlice.floorY - 0.25;
+      const ybTop = backSlice.surfaceY + 0.25;
+
+      // 3 quads: Left frustum wall, Right frustum wall, Back frustum wall
+      const positions = new Float32Array([
+        // Left wall (0..3: bot-front, bot-back, top-back, top-front)
+        -wf, yfBot, zFront,
+        -wb, ybBot, zBack,
+        -wb, ybTop, zBack,
+        -wf, yfTop, zFront,
+        // Right wall (4..7: bot-back, bot-front, top-front, top-back)
+        wb, ybBot, zBack,
+        wf, yfBot, zFront,
+        wf, yfTop, zFront,
+        wb, ybTop, zBack,
+        // Back wall (8..11: bot-left, bot-right, top-right, top-left)
+        -wb, ybBot, zBack,
+        wb, ybBot, zBack,
+        wb, ybTop, zBack,
+        -wb, ybTop, zBack,
+      ]);
+
+      // Vertex colors provide natural underwater depth shading (deep dark bottom -> ocean top)
+      const botShade = 0.48;
+      const topShade = 1.0;
+      const colors = new Float32Array([
+        // Left wall
+        botShade, botShade, botShade,
+        botShade, botShade, botShade,
+        topShade, topShade, topShade,
+        topShade, topShade, topShade,
+        // Right wall
+        botShade, botShade, botShade,
+        botShade, botShade, botShade,
+        topShade, topShade, topShade,
+        topShade, topShade, topShade,
+        // Back wall
+        botShade, botShade, botShade,
+        botShade, botShade, botShade,
+        topShade, topShade, topShade,
+        topShade, topShade, topShade,
+      ]);
+
+      const indices = [
+        0, 1, 2, 0, 2, 3,
+        4, 5, 6, 4, 6, 7,
+        8, 9, 10, 8, 10, 11,
+      ];
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      return geo;
+    }
+
+    function buildTankEnvironment(tierIdx: number, isFrameless: boolean) {
       while (habitatGroup.children.length > 0) {
         habitatGroup.remove(habitatGroup.children[0]);
       }
       kelpBasePositions.length = 0;
+      activeFrustumWallsMat = null;
+      activeWaterSurfaceMat = null;
 
       const tank = TANK_TIERS[tierIdx] || TANK_TIERS[0];
-      scene.background = new THREE.Color(tank.waterTintHex);
-      scene.fog = new THREE.FogExp2(tank.waterTintHex, tank.fogDensity);
+      const aspect = camera.aspect || 16 / 9;
+      builtAspect = aspect;
+
+      const initBgBrightness =
+        ecosystemRef.current.graphicsSettings?.backgroundBrightness ?? 0.22;
+      const bgCol = computeUserBackgroundColor(tank, initBgBrightness);
+
+      scene.background = bgCol.clone();
+      scene.fog = new THREE.FogExp2(
+        bgCol.clone(),
+        isFrameless ? tank.fogDensity * 0.92 : tank.fogDensity
+      );
       hemiLight.color.set(tank.ambientLightColorHex);
 
       const W = tank.width;
@@ -987,8 +1182,10 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       const D = tank.depth;
       const floorY = -H * 0.42;
 
-      // A. Sandy Seabed Base with Bump Map
-      const floorGeo = new THREE.BoxGeometry(W, 0.45, D);
+      sandMap.repeat.set(isFrameless ? 6 : 4, isFrameless ? 5 : 4);
+      sandBump.repeat.set(isFrameless ? 9 : 6, isFrameless ? 8 : 6);
+      causticMap.repeat.set(isFrameless ? 5 : 3, isFrameless ? 4 : 3);
+
       const floorMat = new THREE.MeshStandardMaterial({
         color: 0xffffff,
         map: sandMap,
@@ -996,111 +1193,145 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         bumpScale: 0.08,
         roughness: 0.88,
         metalness: 0.05,
+        side: THREE.DoubleSide,
       });
-      const floorMesh = new THREE.Mesh(floorGeo, floorMat);
-      floorMesh.position.set(0, floorY - 0.225, 0);
-      floorMesh.receiveShadow = true;
-      habitatGroup.add(floorMesh);
 
-      // B. Animated Caustic Shimmer Plane
-      const causticGeo = new THREE.PlaneGeometry(W * 0.98, D * 0.98);
-      causticGeo.rotateX(-Math.PI / 2);
       const causticMat = new THREE.MeshBasicMaterial({
         map: causticMap,
         transparent: true,
         opacity: 0.36 * tank.causticsIntensity,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
-      });
-      causticOverlayPlane = new THREE.Mesh(causticGeo, causticMat);
-      causticOverlayPlane.position.set(0, floorY + 0.025, 0);
-      habitatGroup.add(causticOverlayPlane);
-
-      // C. Architectural Aquarium Frame
-      const frameMat = new THREE.MeshStandardMaterial({
-        color: 0x0f172a,
-        roughness: 0.28,
-        metalness: 0.85,
-      });
-      const trimMat = new THREE.MeshStandardMaterial({
-        color: 0x38bdf8,
-        roughness: 0.2,
-        metalness: 0.6,
-        emissive: 0x0284c7,
-        emissiveIntensity: 0.25,
+        side: THREE.DoubleSide,
       });
 
-      const pillarGeo = new THREE.BoxGeometry(0.24, H + 0.4, 0.24);
-      const corners = [
-        [-W / 2, 0, -D / 2],
-        [W / 2, 0, -D / 2],
-        [-W / 2, 0, D / 2],
-        [W / 2, 0, D / 2],
-      ];
-      for (const [cx, cy, cz] of corners) {
-        const p = new THREE.Mesh(pillarGeo, frameMat);
-        p.position.set(cx, cy, cz);
-        habitatGroup.add(p);
-      }
-
-      const railXGeo = new THREE.BoxGeometry(W + 0.3, 0.22, 0.26);
-      const railZGeo = new THREE.BoxGeometry(0.26, 0.22, D + 0.3);
-      for (const ry of [floorY - 0.35, H * 0.46]) {
-        const rFront = new THREE.Mesh(railXGeo, frameMat);
-        rFront.position.set(0, ry, D / 2);
-        const rBack = new THREE.Mesh(railXGeo, frameMat);
-        rBack.position.set(0, ry, -D / 2);
-        const rLeft = new THREE.Mesh(railZGeo, frameMat);
-        rLeft.position.set(-W / 2, ry, 0);
-        const rRight = new THREE.Mesh(railZGeo, frameMat);
-        rRight.position.set(W / 2, ry, 0);
-        habitatGroup.add(rFront, rBack, rLeft, rRight);
-      }
-
-      // Overhead LED Canopy Light Bar
-      const canopyGroup = new THREE.Group();
-      const hoodGeo = new THREE.BoxGeometry(W * 0.72, 0.28, D * 0.32);
-      const hoodMesh = new THREE.Mesh(hoodGeo, frameMat);
-      const ledStripGeo = new THREE.PlaneGeometry(W * 0.68, D * 0.24);
-      ledStripGeo.rotateX(Math.PI / 2);
-      const ledMesh = new THREE.Mesh(ledStripGeo, trimMat);
-      ledMesh.position.y = -0.145;
-      canopyGroup.add(hoodMesh, ledMesh);
-      canopyGroup.position.set(0, H * 0.49, 0);
-      habitatGroup.add(canopyGroup);
-
-      // Back Glass Wall
-      const glassMat = new THREE.MeshPhysicalMaterial({
-        color: 0xbae6fd,
-        roughness: 0.08,
-        metalness: 0.0,
-        transmission: isSoftwareGl ? 0 : 0.85,
-        transparent: true,
-        opacity: isSoftwareGl ? 0.14 : 0.28,
-        depthWrite: false,
-      });
-      const backGlass = new THREE.Mesh(new THREE.PlaneGeometry(W, H), glassMat);
-      backGlass.position.set(0, 0.02 * H, -D / 2);
-      backGlass.renderOrder = 2;
-      habitatGroup.add(backGlass);
-
-      // Top Water Surface Meniscus (where food is sprinkled and floats before sinking)
-      const surfaceGeo = new THREE.PlaneGeometry(W * 0.98, D * 0.98);
-      surfaceGeo.rotateX(Math.PI / 2);
       const surfaceMat = new THREE.MeshBasicMaterial({
         map: causticMap,
         color: 0x7dd3fc,
         transparent: true,
-        opacity: 0.24,
+        opacity: isFrameless ? 0.16 : 0.22,
         side: THREE.DoubleSide,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
       });
-      const waterSurfaceMesh = new THREE.Mesh(surfaceGeo, surfaceMat);
-      waterSurfaceMesh.position.set(0, H * 0.355, 0);
-      habitatGroup.add(waterSurfaceMesh);
+      activeWaterSurfaceMat = surfaceMat;
 
-      // D. Composite Basalt Rock Arches & Reef Formations
+      if (isFrameless) {
+        // A. Perspective-Frustum Trapezoidal Seabed Floor (narrower in front, wider in back)
+        const frustumFloorGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'floor', 1.14);
+        const floorMesh = new THREE.Mesh(frustumFloorGeo, floorMat);
+        floorMesh.receiveShadow = true;
+        habitatGroup.add(floorMesh);
+
+        // B. Perspective-Frustum Caustic Shimmer Overlay
+        const frustumCausticGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'caustic', 1.12);
+        causticOverlayPlane = new THREE.Mesh(frustumCausticGeo, causticMat);
+        habitatGroup.add(causticOverlayPlane);
+
+        // C. Perspective-Frustum Top Water Surface Meniscus
+        const frustumSurfaceGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'surface', 1.14);
+        const waterSurfaceMesh = new THREE.Mesh(frustumSurfaceGeo, surfaceMat);
+        habitatGroup.add(waterSurfaceMesh);
+
+        // D. Frustum Sanctuary Side & Back Enclosure Walls (Unlit MeshBasicMaterial with vertex depth gradient
+        // so directional/studio lights never cause bright blue glare on the back wall!)
+        const frustumWallsGeo = buildFrustumEnclosureWallsGeometry(tank, aspect);
+        const frustumWallsMat = new THREE.MeshBasicMaterial({
+          color: bgCol.clone(),
+          vertexColors: true,
+          side: THREE.DoubleSide,
+          fog: true,
+        });
+        activeFrustumWallsMat = frustumWallsMat;
+        const frustumWallsMesh = new THREE.Mesh(frustumWallsGeo, frustumWallsMat);
+        habitatGroup.add(frustumWallsMesh);
+      } else {
+        // Classic Framed Box Tank Mode
+        const floorGeo = new THREE.BoxGeometry(W, 0.45, D);
+        const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+        floorMesh.position.set(0, floorY - 0.225, 0);
+        floorMesh.receiveShadow = true;
+        habitatGroup.add(floorMesh);
+
+        const causticGeo = new THREE.PlaneGeometry(W * 0.98, D * 0.98);
+        causticGeo.rotateX(-Math.PI / 2);
+        causticOverlayPlane = new THREE.Mesh(causticGeo, causticMat);
+        causticOverlayPlane.position.set(0, floorY + 0.025, 0);
+        habitatGroup.add(causticOverlayPlane);
+
+        const frameMat = new THREE.MeshStandardMaterial({
+          color: 0x0f172a,
+          roughness: 0.28,
+          metalness: 0.85,
+        });
+        const trimMat = new THREE.MeshStandardMaterial({
+          color: 0x38bdf8,
+          roughness: 0.2,
+          metalness: 0.6,
+          emissive: 0x0284c7,
+          emissiveIntensity: 0.25,
+        });
+
+        const pillarGeo = new THREE.BoxGeometry(0.24, H + 0.4, 0.24);
+        const corners = [
+          [-W / 2, 0, -D / 2],
+          [W / 2, 0, -D / 2],
+          [-W / 2, 0, D / 2],
+          [W / 2, 0, D / 2],
+        ];
+        for (const [cx, cy, cz] of corners) {
+          const p = new THREE.Mesh(pillarGeo, frameMat);
+          p.position.set(cx, cy, cz);
+          habitatGroup.add(p);
+        }
+
+        const railXGeo = new THREE.BoxGeometry(W + 0.3, 0.22, 0.26);
+        const railZGeo = new THREE.BoxGeometry(0.26, 0.22, D + 0.3);
+        for (const ry of [floorY - 0.35, H * 0.46]) {
+          const rFront = new THREE.Mesh(railXGeo, frameMat);
+          rFront.position.set(0, ry, D / 2);
+          const rBack = new THREE.Mesh(railXGeo, frameMat);
+          rBack.position.set(0, ry, -D / 2);
+          const rLeft = new THREE.Mesh(railZGeo, frameMat);
+          rLeft.position.set(-W / 2, ry, 0);
+          const rRight = new THREE.Mesh(railZGeo, frameMat);
+          rRight.position.set(W / 2, ry, 0);
+          habitatGroup.add(rFront, rBack, rLeft, rRight);
+        }
+
+        const canopyGroup = new THREE.Group();
+        const hoodGeo = new THREE.BoxGeometry(W * 0.72, 0.28, D * 0.32);
+        const hoodMesh = new THREE.Mesh(hoodGeo, frameMat);
+        const ledStripGeo = new THREE.PlaneGeometry(W * 0.68, D * 0.24);
+        ledStripGeo.rotateX(Math.PI / 2);
+        const ledMesh = new THREE.Mesh(ledStripGeo, trimMat);
+        ledMesh.position.y = -0.145;
+        canopyGroup.add(hoodMesh, ledMesh);
+        canopyGroup.position.set(0, H * 0.49, 0);
+        habitatGroup.add(canopyGroup);
+
+        const glassMat = new THREE.MeshPhysicalMaterial({
+          color: 0xbae6fd,
+          roughness: 0.08,
+          metalness: 0.0,
+          transmission: isSoftwareGl ? 0 : 0.85,
+          transparent: true,
+          opacity: isSoftwareGl ? 0.14 : 0.28,
+          depthWrite: false,
+        });
+        const backGlass = new THREE.Mesh(new THREE.PlaneGeometry(W, H), glassMat);
+        backGlass.position.set(0, 0.02 * H, -D / 2);
+        backGlass.renderOrder = 2;
+        habitatGroup.add(backGlass);
+
+        const surfaceGeo = new THREE.PlaneGeometry(W * 0.98, D * 0.98);
+        surfaceGeo.rotateX(Math.PI / 2);
+        const waterSurfaceMesh = new THREE.Mesh(surfaceGeo, surfaceMat);
+        waterSurfaceMesh.position.set(0, H * 0.355, 0);
+        habitatGroup.add(waterSurfaceMesh);
+      }
+
+      // D. Composite Basalt Rock Arches & Reef Formations (Positioned inside the Frustum!)
       const rockMat = new THREE.MeshStandardMaterial({
         color: 0x1e293b,
         bumpMap: sandBump,
@@ -1118,8 +1349,9 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       for (let r = 0; r < tank.rockArchCount; r++) {
         const archGroup = new THREE.Group();
         const angle = (r / Math.max(1, tank.rockArchCount)) * Math.PI * 1.6 - Math.PI * 0.8;
-        const rx = Math.sin(angle) * (W * 0.32);
-        const rz = -D * 0.15 + Math.cos(angle * 2) * (D * 0.22);
+        const rz = -D * 0.14 + Math.cos(angle * 2) * (D * 0.22);
+        const rSlice = getTankBoundsAtZ(tank, rz, isFrameless, aspect);
+        const rx = Math.sin(angle) * (rSlice.halfW * 0.72);
 
         const baseLeft = new THREE.Mesh(dodecaGeo, rockMat);
         baseLeft.scale.set(1.2, 1.4, 1.0);
@@ -1138,12 +1370,12 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         mossCap.position.set(0, 1.92, 0.05);
 
         archGroup.add(baseLeft, baseRight, bridge, mossCap);
-        archGroup.position.set(rx, floorY, rz);
+        archGroup.position.set(rx, rSlice.floorY, rz);
         archGroup.rotation.y = (r * 1.1) % Math.PI;
         habitatGroup.add(archGroup);
       }
 
-      // E. Bioluminescent Coral Colonies
+      // E. Bioluminescent Coral Colonies (Scaled to Frustum Width & Floor Height at Z)
       const coralColors = [0xf43f5e, 0xf59e0b, 0xa855f7, 0x06b6d4, 0x10b981];
       const branchGeo = new THREE.CylinderGeometry(0.06, 0.14, 0.9, 8);
       branchGeo.translate(0, 0.45, 0);
@@ -1170,13 +1402,14 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
           branch.add(tip);
           coralGroup.add(branch);
         }
-        const cx = (((c * 67) % 100) / 100 - 0.5) * (W * 0.78);
-        const cz = (((c * 43) % 100) / 100 - 0.5) * (D * 0.72);
-        coralGroup.position.set(cx, floorY, cz);
+        const cz = (((c * 43) % 100) / 100 - 0.5) * (D * 0.74);
+        const cSlice = getTankBoundsAtZ(tank, cz, isFrameless, aspect);
+        const cx = (((c * 67) % 100) / 100 - 0.5) * (cSlice.halfW * 1.72);
+        coralGroup.position.set(cx, cSlice.floorY, cz);
         habitatGroup.add(coralGroup);
       }
 
-      // F. Swaying Botanical Kelp Blades (`InstancedMesh`)
+      // F. Swaying Botanical Kelp Blades (`InstancedMesh`, Distributed inside Frustum)
       kelpCountCurrent = tank.kelpCount;
       const kelpGeo = new THREE.CylinderGeometry(0.03, 0.08, 2.6, 7, 5);
       kelpGeo.scale(1.8, 1.0, 0.45);
@@ -1190,11 +1423,12 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       kelpInstancedMesh.frustumCulled = false;
 
       for (let k = 0; k < kelpCountCurrent; k++) {
-        const kx = (((k * 89) % 100) / 100 - 0.5) * (W * 0.84);
-        const kz = -D * 0.35 + (((k * 31) % 100) / 100) * (D * 0.65);
+        const kz = -D * 0.36 + (((k * 31) % 100) / 100) * (D * 0.68);
+        const kSlice = getTankBoundsAtZ(tank, kz, isFrameless, aspect);
+        const kx = (((k * 89) % 100) / 100 - 0.5) * (kSlice.halfW * 1.8);
         const sy = 0.65 + ((k * 19) % 10) * 0.08;
-        kelpBasePositions.push({ x: kx, y: floorY, z: kz, scaleY: sy, phase: k * 0.7 });
-        _vec3A.set(kx, floorY, kz);
+        kelpBasePositions.push({ x: kx, y: kSlice.floorY, z: kz, scaleY: sy, phase: k * 0.7 });
+        _vec3A.set(kx, kSlice.floorY, kz);
         _euler.set(0, (k * 0.5) % Math.PI, 0);
         _quat.setFromEuler(_euler);
         _scaleVec.set(1, sy, 1);
@@ -1208,7 +1442,13 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       habitatGroup.add(kelpInstancedMesh);
     }
 
-    buildTankEnvironment(activeTankTierRef.current);
+    const initialFrameless =
+      ecosystemRef.current.graphicsSettings?.framelessTvMode !== undefined
+        ? ecosystemRef.current.graphicsSettings.framelessTvMode
+        : framelessTvModeRef.current;
+    builtTankTier = activeTankTierRef.current;
+    builtFramelessMode = initialFrameless;
+    buildTankEnvironment(builtTankTier, builtFramelessMode);
 
     // 5. Rising Oxygen Bubble Stream (`InstancedMesh` Pool — Zero Allocation)
     const BUBBLE_COUNT = qualityTier === 'low' ? 24 : 56;
@@ -1225,11 +1465,14 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     bubbleInstanced.frustumCulled = false;
     scene.add(bubbleInstanced);
 
+    const initTank = TANK_TIERS[builtTankTier] || TANK_TIERS[0];
     const bubbleStates = new Float32Array(BUBBLE_COUNT * 4);
     for (let i = 0; i < BUBBLE_COUNT; i++) {
-      bubbleStates[i * 4 + 0] = (Math.random() - 0.5) * 12;
-      bubbleStates[i * 4 + 1] = (Math.random() - 0.5) * 7;
-      bubbleStates[i * 4 + 2] = (Math.random() - 0.5) * 7;
+      const bz = (Math.random() - 0.5) * (initTank.depth * 0.74);
+      const bSlice = getTankBoundsAtZ(initTank, bz, builtFramelessMode !== false, camera.aspect);
+      bubbleStates[i * 4 + 0] = (Math.random() - 0.5) * (bSlice.halfW * 1.7);
+      bubbleStates[i * 4 + 1] = bSlice.floorY + Math.random() * (bSlice.surfaceY - bSlice.floorY);
+      bubbleStates[i * 4 + 2] = bz;
       bubbleStates[i * 4 + 3] = 0.65 + Math.random() * 0.9;
     }
 
@@ -1320,22 +1563,68 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         onTickRef.current(rawDt);
       }
 
-      if (builtTankTier !== activeTankTierRef.current) {
+      const eco = ecosystemRef.current;
+      const targetFrameless =
+        eco.graphicsSettings?.framelessTvMode !== undefined
+          ? eco.graphicsSettings.framelessTvMode
+          : framelessTvModeRef.current;
+
+      if (
+        builtTankTier !== activeTankTierRef.current ||
+        builtFramelessMode !== targetFrameless ||
+        (targetFrameless && Math.abs(camera.aspect - builtAspect) > 0.05)
+      ) {
         builtTankTier = activeTankTierRef.current;
-        buildTankEnvironment(builtTankTier);
+        builtFramelessMode = targetFrameless;
+        buildTankEnvironment(builtTankTier, builtFramelessMode);
       }
 
-      const eco = ecosystemRef.current;
       const tank = TANK_TIERS[builtTankTier] || TANK_TIERS[0];
-      const floorY = -tank.height * 0.42;
+      const isFramelessNow = builtFramelessMode !== false;
       const targetPolyQuality =
         eco.graphicsSettings?.fishPolygonQuality || fishPolygonQualityRef.current || 'high';
+
+      // Apply user lighting & back-of-tank background brightness settings in real time
+      const userLightIntensity = Math.max(
+        0.15,
+        Math.min(1.8, eco.graphicsSettings?.lightIntensity ?? 0.95)
+      );
+      const userBgBrightness = Math.max(
+        0.0,
+        Math.min(1.0, eco.graphicsSettings?.backgroundBrightness ?? 0.22)
+      );
+      const liveBgCol = computeUserBackgroundColor(tank, userBgBrightness);
+      if (scene.background instanceof THREE.Color) {
+        scene.background.copy(liveBgCol);
+      } else {
+        scene.background = liveBgCol.clone();
+      }
+      if (scene.fog instanceof THREE.FogExp2) {
+        scene.fog.color.copy(liveBgCol);
+      }
+      if (activeFrustumWallsMat) {
+        activeFrustumWallsMat.color.copy(liveBgCol);
+      }
+      if (activeWaterSurfaceMat) {
+        activeWaterSurfaceMat.opacity =
+          (isFramelessNow ? 0.14 : 0.2) * Math.min(1.25, userLightIntensity);
+      }
+
+      hemiLight.intensity = 1.05 * userLightIntensity;
+      sunKeyLight.intensity = 1.65 * userLightIntensity;
+      rimLight.intensity = 0.8 * userLightIntensity;
+      frontFillLight.intensity = 0.55 * userLightIntensity;
+      renderer.toneMappingExposure = 0.85 + 0.28 * Math.min(1.4, userLightIntensity);
 
       // Animate caustics & swaying kelp
       causticMap.offset.x = (elapsedTotal * 0.03) % 1;
       causticMap.offset.y = (elapsedTotal * 0.022) % 1;
       if (causticOverlayPlane) {
         causticOverlayPlane.visible = eco.graphicsSettings?.showCaustics !== false;
+        const cMat = causticOverlayPlane.material as THREE.MeshBasicMaterial;
+        if (cMat) {
+          cMat.opacity = 0.32 * tank.causticsIntensity * Math.min(1.3, userLightIntensity);
+        }
       }
 
       if (kelpInstancedMesh) {
@@ -1352,19 +1641,21 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         kelpInstancedMesh.instanceMatrix.needsUpdate = true;
       }
 
-      // Update rising oxygen bubbles
+      // Update rising oxygen bubbles inside frustum bounds
       const showParticles = eco.graphicsSettings?.showParticles !== false;
       bubbleInstanced.visible = showParticles;
       if (showParticles) {
-        const halfH = tank.height * 0.42;
         for (let i = 0; i < BUBBLE_COUNT; i++) {
           const base = i * 4;
+          const bSlice = getTankBoundsAtZ(tank, bubbleStates[base + 2], isFramelessNow, camera.aspect);
           if (!isPausedRef.current) {
             bubbleStates[base + 1] += bubbleStates[base + 3] * rawDt;
-            if (bubbleStates[base + 1] > halfH) {
-              bubbleStates[base + 1] = -halfH;
-              bubbleStates[base + 0] = (Math.random() - 0.5) * (tank.width * 0.78);
-              bubbleStates[base + 2] = (Math.random() - 0.5) * (tank.depth * 0.72);
+            if (bubbleStates[base + 1] > bSlice.surfaceY) {
+              const newBz = (Math.random() - 0.5) * (tank.depth * 0.74);
+              const newSlice = getTankBoundsAtZ(tank, newBz, isFramelessNow, camera.aspect);
+              bubbleStates[base + 2] = newBz;
+              bubbleStates[base + 1] = newSlice.floorY;
+              bubbleStates[base + 0] = (Math.random() - 0.5) * (newSlice.halfW * 1.72);
             }
           }
           const wobble = Math.sin(elapsedTotal * 3 + i) * 0.08;
@@ -1488,9 +1779,10 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         // Real aquarium simulation: never draw sci-fi selection rings around individual fish
         rig.selectionRing.visible = false;
 
-        // Grounded contact shadow on seabed
-        rig.shadowDisc.position.set(fish.state.x, floorY + 0.03, fish.state.z);
-        const heightAboveFloor = Math.max(0.1, fish.state.y - floorY);
+        // Grounded contact shadow on the sloped frustum seabed at the fish's Z depth
+        const fishSlice = getTankBoundsAtZ(tank, fish.state.z, isFramelessNow, camera.aspect);
+        rig.shadowDisc.position.set(fish.state.x, fishSlice.floorY + 0.04, fish.state.z);
+        const heightAboveFloor = Math.max(0.1, fish.state.y - fishSlice.floorY);
         const shadowScale = Math.max(0.3, scale * (1.1 - heightAboveFloor * 0.05));
         rig.shadowDisc.scale.set(shadowScale, shadowScale, shadowScale);
       }
@@ -1519,21 +1811,42 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         });
       }
 
-      // 10. Unified Calm Full-Aquarium Screensaver & Owner View
+      // 10. Frustum-Fitted Full-Screen TV Camera vs Framed Tank View
       const dampFactor = 1 - Math.exp(-3.8 * rawDt);
       const orb = cameraOrbitRef.current;
-      const swayAngle = Math.sin(elapsedTotal * 0.07) * 0.26 + orb.yaw * 0.5;
-      const baseDist = (tank.width * 0.68 + 4.8) * orb.zoom;
-      _vec3CamTarget.set(
-        Math.sin(swayAngle) * baseDist,
-        Math.sin(elapsedTotal * 0.09) * 0.65 + 0.9 + orb.pitch * 3.0,
-        Math.cos(swayAngle) * baseDist
-      );
-      _vec3LookTarget.set(
-        Math.cos(elapsedTotal * 0.05) * (tank.width * 0.08),
-        Math.sin(elapsedTotal * 0.08) * 0.35,
-        0
-      );
+      const centerSlice = getTankBoundsAtZ(tank, 0, isFramelessNow, camera.aspect);
+
+      if (isFramelessNow) {
+        // Locked to the exact apex of the 3D perspective-frustum aquarium so:
+        // - Front fishes (z > 0) are close and crisp without ever hiding off the front-left/right sides
+        // - Back fishes (z < 0) span the full wide rear frustum
+        // - You see 100% of the tank's contents edge-to-edge without seeing outside the tank
+        const swayAngle = Math.sin(elapsedTotal * 0.05) * 0.032 + orb.yaw * 0.2;
+        const baseDist = centerSlice.camZ * orb.zoom;
+        _vec3CamTarget.set(
+          Math.sin(swayAngle) * baseDist,
+          Math.sin(elapsedTotal * 0.07) * 0.12 + orb.pitch * 1.8,
+          Math.cos(swayAngle) * baseDist
+        );
+        _vec3LookTarget.set(
+          Math.cos(elapsedTotal * 0.04) * 0.14,
+          Math.sin(elapsedTotal * 0.06) * 0.08,
+          0
+        );
+      } else {
+        const swayAngle = Math.sin(elapsedTotal * 0.07) * 0.26 + orb.yaw * 0.5;
+        const baseDist = (tank.width * 0.68 + 4.8) * orb.zoom;
+        _vec3CamTarget.set(
+          Math.sin(swayAngle) * baseDist,
+          Math.sin(elapsedTotal * 0.09) * 0.65 + 0.9 + orb.pitch * 3.0,
+          Math.cos(swayAngle) * baseDist
+        );
+        _vec3LookTarget.set(
+          Math.cos(elapsedTotal * 0.05) * (tank.width * 0.06),
+          Math.sin(elapsedTotal * 0.08) * 0.25,
+          0
+        );
+      }
 
       camera.position.lerp(_vec3CamTarget, dampFactor);
       camera.lookAt(_vec3LookTarget);

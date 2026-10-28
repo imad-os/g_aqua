@@ -15,10 +15,12 @@ import {
   getDoc,
   getDocs,
   deleteDoc,
+  onSnapshot,
   query,
   limit,
 } from 'firebase/firestore';
 import { applyFishLifetimeLearning, forwardFishBrain } from './brain';
+import { DEFAULT_BRAIN_CONFIG } from './defaults';
 import {
   AdminUserRecord,
   ExperimentComparisonResult,
@@ -424,6 +426,7 @@ export async function saveModelVersionToFirestore(
     isPromotedBase: model.isPromotedBase,
     notes: model.notes,
     brainConfig: model.brainConfig,
+    speciesConfig: model.speciesConfig || null,
     layers,
     benchmark: model.benchmark,
     savedAtMs: Date.now(),
@@ -444,7 +447,7 @@ export async function saveModelVersionToFirestore(
         });
       }
       filtered.unshift(model);
-      localStorage.setItem(LOCAL_BASE_MODELS_CACHE_KEY, JSON.stringify(filtered.slice(0, 50)));
+      localStorage.setItem(LOCAL_BASE_MODELS_CACHE_KEY, JSON.stringify(filtered.slice(0, 65)));
     }
   } catch {
     // ignore
@@ -469,7 +472,7 @@ export async function saveModelVersionToFirestore(
  */
 export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord[]> {
   try {
-    const snap = await getDocs(query(collection(aiFirestore, 'base_models'), limit(50)));
+    const snap = await getDocs(query(collection(aiFirestore, 'base_models'), limit(80)));
     const models: ModelVersionRecord[] = [];
     snap.forEach((d) => {
       if (d.id.startsWith('active__')) return; // Skip pointer duplicates in version list
@@ -485,6 +488,7 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
           isPromotedBase: Boolean(data.isPromotedBase),
           notes: data.notes || '',
           brainConfig: data.brainConfig,
+          speciesConfig: data.speciesConfig || undefined,
           weights: layers.map((l) => l.w || []),
           biases: layers.map((l) => l.b || []),
           benchmark: data.benchmark,
@@ -509,8 +513,39 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
 }
 
 // ============================================================================
-// 3. USER FISH BRAINS & 24/7 OFFLINE FISH SERVICE (`mypc_user_brains`)
+// 3. USER FISH BRAINS & 24/7 DYNAMIC OFFLINE FISH KEEPER (`mypc_user_brains`)
 // ============================================================================
+
+/**
+ * Immediately marks a MyPC user as Online (in-game) or Offline (in Keeper) in Firestore
+ * so the 24/7 Fish Keeper dynamically removes their fishes when they open the game
+ * and brings them back when they close the game.
+ */
+export async function setUserOnlineStatusInFirestore(
+  username: string,
+  profileId: string,
+  isActivelyPlaying: boolean,
+  autoFeederStock: number
+): Promise<void> {
+  try {
+    const docId = sanitizeKey(username);
+    const now = Date.now();
+    await setDoc(
+      doc(aiFirestore, 'mypc_user_brains', docId),
+      {
+        username: username || 'Keeper',
+        profileId: profileId || 'default',
+        updatedAtMs: now,
+        isActivelyPlaying,
+        lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
+        autoFeederStock,
+      },
+      { merge: true }
+    );
+  } catch {
+    // ignore transient offline
+  }
+}
 
 /**
  * Syncs AI-specific data (individual fish brains + active play heartbeat) to Firestore
@@ -624,22 +659,63 @@ export async function fetchAllUserBrainRecordsFromFirestore(): Promise<
   }
 }
 
+/**
+ * Real-time subscription to `mypc_user_brains` so the 24/7 Fish Keeper immediately
+ * removes a user's fishes when they open the game and restores them when they leave.
+ */
+export function subscribeToAllUserBrainRecords(
+  onUpdate: (records: CloudUserBrainRecord[]) => void
+): () => void {
+  try {
+    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(25));
+    return onSnapshot(
+      q,
+      (snap) => {
+        const list: CloudUserBrainRecord[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as any;
+          list.push({
+            ...data,
+            fishBrains: (data.fishBrains || []).map((fb: any) => ({
+              ...fb,
+              brain: fromFirestoreSafeBrain(fb.brain),
+            })),
+          } as CloudUserBrainRecord);
+        });
+        onUpdate(list);
+      },
+      () => {
+        // Fallback if snapshot listener errors
+      }
+    );
+  } catch {
+    return () => {};
+  }
+}
+
 const _cloudSensory = new Float32Array(32);
 
 /**
  * Steps a remote MyPC user's offline fishes in the 24/7 Trainer Offline Service and persists
  * updated brains, energy, hunger, and starvation status back to Firestore (`mypc_user_brains`).
+ *
+ * When `trainerAutoFeedOverride` is disabled (`false`), the Keeper checks the owner's own
+ * auto-feeder (`record.autoFeederStock > 0`) so fishes whose owner installed an auto-feeder
+ * are still fed automatically using the owner's feeder!
  */
 export async function stepAndSyncCloudUserOfflineFishes(
   record: CloudUserBrainRecord,
   simHoursDelta: number,
-  trainerAutoFeedEnabled: boolean
+  trainerAutoFeedOverride: boolean
 ): Promise<{
   updatedLiveCount: number;
   newlyStarvedNames: string[];
+  usedOwnerAutoFeeder: boolean;
 }> {
   let updatedLiveCount = 0;
   const newlyStarvedNames: string[] = [];
+  const ownerHasAutoFeeder = Number(record.autoFeederStock || 0) > 0;
+  const effectiveFeederActive = trainerAutoFeedOverride || ownerHasAutoFeeder;
 
   for (const fb of record.fishBrains) {
     if (!fb.alive) continue;
@@ -654,20 +730,20 @@ export async function stepAndSyncCloudUserOfflineFishes(
     _cloudSensory.fill(0);
     _cloudSensory[0] = Math.sin(fb.ageSimHours * 5);
     _cloudSensory[2] = Math.cos(fb.ageSimHours * 5);
-    _cloudSensory[3] = trainerAutoFeedEnabled || record.autoFeederStock > 0 ? 0.75 : 0.0;
+    _cloudSensory[3] = effectiveFeederActive ? 0.75 : 0.0;
     _cloudSensory[7] = fb.hunger / 100;
     _cloudSensory[8] = fb.energy / 100;
 
     forwardFishBrain(fb.brain, _cloudSensory, 0.05);
     fb.decisionsMade = (fb.decisionsMade || 0) + 1;
 
-    // If feeder is active and fish is hungry, fish forages and learns
-    if ((trainerAutoFeedEnabled || record.autoFeederStock > 0) && fb.hunger > 28) {
+    // If trainer override feeder OR owner's own auto-feeder is active, hungry fish eats & learns
+    if (effectiveFeederActive && fb.hunger > 28) {
       fb.energy = Math.min(100, Number((fb.energy + 22 * simHoursDelta * 4).toFixed(2)));
       fb.hunger = Number((100 - fb.energy).toFixed(2));
       fb.foodPelletsEaten = (fb.foodPelletsEaten || 0) + 1;
       fb.lifetimeReward = Number(((fb.lifetimeReward || 0) + 0.35).toFixed(2));
-      applyFishLifetimeLearning(fb.brain, 0.35, 0.015, 0.0005);
+      applyFishLifetimeLearning(fb.brain, 0.35, DEFAULT_BRAIN_CONFIG);
     }
 
     // Check starvation or old age death
@@ -701,7 +777,11 @@ export async function stepAndSyncCloudUserOfflineFishes(
     // ignore transient offline
   }
 
-  return { updatedLiveCount, newlyStarvedNames };
+  return {
+    updatedLiveCount,
+    newlyStarvedNames,
+    usedOwnerAutoFeeder: !trainerAutoFeedOverride && ownerHasAutoFeeder,
+  };
 }
 
 /**

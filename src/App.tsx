@@ -4,14 +4,18 @@ import {
   getPolygonSpecForQuality,
 } from './components/AquariumCanvas3D';
 import { audioEngine } from './engine/audio';
+import { createBaseBrainInstance } from './engine/brain';
 import { DEFAULT_SPECIES_LIST, TANK_TIERS } from './engine/defaults';
 import {
   fetchBaseModelsFromFirestore,
   loadUserBrainsFromFirestore,
+  setUserOnlineStatusInFirestore,
   syncUserBrainsToFirestore,
 } from './engine/firebaseBrainer';
 import { getMyPC, I18N, MyPCInfo } from './engine/mypc';
 import {
+  awardOwnerXp,
+  getTankBoundsAtZ,
   nextEntityId,
   spawnFoundingFish,
   stepEcosystemSimulation,
@@ -23,14 +27,22 @@ import {
   saveEcosystemState,
 } from './engine/storage';
 import {
+  FishBrainInstance,
   FishPolygonQuality,
   FoodPellet,
   SavedEcosystemState,
+  SpeciesConfig,
   ThreatEntity,
 } from './engine/types';
 
 type GameScreenState = 'title' | 'playing' | 'paused';
-type SettingsModalTab = 'fish_stats' | 'graphics_polygons' | 'aquarium_shop';
+type SettingsModalTab = 'fish_stats' | 'aquarium_shop' | 'graphics_polygons';
+
+const MODAL_TABS_ORDER: SettingsModalTab[] = [
+  'fish_stats',
+  'aquarium_shop',
+  'graphics_polygons',
+];
 
 interface HelpTopic {
   title: string;
@@ -49,25 +61,30 @@ const HELP_TOPICS: Record<string, HelpTopic> = {
     body: 'Controls real-time underwater soft shadows, glass reflections, and high-DPI retina sharpness inside the aquarium.',
     tip: 'Set to "High" for realistic seabed shadows beneath swimming fishes.',
   },
-  time_speed: {
-    title: 'Aquarium Biological Clock Speed',
-    body: 'Fishes age, get hungry, mature, and naturally breed based on simulation hours. At 1x speed, 1 simulation hour equals 1 real hour. At 24x speed, a full 24-hour fish day passes in 1 real hour.',
-    tip: 'Use 6x or 24x if you want to watch your 2 starter fishes grow up and have babies sooner.',
+  owner_level_shop: {
+    title: 'Owner Level, Fish Shop & Tank Space (3 to 6 Max)',
+    body: 'Feeding fishes, keeping water clean, and raising babies earns Owner XP and raises your Owner Level. Higher Owner Levels unlock new famous fish species in the shop! Upgrading your aquarium tank is strictly for more space: Tank 1 holds 3 fishes, Tank 2 holds 4, Tank 3 holds 5, and Tank 4 holds the maximum of 6 fishes.',
+    tip: 'Babies hatched by AI breeding are allowed to exist OVER your tank’s max capacity! When those babies mature into adults over the limit, they stay safely in your tank and new breeding pauses until space frees up.',
   },
   ai_breeding: {
-    title: '100% AI-Driven Natural Breeding & Satisfaction',
-    body: 'Just like a real aquarium, you cannot force fishes to hatch babies manually. When two adult fishes are well-fed (Energy above 60%) and comfortable in clean water, their AI naturally courts and produces offspring that inherit the mother’s brain.',
-    tip: 'Sprinkle food on top of the water regularly and keep water quality clean so your fishes stay satisfied and reproduce on their own!',
+    title: '100% AI-Driven Natural Breeding & Baby Overflow',
+    body: 'Just like a real aquarium, you cannot force fishes to hatch babies manually. When adult fishes are well-fed (Energy above 60%) and comfortable in clean water, their AI naturally courts and produces offspring that inherit the mother’s brain. Babies can even hatch over the tank capacity limit (3/4/5/6)!',
+    tip: 'Sprinkle food on top of the water regularly and keep water quality clean so your fishes stay satisfied and reproduce on their own.',
   },
-  top_feeding: {
-    title: 'Top-Surface Aquarium Feeding',
-    body: 'When you sprinkle food, flakes and pellets float on the top water surface for a few seconds before slowly sinking toward the sand. Hungry fishes sense the food and swim up toward the surface to eat.',
-    tip: 'Press OK / A / Space anytime while watching your aquarium to sprinkle food across the top water surface.',
+  controller_remote: {
+    title: 'TV Remote & Game Controller Support',
+    body: 'You can play and navigate the entire aquarium and menus using either a TV Remote Controller or a Gamepad Controller. Press "Play/Pause" on your TV Remote or "+ / Select / Start" on your Game Controller anytime to open or close the Owner Menu.',
+    tip: 'Use D-Pad / Arrow keys to move between buttons, LB / RB to switch tabs, OK / A to confirm, and Back / B to close.',
   },
   water_care: {
-    title: 'Water Quality & Comfort',
-    body: 'Clean, well-filtered water keeps fish stress low and health at 100%. High comfort encourages adult fishes to mate and pass their learned brain behaviors to the next generation.',
-    tip: 'Click "Refresh Water & Filter" whenever water quality dips below 90%.',
+    title: 'Water Quality, Auto-Feeder & 24/7 Offline Keeper',
+    body: 'Clean water keeps fish stress low. Installing a Top Auto-Feeder not only feeds your fishes while you watch, but also feeds them automatically in the 24/7 Offline Fish Keeper when you close the game!',
+    tip: 'Buy a Top Auto-Feeder in the Shop so your fishes are fed using your own feeder even when the Trainer’s override feeder is off.',
+  },
+  frameless_tv: {
+    title: 'Full-Screen TV Aquarium Mode (No Tank Frames)',
+    body: 'Turns your entire TV or monitor into a frameless, edge-to-edge living aquarium window with no metal tank borders or hood. This is the default mode.',
+    tip: 'In Full-Screen TV Mode, use the Left / Right / Up / Down arrows on your TV remote or controller to move focus across the buttons on top, and press OK / A to activate the focused button.',
   },
 };
 
@@ -101,16 +118,33 @@ export default function App() {
     );
   });
 
-  const [ecosystem, setEcosystem] = useState<SavedEcosystemState>(() =>
-    loadEcosystemState()
-  );
+  const [ecosystem, setEcosystem] = useState<SavedEcosystemState>(() => {
+    const loaded = loadEcosystemState();
+    // User cannot accelerate time in the player game — always 1x real-time
+    loaded.timeMultiplier = 1;
+    return loaded;
+  });
   const ecosystemRef = useRef<SavedEcosystemState>(ecosystem);
   ecosystemRef.current = ecosystem;
 
   // Settings & Fish Stats Modal State
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
+  const settingsOpenRef = useRef<boolean>(false);
+  settingsOpenRef.current = settingsOpen;
+
   const [settingsTab, setSettingsTab] = useState<SettingsModalTab>('fish_stats');
+  const settingsTabRef = useRef<SettingsModalTab>('fish_stats');
+  settingsTabRef.current = settingsTab;
+
   const [helpModalTopic, setHelpModalTopic] = useState<HelpTopic | null>(null);
+  const helpModalRef = useRef<HelpTopic | null>(null);
+  helpModalRef.current = helpModalTopic;
+
+  // Spatial TV Remote / Gamepad Focus Index inside open dialogs
+  const [focusedBtnIndex, setFocusedBtnIndex] = useState<number>(0);
+  const focusedBtnIndexRef = useRef<number>(0);
+  focusedBtnIndexRef.current = focusedBtnIndex;
+
   const [polyStats, setPolyStats] = useState<{
     trianglesPerFish: number;
     totalFishTriangles: number;
@@ -118,6 +152,9 @@ export default function App() {
 
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [lastControllerInputLabel, setLastControllerInputLabel] = useState<string>(
+    'TV Remote [Play/Pause] or Gamepad [+ / Select / Start] opens Menu'
+  );
 
   // Real-time simulation refs
   const pelletsRef = useRef<FoodPellet[]>([]);
@@ -134,6 +171,8 @@ export default function App() {
   });
   const lastHudSyncMsRef = useRef<number>(0);
   const lastFirestoreSyncMsRef = useRef<number>(0);
+  const prevGamepadButtonsRef = useRef<boolean[]>([]);
+  const lastDpadAxisMoveMsRef = useRef<number>(0);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -141,7 +180,7 @@ export default function App() {
 
   useEffect(() => {
     if (!toastMessage) return;
-    const t = window.setTimeout(() => setToastMessage(null), 4000);
+    const t = window.setTimeout(() => setToastMessage(null), 4200);
     return () => window.clearTimeout(t);
   }, [toastMessage]);
 
@@ -151,47 +190,189 @@ export default function App() {
     }
   }, [screenState]);
 
-  // Publish active game session heartbeat so the standalone Back-Office Trainer App's
-  // 24/7 Offline Service knows this owner is currently watching their tank live
-  useEffect(() => {
-    const currentTank =
-      TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
-    const isPlayingNow = screenState === 'playing';
-    publishActiveGameSessionLease(currentTank.id, isPlayingNow);
+  // Helper to get all currently visible focusable buttons in the active modal or overlay
+  const getVisibleFocusableButtons = useCallback((): HTMLButtonElement[] => {
+    if (typeof document === 'undefined') return [];
+    const scopeSelector = helpModalRef.current
+      ? '[data-modal-scope="help"]'
+      : settingsOpenRef.current
+      ? '[data-modal-scope="settings"]'
+      : screenStateRef.current === 'paused'
+      ? '[data-modal-scope="paused"]'
+      : screenStateRef.current === 'title'
+      ? '[data-modal-scope="title"]'
+      : '[data-modal-scope="hud"]';
 
-    if (!isPlayingNow) return;
+    const container = document.querySelector(scopeSelector) || document;
+    const nodes = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        'button[data-tv-focusable="true"]:not([disabled])'
+      )
+    );
+    return nodes.filter((el) => el.offsetParent !== null);
+  }, []);
+
+  // Keep TV Remote / Gamepad visual focus synced when modals or tabs change
+  useEffect(() => {
+    setFocusedBtnIndex(0);
+    focusedBtnIndexRef.current = 0;
+    const timer = window.setTimeout(() => {
+      const buttons = getVisibleFocusableButtons();
+      if (buttons[0]) {
+        buttons[0].focus({ preventScroll: false });
+      }
+    }, 40);
+    return () => window.clearTimeout(timer);
+  }, [settingsOpen, settingsTab, helpModalTopic, screenState, getVisibleFocusableButtons]);
+
+  const moveControllerFocus = useCallback(
+    (delta: number) => {
+      const buttons = getVisibleFocusableButtons();
+      if (buttons.length === 0) return;
+      const nextIdx =
+        (((focusedBtnIndexRef.current + delta) % buttons.length) + buttons.length) %
+        buttons.length;
+      focusedBtnIndexRef.current = nextIdx;
+      setFocusedBtnIndex(nextIdx);
+      const target = buttons[nextIdx];
+      if (target) {
+        target.focus({ preventScroll: false });
+        target.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    },
+    [getVisibleFocusableButtons]
+  );
+
+  const activateFocusedControllerButton = useCallback((): boolean => {
+    const buttons = getVisibleFocusableButtons();
+    if (buttons.length === 0) return false;
+    const idx = Math.min(buttons.length - 1, Math.max(0, focusedBtnIndexRef.current));
+    const target = buttons[idx];
+    if (target) {
+      target.click();
+      return true;
+    }
+    return false;
+  }, [getVisibleFocusableButtons]);
+
+  const cycleSettingsTab = useCallback((dir: 1 | -1) => {
+    const curIdx = MODAL_TABS_ORDER.indexOf(settingsTabRef.current);
+    const nextIdx =
+      (curIdx + dir + MODAL_TABS_ORDER.length) % MODAL_TABS_ORDER.length;
+    setSettingsTab(MODAL_TABS_ORDER[nextIdx]);
+  }, []);
+
+  // ============================================================================
+  // DYNAMIC 24/7 FISH KEEPER HAND-OFF (ONLINE WHEN OPEN, OFFLINE WHEN CLOSED)
+  // ============================================================================
+  useEffect(() => {
+    const eco = ecosystemRef.current;
+    const currentTank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+    const username = mypc.info()?.profile?.name || 'Keeper';
+    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const feederCount = eco.autoFeederCountByTank[currentTank.id] || 0;
+    const isOnlineNow = screenState === 'playing';
+
+    // Publish local lease AND Firestore online flag so the Fish Keeper dynamically removes this user's fishes immediately
+    publishActiveGameSessionLease(currentTank.id, isOnlineNow);
+    setUserOnlineStatusInFirestore(username, profileId, isOnlineNow, feederCount);
+    if (isOnlineNow) {
+      syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+    }
+
+    const handleVisibilityOrUnload = () => {
+      const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
+      const uName = mypc.info()?.profile?.name || 'Keeper';
+      const pId = mypc.info()?.profile?.id || 'local-caretaker';
+      const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
+      const visible =
+        typeof document !== 'undefined' &&
+        document.visibilityState === 'visible' &&
+        screenStateRef.current === 'playing';
+
+      publishActiveGameSessionLease(tankNow.id, visible);
+      setUserOnlineStatusInFirestore(uName, pId, visible, fCount);
+      syncUserBrainsToFirestore(
+        uName,
+        pId,
+        ecosystemRef.current.fishes,
+        visible,
+        fCount
+      );
+    };
+
+    const handlePageHide = () => {
+      const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
+      const uName = mypc.info()?.profile?.name || 'Keeper';
+      const pId = mypc.info()?.profile?.id || 'local-caretaker';
+      const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
+      publishActiveGameSessionLease(tankNow.id, false);
+      setUserOnlineStatusInFirestore(uName, pId, false, fCount);
+      syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount);
+    };
+
+    window.addEventListener('beforeunload', handlePageHide);
+    window.addEventListener('pagehide', handlePageHide);
+    document.addEventListener('visibilitychange', handleVisibilityOrUnload);
+
+    if (!isOnlineNow) {
+      return () => {
+        window.removeEventListener('beforeunload', handlePageHide);
+        window.removeEventListener('pagehide', handlePageHide);
+        document.removeEventListener('visibilitychange', handleVisibilityOrUnload);
+      };
+    }
+
     const timer = window.setInterval(() => {
-      publishActiveGameSessionLease(currentTank.id, true);
-    }, 2000);
+      const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
+      const uName = mypc.info()?.profile?.name || 'Keeper';
+      const pId = mypc.info()?.profile?.id || 'local-caretaker';
+      const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
+      publishActiveGameSessionLease(tankNow.id, true);
+      setUserOnlineStatusInFirestore(uName, pId, true, fCount);
+    }, 2500);
 
     return () => {
       window.clearInterval(timer);
+      window.removeEventListener('beforeunload', handlePageHide);
+      window.removeEventListener('pagehide', handlePageHide);
+      document.removeEventListener('visibilitychange', handleVisibilityOrUnload);
       publishActiveGameSessionLease(currentTank.id, false);
+      setUserOnlineStatusInFirestore(username, profileId, false, feederCount);
     };
-  }, [screenState, ecosystem.activeTankTier]);
+  }, [screenState, ecosystem.activeTankTier, mypc]);
 
   // Sprinkle food across the TOP water surface (just like a real aquarium owner)
   const handleSprinkleFoodOnTop = useCallback(() => {
-    const tank = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
-    const halfW = tank.width * 0.36;
+    const eco = ecosystemRef.current;
+    const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+    const isFrameless = eco.graphicsSettings?.framelessTvMode !== false;
     const halfD = tank.depth * 0.34;
-    const topSurfaceY = tank.height * 0.38 * 0.92;
 
     for (let i = 0; i < 6; i++) {
       if (pelletsRef.current.length >= 60) break;
+      const pelletZ = (Math.random() - 0.5) * halfD * 1.6;
+      const sliceBounds = getTankBoundsAtZ(tank, pelletZ, isFrameless);
       pelletsRef.current.push({
         id: nextEntityId('pellet'),
-        x: (Math.random() - 0.5) * halfW * 1.6,
-        y: topSurfaceY + (Math.random() - 0.5) * 0.06,
-        z: (Math.random() - 0.5) * halfD * 1.6,
+        x: (Math.random() - 0.5) * sliceBounds.halfW * 1.4,
+        y: sliceBounds.surfaceY + (Math.random() - 0.5) * 0.06,
+        z: pelletZ,
         vy: -0.26 - Math.random() * 0.12,
         nutrition: 28,
         ageSeconds: 0,
         source: 'manual',
       });
     }
+    const xpRes = awardOwnerXp(eco, 6);
+    saveEcosystemState(eco);
+    setEcosystem({ ...eco });
     audioEngine.playPelletDrop();
-    showToast('Sprinkled food flakes across the top water surface.');
+    showToast(
+      xpRes.leveledUp
+        ? `Sprinkled food on top! Owner Level Up → Level ${xpRes.newLevel} (New shop fishes unlocked!)`
+        : 'Sprinkled food flakes across the top water surface (+6 Owner XP).'
+    );
   }, [showToast]);
 
   // Refresh aquarium water quality & comfort
@@ -205,12 +386,90 @@ export default function App() {
         f.state.health = Math.min(100, f.state.health + 15);
       }
     }
+    const xpRes = awardOwnerXp(eco, 12);
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
-    showToast('Water filtered & conditioned to 100% quality (25.0°C). Fish comfort restored!');
+    showToast(
+      xpRes.leveledUp
+        ? `Water filtered to 100%! Owner Level Up → Level ${xpRes.newLevel}!`
+        : 'Water filtered & conditioned to 100% quality (25.0°C). Fish comfort restored (+12 Owner XP)!'
+    );
   };
 
-  // Buy or switch to a bigger Aquarium Tank Tier
+  // Buy a Fish from the Shop (Unlocked by Owner Level, up to Tank Capacity 3 / 4 / 5 / 6)
+  const handleBuyFishFromShop = (species: SpeciesConfig) => {
+    const eco = ecosystemRef.current;
+    const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
+    const aliveFishes = eco.fishes.filter((f) => f.lineage.alive);
+    const ownerLevel = eco.ownerLevel || 1;
+    const reqLevel = species.requiredOwnerLevel || 1;
+    const price = species.shopPriceCredits || 45;
+
+    if (ownerLevel < reqLevel) {
+      showToast(
+        `${species.name} requires Owner Level ${reqLevel} (you are Level ${ownerLevel}). Feed & care for your fishes to level up!`
+      );
+      return;
+    }
+
+    if (aliveFishes.length >= tank.maxFishCapacity) {
+      showToast(
+        `${tank.name} is at full capacity (${aliveFishes.length}/${tank.maxFishCapacity} fishes). Upgrade your aquarium tank for more space!`
+      );
+      return;
+    }
+
+    if (eco.bioCredits < price) {
+      showToast(
+        `Need ${price} Credits to buy ${species.name} (you have ${Math.round(
+          eco.bioCredits
+        )} Credits).`
+      );
+      return;
+    }
+
+    // Use promoted Base Model brain from Firestore / Registry if available
+    const promotedModel = eco.modelRegistry.find(
+      (m) => m.speciesId === species.id && m.isPromotedBase
+    );
+    let customBrain: FishBrainInstance | undefined;
+    if (promotedModel && promotedModel.weights?.length) {
+      const base = createBaseBrainInstance(promotedModel.brainConfig, Date.now() & 0xffff);
+      base.inheritedWeights = promotedModel.weights.map((w) => [...w]);
+      base.inheritedBiases = promotedModel.biases.map((b) => [...b]);
+      customBrain = base;
+    }
+
+    const newFish = spawnFoundingFish(
+      species,
+      eco.activeTankTier,
+      eco.simHoursTotal,
+      aliveFishes.length,
+      customBrain
+    );
+    eco.bioCredits -= price;
+    eco.fishes.push(newFish);
+    const xpRes = awardOwnerXp(eco, 25);
+
+    saveEcosystemState(eco);
+    setEcosystem({ ...eco });
+    audioEngine.playBirthChime();
+
+    const username = mypc.info()?.profile?.name || 'Keeper';
+    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
+    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+
+    showToast(
+      xpRes.leveledUp
+        ? `Bought ${species.name} (${newFish.lineage.name})! Owner Level Up → Level ${xpRes.newLevel}!`
+        : `Purchased ${species.name} (${newFish.lineage.name})! Tank space: ${
+            aliveFishes.length + 1
+          }/${tank.maxFishCapacity}.`
+    );
+  };
+
+  // Buy or switch to a bigger Aquarium Tank Tier (Strictly for Space: 3 -> 4 -> 5 -> 6)
   const handleBuyOrSelectTank = (tierIndex: number) => {
     const tier = TANK_TIERS[tierIndex];
     if (!tier) return;
@@ -228,6 +487,7 @@ export default function App() {
       }
       eco.bioCredits -= tier.costCredits;
       eco.unlockedTankTiers.push(tierIndex);
+      awardOwnerXp(eco, 40);
     }
 
     eco.activeTankTier = tierIndex;
@@ -245,8 +505,8 @@ export default function App() {
     audioEngine.playTankUpgrade();
     showToast(
       isUnlocked
-        ? `Moved your fishes into ${tier.name} (Capacity: ${tier.maxFishCapacity} fishes).`
-        : `Purchased ${tier.name}! Capacity expanded to ${tier.maxFishCapacity} fishes.`
+        ? `Moved your fishes into ${tier.name} (Space Capacity: ${tier.maxFishCapacity} fishes + babies).`
+        : `Purchased ${tier.name}! Space expanded to ${tier.maxFishCapacity} fishes (+ babies over max).`
     );
   };
 
@@ -268,11 +528,19 @@ export default function App() {
 
     eco.bioCredits -= cost;
     eco.autoFeederCountByTank[tank.id] = currentCount + 1;
+    awardOwnerXp(eco, 20);
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
     audioEngine.playTankUpgrade();
+
+    const username = mypc.info()?.profile?.name || 'Keeper';
+    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, currentCount + 1);
+
     showToast(
-      `Installed Top Auto-Feeder #${currentCount + 1} (${currentCount + 1}/${tank.maxAutoFeeders}).`
+      `Installed Top Auto-Feeder #${currentCount + 1} (${
+        currentCount + 1
+      }/${tank.maxAutoFeeders}). Also feeds your fishes in the 24/7 Offline Keeper!`
     );
   };
 
@@ -304,6 +572,7 @@ export default function App() {
         showCaustics: true,
         showParticles: true,
         antiAliasing: true,
+        framelessTvMode: true,
       }),
       fishPolygonQuality: polyQuality,
     };
@@ -313,13 +582,183 @@ export default function App() {
     showToast(`3D Fish Mesh Quality set to ${spec.label}`);
   };
 
+  // Toggle Full-Screen TV Mode (Frameless Aquarium vs Framed Tank)
+  const handleToggleFramelessTvMode = useCallback(() => {
+    const eco = ecosystemRef.current;
+    const currentlyFrameless = eco.graphicsSettings?.framelessTvMode !== false;
+    const nextFrameless = !currentlyFrameless;
+    eco.graphicsSettings = {
+      ...(eco.graphicsSettings || {
+        fishPolygonQuality: 'high',
+        environmentQuality: 'high',
+        showCaustics: true,
+        showParticles: true,
+        antiAliasing: true,
+        lightIntensity: 0.95,
+        backgroundBrightness: 0.22,
+      }),
+      framelessTvMode: nextFrameless,
+    };
+    saveEcosystemState(eco);
+    setEcosystem({ ...eco });
+    showToast(
+      nextFrameless
+        ? 'Full-Screen TV Aquarium Mode ON (No Tank Frames — Arrows control top buttons).'
+        : 'Framed Aquarium Tank Mode ON (Tank frames visible).'
+    );
+  }, [showToast]);
+
+  // Update Aquarium Overhead Light Intensity & Back-of-Tank Blue Brightness
+  const handleUpdateLightingSettings = useCallback(
+    (patch: { lightIntensity?: number; backgroundBrightness?: number }, labelMsg?: string) => {
+      const eco = ecosystemRef.current;
+      const cur = eco.graphicsSettings || {
+        fishPolygonQuality: 'high',
+        environmentQuality: 'high',
+        showCaustics: true,
+        showParticles: true,
+        antiAliasing: true,
+        framelessTvMode: true,
+        lightIntensity: 0.95,
+        backgroundBrightness: 0.22,
+      };
+      const nextLight =
+        patch.lightIntensity !== undefined
+          ? Math.max(0.15, Math.min(1.8, Number(patch.lightIntensity.toFixed(2))))
+          : cur.lightIntensity ?? 0.95;
+      const nextBg =
+        patch.backgroundBrightness !== undefined
+          ? Math.max(0.0, Math.min(1.0, Number(patch.backgroundBrightness.toFixed(2))))
+          : cur.backgroundBrightness ?? 0.22;
+
+      eco.graphicsSettings = {
+        ...cur,
+        lightIntensity: nextLight,
+        backgroundBrightness: nextBg,
+      };
+      saveEcosystemState(eco);
+      setEcosystem({ ...eco });
+      if (labelMsg) {
+        showToast(labelMsg);
+      }
+    },
+    [showToast]
+  );
+
   const handleStartAquarium = useCallback(() => {
     audioEngine.initOrResume();
+    ecosystemRef.current.timeMultiplier = 1;
     setScreenState('playing');
-    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
-    }
   }, []);
+
+  // ============================================================================
+  // TV REMOTE & KEYBOARD CONTROLLER LISTENER ("Play/Pause", "+", "Select", "Start")
+  // ============================================================================
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const key = e.key || '';
+      const code = e.code || '';
+      const keyCode = e.keyCode || 0;
+
+      // 1. TV Remote "Play/Pause" (Tizen 10252 / 415 / 19 / 179 / MediaPlayPause)
+      // or Gamepad/Keyboard "+", "Select", "Start", "Menu"
+      const isTvPlayPause =
+        key === 'MediaPlayPause' ||
+        key === 'PlayPause' ||
+        key === 'MediaPlay' ||
+        key === 'MediaPause' ||
+        code === 'MediaPlayPause' ||
+        keyCode === 10252 ||
+        keyCode === 415 ||
+        keyCode === 19 ||
+        keyCode === 179;
+
+      const isPlusSelectStartMenu =
+        key === '+' ||
+        key === '=' ||
+        key === 'Select' ||
+        key === 'ContextMenu' ||
+        key === 'F1' ||
+        key.toLowerCase() === 'm' ||
+        code === 'ContextMenu';
+
+      if (isTvPlayPause || isPlusSelectStartMenu) {
+        e.preventDefault();
+        setLastControllerInputLabel(
+          isTvPlayPause
+            ? 'TV Remote [Play/Pause] pressed → Toggled Owner Menu'
+            : 'Controller [+ / Select / Start] pressed → Toggled Owner Menu'
+        );
+        if (screenStateRef.current === 'title') {
+          handleStartAquarium();
+          setSettingsOpen(true);
+        } else {
+          if (screenStateRef.current === 'paused') {
+            ecosystemRef.current.paused = false;
+            setScreenState('playing');
+          }
+          setSettingsOpen((prev) => !prev);
+        }
+        return;
+      }
+
+      // 2. Back / Cancel / Escape / Tizen Return (10009)
+      if (key === 'Escape' || key === 'Backspace' || key === 'BrowserBack' || keyCode === 10009) {
+        if (helpModalRef.current) {
+          e.preventDefault();
+          setHelpModalTopic(null);
+          return;
+        }
+        if (settingsOpenRef.current) {
+          e.preventDefault();
+          setSettingsOpen(false);
+          return;
+        }
+      }
+
+      // 3. Spatial D-Pad / Arrow navigation across top bar buttons (in playing mode) or modal buttons
+      if (key === 'ArrowDown' || key === 'ArrowRight') {
+        e.preventDefault();
+        moveControllerFocus(1);
+        setLastControllerInputLabel('Arrow [Right/Down] → Focused Next Button');
+        return;
+      }
+      if (key === 'ArrowUp' || key === 'ArrowLeft') {
+        e.preventDefault();
+        moveControllerFocus(-1);
+        setLastControllerInputLabel('Arrow [Left/Up] → Focused Previous Button');
+        return;
+      }
+      if (key === 'Enter' || key === ' ') {
+        e.preventDefault();
+        if (!activateFocusedControllerButton() && screenStateRef.current === 'playing') {
+          handleSprinkleFoodOnTop();
+        }
+        return;
+      }
+      if (helpModalRef.current || settingsOpenRef.current) {
+        if (key === '[' || key === 'PageUp') {
+          e.preventDefault();
+          cycleSettingsTab(-1);
+          return;
+        }
+        if (key === ']' || key === 'PageDown') {
+          e.preventDefault();
+          cycleSettingsTab(1);
+          return;
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    activateFocusedControllerButton,
+    cycleSettingsTab,
+    handleSprinkleFoodOnTop,
+    handleStartAquarium,
+    moveControllerFocus,
+  ]);
 
   // Initialize MyPC SDK Lifecycle, Gamepad Listeners & Firestore Brain Sync
   useEffect(() => {
@@ -329,22 +768,38 @@ export default function App() {
         setMypcInfo(info);
         audioEngine.setVolumes(info.volume?.music ?? 0.7, info.volume?.sfx ?? 0.8);
 
-        const cfg = mypc.app_config || {};
-        if (cfg.timeMultiplier) {
-          ecosystemRef.current.timeMultiplier = Number(cfg.timeMultiplier) || 1;
-        }
+        // Lock player game clock to 1x real-time
+        ecosystemRef.current.timeMultiplier = 1;
 
-        // 1. Load latest promoted Base Models from Firestore `base_models` collection
+        // 1. Load latest promoted Base Models & edited species properties from Firestore `base_models`
         fetchBaseModelsFromFirestore().then((cloudModels) => {
           if (cloudModels.length > 0) {
             const eco = ecosystemRef.current;
             eco.modelRegistry = cloudModels;
-            for (const sp of eco.speciesList) {
-              const promoted = cloudModels.find(
-                (m) => m.speciesId === sp.id && m.isPromotedBase
-              );
-              if (promoted) {
-                sp.activeBaseModelVersion = promoted.versionId;
+            for (const cm of cloudModels) {
+              // Merge any new or edited species properties saved in the Trainer
+              if (cm.speciesConfig) {
+                const existingIdx = eco.speciesList.findIndex(
+                  (s) => s.id === cm.speciesConfig!.id
+                );
+                if (existingIdx >= 0) {
+                  eco.speciesList[existingIdx] = {
+                    ...eco.speciesList[existingIdx],
+                    ...cm.speciesConfig,
+                    lifespan: {
+                      ...eco.speciesList[existingIdx].lifespan,
+                      ...cm.speciesConfig.lifespan,
+                    },
+                  };
+                } else {
+                  eco.speciesList.push(cm.speciesConfig);
+                }
+              }
+              if (cm.isPromotedBase) {
+                const sp = eco.speciesList.find((s) => s.id === cm.speciesId);
+                if (sp) {
+                  sp.activeBaseModelVersion = cm.versionId;
+                }
               }
             }
             saveEcosystemState(eco);
@@ -379,7 +834,7 @@ export default function App() {
 
         mypc.setMenu([
           { id: 'feed', label: 'Sprinkle Food on Top' },
-          { id: 'settings', label: 'Fish Stats & Settings' },
+          { id: 'settings', label: 'Owner Menu, Shop & Fish Stats' },
           { id: 'restart', label: 'Reset Aquarium (2 Starter Fishes)' },
         ]);
 
@@ -387,11 +842,8 @@ export default function App() {
       },
       onStart: () => {},
       onPause: () => {
-        ecosystemRef.current.paused = true;
-        audioEngine.pause();
-        if (screenStateRef.current === 'playing') {
-          setScreenState('paused');
-        }
+        // On TV Remote Play/Pause or SDK pause, open the Owner Menu so the user can inspect or shop with their remote
+        setSettingsOpen(true);
       },
       onResume: () => {
         ecosystemRef.current.paused = false;
@@ -402,7 +854,11 @@ export default function App() {
       },
       onDestroy: () => {
         const tank = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
+        const username = mypc.info()?.profile?.name || 'Keeper';
+        const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+        const feederCount = ecosystemRef.current.autoFeederCountByTank[tank.id] || 0;
         publishActiveGameSessionLease(tank.id, false);
+        setUserOnlineStatusInFirestore(username, profileId, false, feederCount);
         saveEcosystemState(ecosystemRef.current);
         audioEngine.destroy();
       },
@@ -426,38 +882,49 @@ export default function App() {
       onInput: (action, pressed, repeat) => {
         if (!pressed) return;
 
-        if (screenStateRef.current === 'title') {
-          if (action === 'confirm' || action === 'jump') {
+        // Open/Toggle menu on TV Remote "Play/Pause" (`pause` / `play_pause` / `menu`)
+        // or Gamepad `+` / `Select` / `Start` (`select` / `start` / `menu` / `run`)
+        if (
+          !repeat &&
+          (action === 'menu' ||
+            action === 'pause' ||
+            action === 'play_pause' ||
+            action === 'select' ||
+            action === 'start' ||
+            action === 'run')
+        ) {
+          setLastControllerInputLabel(`Controller [${action.toUpperCase()}] → Toggled Owner Menu`);
+          if (screenStateRef.current === 'title') {
             handleStartAquarium();
-          }
-          return;
-        }
-
-        if (screenStateRef.current === 'paused') {
-          if (action === 'confirm' || action === 'cancel' || action === 'menu') {
-            ecosystemRef.current.paused = false;
-            setScreenState('playing');
-          }
-          return;
-        }
-
-        if (screenStateRef.current === 'playing' && !repeat) {
-          if (action === 'confirm' || action === 'jump') {
-            handleSprinkleFoodOnTop();
-          } else if (action === 'menu' || action === 'run') {
+            setSettingsOpen(true);
+          } else {
             setSettingsOpen((v) => !v);
-          } else if (action === 'cancel') {
-            setHelpModalTopic(null);
-            setSettingsOpen(false);
-          } else if (action === 'left') {
-            cameraOrbitRef.current.yaw = Math.max(-0.8, cameraOrbitRef.current.yaw - 0.15);
-          } else if (action === 'right') {
-            cameraOrbitRef.current.yaw = Math.min(0.8, cameraOrbitRef.current.yaw + 0.15);
-          } else if (action === 'up') {
-            cameraOrbitRef.current.zoom = Math.max(0.65, cameraOrbitRef.current.zoom - 0.1);
-          } else if (action === 'down') {
-            cameraOrbitRef.current.zoom = Math.min(1.45, cameraOrbitRef.current.zoom + 0.1);
           }
+          return;
+        }
+
+        // Route D-Pad / Arrows & Confirm/Cancel to focusable buttons (top HUD buttons in playing mode, or modal/title buttons)
+        if (action === 'down' || action === 'right') {
+          moveControllerFocus(1);
+          setLastControllerInputLabel(`Controller [${action.toUpperCase()}] → Focused Next Button`);
+          return;
+        }
+        if (action === 'up' || action === 'left') {
+          moveControllerFocus(-1);
+          setLastControllerInputLabel(`Controller [${action.toUpperCase()}] → Focused Prev Button`);
+          return;
+        }
+        if (!repeat && (action === 'confirm' || action === 'jump')) {
+          if (!activateFocusedControllerButton()) {
+            if (screenStateRef.current === 'title') handleStartAquarium();
+            else if (screenStateRef.current === 'playing') handleSprinkleFoodOnTop();
+          }
+          return;
+        }
+        if (!repeat && action === 'cancel') {
+          if (helpModalRef.current) setHelpModalTopic(null);
+          else if (settingsOpenRef.current) setSettingsOpen(false);
+          return;
         }
       },
     });
@@ -465,39 +932,163 @@ export default function App() {
     if (mypc.gamepad) {
       mypc.gamepad.on(
         'button',
-        (_index: number, pressed: boolean, _value: number, _dev: string, name: string) => {
+        (index: number, pressed: boolean, _value: number, _dev: string, name: string) => {
           if (!pressed) return;
-          if (screenStateRef.current === 'title') {
-            if (name === 'A' || name === 'Start') {
+          const btnName = (name || '').toLowerCase();
+
+          // Open/Toggle menu on "+", "Select", "Start", or indices 8 / 9
+          if (
+            btnName === 'start' ||
+            btnName === 'select' ||
+            btnName === '+' ||
+            btnName === '-' ||
+            btnName === 'menu' ||
+            index === 8 ||
+            index === 9 ||
+            btnName === 'y' ||
+            btnName === 'x'
+          ) {
+            setLastControllerInputLabel(`Gamepad [${name || `Btn ${index}`}] → Toggled Owner Menu`);
+            if (screenStateRef.current === 'title') {
               handleStartAquarium();
+              setSettingsOpen(true);
+            } else {
+              setSettingsOpen((v) => !v);
             }
             return;
           }
+
+          if (helpModalRef.current || settingsOpenRef.current) {
+            if (btnName === 'lb' || index === 4) {
+              cycleSettingsTab(-1);
+            } else if (btnName === 'rb' || index === 5) {
+              cycleSettingsTab(1);
+            } else if (btnName === 'a' || index === 0) {
+              activateFocusedControllerButton();
+            } else if (btnName === 'b' || index === 1) {
+              if (helpModalRef.current) setHelpModalTopic(null);
+              else setSettingsOpen(false);
+            } else if (index === 12 || index === 14) {
+              moveControllerFocus(-1);
+            } else if (index === 13 || index === 15) {
+              moveControllerFocus(1);
+            }
+            return;
+          }
+
+          if (screenStateRef.current === 'title') {
+            if (btnName === 'a' || index === 0) {
+              if (!activateFocusedControllerButton()) handleStartAquarium();
+            } else if (index === 12 || index === 14) {
+              moveControllerFocus(-1);
+            } else if (index === 13 || index === 15) {
+              moveControllerFocus(1);
+            }
+            return;
+          }
+
           if (screenStateRef.current === 'playing') {
-            if (name === 'A') {
-              handleSprinkleFoodOnTop();
-            } else if (name === 'Y' || name === 'X' || name === 'Start' || name === 'Select') {
-              setSettingsOpen((v) => !v);
-            } else if (name === 'B') {
+            if (btnName === 'a' || index === 0) {
+              if (!activateFocusedControllerButton()) handleSprinkleFoodOnTop();
+            } else if (btnName === 'b' || index === 1) {
               setHelpModalTopic(null);
               setSettingsOpen(false);
+            } else if (index === 12 || index === 14) {
+              moveControllerFocus(-1);
+            } else if (index === 13 || index === 15) {
+              moveControllerFocus(1);
             }
           }
         }
       );
     }
-  }, [handleSprinkleFoodOnTop, handleStartAquarium, mypc, showToast]);
+  }, [
+    activateFocusedControllerButton,
+    cycleSettingsTab,
+    handleSprinkleFoodOnTop,
+    handleStartAquarium,
+    moveControllerFocus,
+    mypc,
+    showToast,
+  ]);
 
-  // 60Hz Simulation & Gamepad Stick Polling Callback
+  // 60Hz Simulation & Native HTML5 Gamepad Polling Callback
   const handleTickSimulation = useCallback(
     (dt: number) => {
+      // Poll standard HTML5 navigator.getGamepads() for guaranteed controller & TV remote gamepad support
+      if (typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function') {
+        const pads = navigator.getGamepads();
+        const pad = pads && (pads[0] || pads[1] || pads[2] || pads[3]);
+        if (pad && pad.buttons) {
+          const prev = prevGamepadButtonsRef.current;
+          for (let b = 0; b < pad.buttons.length; b++) {
+            const isDown = Boolean(pad.buttons[b]?.pressed);
+            const wasDown = Boolean(prev[b]);
+            if (isDown && !wasDown) {
+              // Rising edge button press
+              if (b === 8 || b === 9) {
+                // Select (-) or Start (+) opens/closes Owner Menu
+                setLastControllerInputLabel(
+                  b === 9
+                    ? 'Gamepad [Start / +] → Toggled Owner Menu'
+                    : 'Gamepad [Select / -] → Toggled Owner Menu'
+                );
+                if (screenStateRef.current === 'title') {
+                  handleStartAquarium();
+                  setSettingsOpen(true);
+                } else {
+                  setSettingsOpen((v) => !v);
+                }
+              } else if (helpModalRef.current || settingsOpenRef.current) {
+                if (b === 0) activateFocusedControllerButton();
+                else if (b === 1) {
+                  if (helpModalRef.current) setHelpModalTopic(null);
+                  else setSettingsOpen(false);
+                } else if (b === 4) cycleSettingsTab(-1);
+                else if (b === 5) cycleSettingsTab(1);
+                else if (b === 12 || b === 14) moveControllerFocus(-1);
+                else if (b === 13 || b === 15) moveControllerFocus(1);
+              } else if (screenStateRef.current === 'title') {
+                if (b === 0) {
+                  if (!activateFocusedControllerButton()) handleStartAquarium();
+                } else if (b === 12 || b === 14) moveControllerFocus(-1);
+                else if (b === 13 || b === 15) moveControllerFocus(1);
+              } else if (screenStateRef.current === 'playing') {
+                if (b === 0) {
+                  if (!activateFocusedControllerButton()) handleSprinkleFoodOnTop();
+                } else if (b === 12 || b === 14) moveControllerFocus(-1);
+                else if (b === 13 || b === 15) moveControllerFocus(1);
+                else if (b === 2 || b === 3) setSettingsOpen((v) => !v);
+              }
+            }
+            prev[b] = isDown;
+          }
+
+          // Left stick focus navigation across top bar buttons or open modal buttons with cooldown
+          const nowMs = performance.now();
+          const lx = pad.axes?.[0] || 0;
+          const ly = pad.axes?.[1] || 0;
+          if (nowMs - lastDpadAxisMoveMsRef.current > 240) {
+            if (ly > 0.55 || lx > 0.55) {
+              lastDpadAxisMoveMsRef.current = nowMs;
+              moveControllerFocus(1);
+            } else if (ly < -0.55 || lx < -0.55) {
+              lastDpadAxisMoveMsRef.current = nowMs;
+              moveControllerFocus(-1);
+            }
+          }
+        }
+      }
+
       if (screenStateRef.current !== 'playing') return;
 
       const eco = ecosystemRef.current;
+      // Lock player time multiplier to 1x real-time
+      eco.timeMultiplier = 1;
       const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
 
-      // Gentle camera look/zoom via gamepad sticks
-      if (mypc.gamepad) {
+      // Gentle camera look/zoom via gamepad sticks when menu is closed
+      if (!settingsOpenRef.current && mypc.gamepad) {
         const rx = mypc.gamepad.axis(2) || mypc.gamepad.axis(0);
         const ry = mypc.gamepad.axis(3) || mypc.gamepad.axis(1);
         const lt = mypc.gamepad.value(6);
@@ -523,7 +1114,7 @@ export default function App() {
         }
       }
 
-      // Advance Real-Life Aquarium AI Simulation
+      // Advance Real-Life 1x Aquarium AI Simulation
       stepEcosystemSimulation(eco, pelletsRef.current, threatsRef.current, dt, {
         allowAutoFeeders: true,
         onPelletEaten: () => {
@@ -534,7 +1125,7 @@ export default function App() {
           const maxGen = Math.max(...eco.fishes.map((f) => f.lineage.generation));
           mypc.submitScore(maxGen * 100 + eco.bioCredits);
           showToast(
-            `${mother.lineage.name} naturally hatched ${child.lineage.name} (Generation ${child.lineage.generation})!`
+            `${mother.lineage.name} naturally hatched baby ${child.lineage.name} (Gen ${child.lineage.generation})!`
           );
         },
         onDeath: (fish, reason) => {
@@ -549,7 +1140,7 @@ export default function App() {
         saveEcosystemState(eco);
       }
 
-      if (nowMs - lastFirestoreSyncMsRef.current > 12000) {
+      if (nowMs - lastFirestoreSyncMsRef.current > 10000) {
         lastFirestoreSyncMsRef.current = nowMs;
         const username = mypc.info()?.profile?.name || 'Keeper';
         const profileId = mypc.info()?.profile?.id || 'local-caretaker';
@@ -557,21 +1148,44 @@ export default function App() {
         syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
       }
     },
-    [mypc, showToast]
+    [
+      activateFocusedControllerButton,
+      cycleSettingsTab,
+      handleSprinkleFoodOnTop,
+      handleStartAquarium,
+      moveControllerFocus,
+      mypc,
+      showToast,
+    ]
   );
 
   const lang = mypcInfo.lang || 'en';
   const t = I18N[lang] || I18N.en;
   const currentTank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
   const aliveFishes = ecosystem.fishes.filter((f) => f.lineage.alive);
+  const adultFishes = aliveFishes.filter(
+    (f) => f.state.lifeStage === 'adult' || f.state.lifeStage === 'elder'
+  );
+  const babyFishes = aliveFishes.filter(
+    (f) => f.state.lifeStage === 'egg' || f.state.lifeStage === 'juvenile'
+  );
   const highestGeneration = ecosystem.fishes.reduce(
     (m, f) => Math.max(m, f.lineage.generation),
     1
   );
+  const ownerLevel = ecosystem.ownerLevel || 1;
+  const ownerXp = Math.round(ecosystem.ownerXp || 0);
   const currentPolyQuality: FishPolygonQuality =
     ecosystem.graphicsSettings?.fishPolygonQuality || 'high';
   const currentEnvQuality =
     ecosystem.graphicsSettings?.environmentQuality || mypcInfo.quality?.tier || 'high';
+  const isFramelessTvMode = ecosystem.graphicsSettings?.framelessTvMode !== false;
+  const currentLightIntensity = ecosystem.graphicsSettings?.lightIntensity ?? 0.95;
+  const currentBgBrightness = ecosystem.graphicsSettings?.backgroundBrightness ?? 0.22;
+
+  const sortedShopSpecies = [...ecosystem.speciesList].sort(
+    (a, b) => (a.requiredOwnerLevel || 1) - (b.requiredOwnerLevel || 1)
+  );
 
   return (
     <div
@@ -589,6 +1203,7 @@ export default function App() {
         screensaverMode={true}
         qualityTier={currentEnvQuality}
         fishPolygonQuality={currentPolyQuality}
+        framelessTvMode={isFramelessTvMode}
         activeTankTier={ecosystem.activeTankTier}
         isPaused={screenState === 'paused' || ecosystem.paused}
         onTickSimulation={handleTickSimulation}
@@ -597,7 +1212,10 @@ export default function App() {
 
       {/* STATE 1: TITLE SCREEN OVERLAY */}
       {screenState === 'title' && (
-        <div className="fixed inset-0 z-20 flex flex-col justify-between p-8 sm:p-12 pointer-events-none bg-gradient-to-r from-[#030914]/90 via-[#030914]/50 to-transparent">
+        <div
+          data-modal-scope="title"
+          className="fixed inset-0 z-20 flex flex-col justify-between p-8 sm:p-12 pointer-events-none bg-gradient-to-r from-[#030914]/90 via-[#030914]/50 to-transparent"
+        >
           <div className="max-w-xl pointer-events-auto space-y-6 my-auto">
             <svg
               viewBox="0 0 520 110"
@@ -655,94 +1273,150 @@ export default function App() {
 
             <p className="text-sm sm:text-base text-slate-200 leading-relaxed max-w-md">
               Start with 2 living 3D fishes powered by individual neural brains. Sprinkle food on
-              the top water surface, keep their water comfortable, and watch them naturally grow,
-              learn, and breed across generations.
+              the top water surface, level up as an Owner to unlock famous species in the shop, and
+              upgrade your tank from 3 up to 6 fishes (+ babies).
             </p>
 
             <div className="flex flex-wrap items-center gap-3.5 pt-2">
               <button
                 type="button"
                 data-start="true"
+                data-tv-focusable="true"
                 onClick={handleStartAquarium}
-                className="px-7 py-3.5 text-sm font-bold bg-cyan-400 text-slate-950 rounded-lg hover:bg-cyan-300 focus-visible:outline-4 focus-visible:outline-white transition-transform active:scale-95 whitespace-nowrap"
+                className="px-7 py-3.5 text-sm font-bold bg-cyan-400 text-slate-950 rounded-lg hover:bg-cyan-300 focus:ring-4 focus:ring-white focus:outline-none transition-transform active:scale-95 whitespace-nowrap"
               >
                 {t.enterAquarium}
               </button>
 
               <button
                 type="button"
+                data-tv-focusable="true"
                 onClick={() => {
                   handleStartAquarium();
-                  setSettingsTab('graphics_polygons');
+                  setSettingsTab('aquarium_shop');
                   setSettingsOpen(true);
                 }}
-                className="px-5 py-3.5 text-sm font-semibold bg-[#0c192c]/90 text-cyan-300 border border-cyan-500/40 rounded-lg hover:bg-[#132642] focus-visible:outline-4 focus-visible:outline-cyan-400 transition-colors whitespace-nowrap"
+                className="px-5 py-3.5 text-sm font-semibold bg-[#0c192c]/90 text-amber-300 border border-amber-500/40 rounded-lg hover:bg-[#132642] focus:ring-4 focus:ring-amber-300 focus:outline-none transition-colors whitespace-nowrap"
               >
-                Settings &amp; 3D Polygons
+                Aquarium Shop &amp; Tanks
               </button>
             </div>
           </div>
 
           <div className="text-xs font-mono text-slate-300/90 hud-text-shadow">
-            [OK / A] Sprinkle Food on Top · [Menu / Y] Fish Stats &amp; Graphics Settings
+            TV Remote: [Play/Pause] Open Menu · [OK] Feed Top · Gamepad: [+ / Select / Start] Open
+            Menu · [A] Feed
           </div>
         </div>
       )}
 
-      {/* STATE 2: UNIFIED LIVING AQUARIUM / SCREENSAVER VIEW (Calm, Minimal Perimeter) */}
+      {/* STATE 2: UNIFIED LIVING AQUARIUM / SCREENSAVER VIEW */}
       {screenState === 'playing' && (
-        <div className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-5">
-          {/* Minimal Top Bar: Tank Info on Left, Sprinkle Food & Settings on Right */}
-          <div className="w-full flex items-start justify-between gap-4">
-            <div className="pointer-events-auto px-3.5 py-2 rounded-lg bg-[#06101e]/75 border border-slate-700/50 text-xs font-mono text-slate-200 tabular-nums flex items-center gap-3">
+        <div
+          data-modal-scope="hud"
+          className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-5"
+        >
+          {/* Minimal Top Bar: Tank Space, Owner Level & Credits on Left; Actions on Right */}
+          <div className="w-full flex flex-wrap items-start justify-between gap-4">
+            <div className="pointer-events-auto px-3.5 py-2 rounded-lg bg-[#06101e]/80 border border-slate-700/60 text-xs font-mono text-slate-200 tabular-nums flex flex-wrap items-center gap-2.5">
               <span className="text-cyan-300 font-semibold">{currentTank.name}</span>
               <span className="text-slate-500">·</span>
               <span>
-                {aliveFishes.length}/{currentTank.maxFishCapacity} Live Fishes
+                Space: {adultFishes.length}/{currentTank.maxFishCapacity} Fishes
+                {babyFishes.length > 0 ? ` (+${babyFishes.length} Babies)` : ''}
+              </span>
+              <span className="text-slate-500">·</span>
+              <span className="text-violet-300 font-semibold">
+                Owner Lv.{ownerLevel} ({ownerXp}/100 XP)
               </span>
               <span className="text-slate-500">·</span>
               <span className="text-emerald-300">Gen {highestGeneration}</span>
               <span className="text-slate-500">·</span>
-              <span className="text-amber-300">{Math.round(ecosystem.bioCredits)} Credits</span>
-              <span className="text-slate-500 hidden sm:inline">·</span>
-              <span className="text-slate-400 hidden sm:inline">
-                {ecosystem.simHoursTotal.toFixed(1)}h ({ecosystem.timeMultiplier}x)
+              <span className="text-amber-300 font-semibold">
+                {Math.round(ecosystem.bioCredits)} Credits
               </span>
             </div>
 
-            <div className="pointer-events-auto flex items-center gap-2">
+            <div className="pointer-events-auto flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={(e) => {
-                  e.currentTarget.blur();
+                data-tv-focusable="true"
+                onFocus={() => {
+                  focusedBtnIndexRef.current = 0;
+                  setFocusedBtnIndex(0);
+                }}
+                onClick={() => {
                   handleSprinkleFoodOnTop();
                 }}
-                className="px-4 py-2 rounded-lg bg-amber-500/90 text-slate-950 text-xs font-bold hover:bg-amber-400 transition-colors shadow-lg whitespace-nowrap"
+                className={`px-4 py-2 rounded-lg bg-amber-500/95 text-slate-950 text-xs font-bold hover:bg-amber-400 focus:ring-4 focus:ring-white focus:outline-none transition-all shadow-lg whitespace-nowrap ${
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 0
+                    ? 'ring-4 ring-white scale-[1.03]'
+                    : ''
+                }`}
               >
                 Sprinkle Food on Top [OK / A]
               </button>
 
               <button
                 type="button"
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  setSettingsOpen((v) => !v);
+                data-tv-focusable="true"
+                onFocus={() => {
+                  focusedBtnIndexRef.current = 1;
+                  setFocusedBtnIndex(1);
                 }}
-                className="px-3.5 py-2 rounded-lg bg-[#071324]/85 border border-cyan-500/40 text-xs font-semibold text-cyan-200 hover:bg-slate-800 transition-colors shadow-lg whitespace-nowrap"
+                onClick={() => {
+                  handleToggleFramelessTvMode();
+                }}
+                className={`px-3.5 py-2 rounded-lg border text-xs font-semibold transition-all shadow-lg whitespace-nowrap focus:ring-4 focus:ring-cyan-300 focus:outline-none ${
+                  isFramelessTvMode
+                    ? 'bg-emerald-500/20 border-emerald-400/70 text-emerald-200 hover:bg-emerald-500/30'
+                    : 'bg-[#071324]/90 border-slate-600 text-slate-200 hover:bg-slate-800'
+                } ${
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 1
+                    ? 'ring-4 ring-cyan-300 scale-[1.03]'
+                    : ''
+                }`}
               >
-                Fish Stats &amp; Settings [Menu]
+                {isFramelessTvMode ? 'TV Full-Screen: ON (No Frames)' : 'TV Full-Screen: OFF (Framed)'}
               </button>
 
               <button
                 type="button"
+                data-tv-focusable="true"
+                onFocus={() => {
+                  focusedBtnIndexRef.current = 2;
+                  setFocusedBtnIndex(2);
+                }}
+                onClick={() => {
+                  setSettingsOpen((v) => !v);
+                }}
+                className={`px-3.5 py-2 rounded-lg bg-[#071324]/90 border border-cyan-500/50 text-xs font-semibold text-cyan-200 hover:bg-slate-800 focus:ring-4 focus:ring-cyan-300 focus:outline-none transition-all shadow-lg whitespace-nowrap ${
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 2
+                    ? 'ring-4 ring-cyan-300 scale-[1.03]'
+                    : ''
+                }`}
+              >
+                Owner Menu &amp; Shop [Play/Pause · +/Start]
+              </button>
+
+              <button
+                type="button"
+                data-tv-focusable="true"
                 aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
-                onClick={(e) => {
-                  e.currentTarget.blur();
+                onFocus={() => {
+                  focusedBtnIndexRef.current = 3;
+                  setFocusedBtnIndex(3);
+                }}
+                onClick={() => {
                   const nextMute = !isMuted;
                   setIsMuted(nextMute);
                   audioEngine.setMuted(nextMute);
                 }}
-                className="p-2 rounded-lg bg-[#071324]/85 border border-slate-700 text-slate-200 hover:border-cyan-400"
+                className={`p-2 rounded-lg bg-[#071324]/85 border border-slate-700 text-slate-200 hover:border-cyan-400 focus:ring-4 focus:ring-cyan-300 focus:outline-none transition-all ${
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 3
+                    ? 'ring-4 ring-cyan-300 scale-[1.05]'
+                    : ''
+                }`}
               >
                 <svg viewBox="0 0 24 24" className="w-4 h-4 fill-current">
                   {isMuted ? (
@@ -757,89 +1431,107 @@ export default function App() {
 
           {/* Toast Feedback Banner */}
           {toastMessage && (
-            <div className="mx-auto px-4 py-2 rounded-lg bg-[#071324]/90 border border-cyan-400/50 text-xs font-medium text-cyan-200 shadow-lg">
+            <div className="mx-auto px-4 py-2 rounded-lg bg-[#071324]/95 border border-cyan-400/60 text-xs font-medium text-cyan-200 shadow-lg">
               {toastMessage}
             </div>
           )}
 
           {/* Subtle Bottom Ambient Hint */}
-          <div className="w-full flex items-center justify-between text-[11px] font-mono text-slate-400/80 hud-text-shadow">
+          <div className="w-full flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-300/85 hud-text-shadow">
             <span>
-              Water Quality: {Math.round(ecosystem.evolutionConfig.environment.waterQuality * 100)}%
-              · Temp: {ecosystem.evolutionConfig.environment.temperatureC.toFixed(1)}°C · Auto-Feeder:{' '}
-              {ecosystem.autoFeederCountByTank[currentTank.id] || 0}
+              Water: {Math.round(ecosystem.evolutionConfig.environment.waterQuality * 100)}% ·
+              Temp: {ecosystem.evolutionConfig.environment.temperatureC.toFixed(1)}°C · My
+              Auto-Feeder: {ecosystem.autoFeederCountByTank[currentTank.id] || 0}/
+              {currentTank.maxAutoFeeders} · 1x Real-Time
             </span>
-            <span>
-              3D Polygons: {polyStats.trianglesPerFish.toLocaleString()} tris/fish (
-              {currentPolyQuality.toUpperCase()})
-            </span>
+            <span>{lastControllerInputLabel}</span>
           </div>
         </div>
       )}
 
-      {/* OWNER MENU & SETTINGS MODAL (Fish Stats, 3D Polygon Quality, Aquarium Shop) */}
+      {/* OWNER MENU & SETTINGS MODAL (Fish Stats, Aquarium Shop & Buy Fishes, 3D Polygon Quality) */}
       {settingsOpen && (
         <div
           role="dialog"
           aria-modal="true"
           aria-label="Aquarium Owner Menu and Settings"
-          className="fixed inset-0 z-30 flex items-center justify-center bg-[#02060d]/75 p-4 pointer-events-auto"
+          data-modal-scope="settings"
+          className="fixed inset-0 z-30 flex items-center justify-center bg-[#02060d]/80 p-4 pointer-events-auto"
         >
-          <div className="w-full max-w-4xl max-h-[88vh] flex flex-col rounded-2xl bg-[#071324] border border-cyan-500/40 shadow-2xl overflow-hidden text-slate-100">
+          <div className="w-full max-w-5xl max-h-[90vh] flex flex-col rounded-2xl bg-[#071324] border border-cyan-500/40 shadow-2xl overflow-hidden text-slate-100">
             {/* Modal Header */}
-            <div className="px-6 py-4 bg-[#09192f] border-b border-slate-800 flex items-center justify-between gap-4">
+            <div className="px-6 py-4 bg-[#09192f] border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
               <div>
-                <h2 className="text-lg font-bold text-white">
-                  Aquarium Owner Menu &amp; Settings
+                <h2 className="text-lg font-bold text-white flex items-center gap-2.5">
+                  <span>Aquarium Owner Menu &amp; Shop</span>
+                  <span className="text-xs font-mono font-normal text-cyan-300">
+                    Owner Lv.{ownerLevel} ({ownerXp}/100 XP) · {Math.round(ecosystem.bioCredits)}{' '}
+                    Credits
+                  </span>
                 </h2>
-                <p className="text-xs text-slate-400">
-                  Check each fish&rsquo;s health &amp; AI stats, adjust 3D polygon quality, or care
-                  for your tank.
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Navigate with TV Remote Arrows / Gamepad D-Pad · [OK / A] Select · [LB / RB]
+                  Switch Tab · [Play/Pause or +/Start or B] Close
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setSettingsOpen(false)}
-                className="px-3.5 py-1.5 rounded-lg bg-slate-800 text-xs font-semibold text-slate-300 hover:text-white hover:bg-slate-700"
-              >
-                Close [B / Esc]
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-tv-focusable="true"
+                  onClick={() => setHelpModalTopic(HELP_TOPICS.controller_remote)}
+                  className="px-3 py-1.5 rounded-lg bg-cyan-500/20 border border-cyan-400/50 text-xs font-bold text-cyan-300 hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                >
+                  ? Remote / Gamepad Help
+                </button>
+                <button
+                  type="button"
+                  data-tv-focusable="true"
+                  onClick={() => setSettingsOpen(false)}
+                  className="px-3.5 py-1.5 rounded-lg bg-slate-800 text-xs font-semibold text-slate-200 hover:text-white hover:bg-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                >
+                  Close [B / Play-Pause]
+                </button>
+              </div>
             </div>
 
             {/* Modal Tabs */}
             <div className="px-6 py-2.5 bg-[#081528] border-b border-slate-800 flex items-center gap-2 overflow-x-auto">
               <button
                 type="button"
+                data-tv-focusable="true"
                 onClick={() => setSettingsTab('fish_stats')}
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${
+                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
                   settingsTab === 'fish_stats'
                     ? 'bg-cyan-400 text-slate-950'
                     : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
                 }`}
               >
-                My Fishes ({aliveFishes.length} Live Stats)
+                1. My Fishes ({aliveFishes.length} Live · Space {adultFishes.length}/
+                {currentTank.maxFishCapacity})
               </button>
               <button
                 type="button"
-                onClick={() => setSettingsTab('graphics_polygons')}
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${
-                  settingsTab === 'graphics_polygons'
-                    ? 'bg-cyan-400 text-slate-950'
-                    : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                3D Polygon &amp; Graphics Quality
-              </button>
-              <button
-                type="button"
+                data-tv-focusable="true"
                 onClick={() => setSettingsTab('aquarium_shop')}
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors ${
+                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
                   settingsTab === 'aquarium_shop'
                     ? 'bg-amber-400 text-slate-950'
                     : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
                 }`}
               >
-                Aquarium Shop &amp; Water Care ({Math.round(ecosystem.bioCredits)} Credits)
+                2. Buy Fishes &amp; Upgrade Tank Space ({Math.round(ecosystem.bioCredits)} Credits)
+              </button>
+              <button
+                type="button"
+                data-tv-focusable="true"
+                onClick={() => setSettingsTab('graphics_polygons')}
+                className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                  settingsTab === 'graphics_polygons'
+                    ? 'bg-cyan-400 text-slate-950'
+                    : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                }`}
+              >
+                3. Display, Lights &amp; 3D Quality
               </button>
             </div>
 
@@ -848,26 +1540,50 @@ export default function App() {
               {/* TAB 1: STATS OF EACH FISH */}
               {settingsTab === 'fish_stats' && (
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-bold text-white">
-                        Live Fishes in {currentTank.name} ({aliveFishes.length}/
-                        {currentTank.maxFishCapacity})
+                        Live Fishes in {currentTank.name} — Adult Space: {adultFishes.length}/
+                        {currentTank.maxFishCapacity}
+                        {babyFishes.length > 0
+                          ? ` (+ ${babyFishes.length} Babies Over Max Allowed)`
+                          : ''}
                       </h3>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        Fishes grow, forage from the top water surface, and reproduce autonomously
-                        when mature (Age ≥ 4.0h) and well-fed (Energy ≥ 60%).
+                        When you open the game, your fishes dynamically move from the 24/7 Offline
+                        Keeper into your live tank. When you leave, they return to the Keeper
+                        automatically.
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setHelpModalTopic(HELP_TOPICS.ai_breeding)}
-                      className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30"
-                      title="How Natural AI Breeding Works"
-                    >
-                      ?
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={handleSprinkleFoodOnTop}
+                        className="px-3.5 py-1.5 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 focus:ring-4 focus:ring-white focus:outline-none"
+                      >
+                        Sprinkle Food on Top
+                      </button>
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => setHelpModalTopic(HELP_TOPICS.ai_breeding)}
+                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                        title="How Natural AI Breeding Works"
+                      >
+                        ?
+                      </button>
+                    </div>
                   </div>
+
+                  {adultFishes.length > currentTank.maxFishCapacity && (
+                    <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200">
+                      Your babies matured into adults over the tank&rsquo;s space limit (
+                      {adultFishes.length}/{currentTank.maxFishCapacity}). They remain safely in
+                      your aquarium, and new breeding is paused until count drops below capacity or
+                      you upgrade your tank space!
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {aliveFishes.map((fish) => {
@@ -886,32 +1602,33 @@ export default function App() {
                           className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3"
                         >
                           <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                            <div>
-                              <div className="text-sm font-bold text-white">
-                                {fish.lineage.name}{' '}
-                                <span className="text-xs font-mono text-cyan-400">
-                                  · Generation {fish.lineage.generation}
-                                </span>
-                              </div>
-                              <div className="text-xs text-slate-400">
-                                {sp.name} · Base Model:{' '}
-                                <span className="font-mono text-slate-300">
-                                  {fish.lineage.modelVersion}
-                                </span>
+                            <div className="flex items-center gap-2.5">
+                              <span
+                                className="w-3.5 h-3.5 rounded-full shrink-0 border border-white/30"
+                                style={{ backgroundColor: sp.primaryColorHex }}
+                              />
+                              <div>
+                                <div className="text-sm font-bold text-white">
+                                  {fish.lineage.name}{' '}
+                                  <span className="text-xs font-mono text-cyan-400">
+                                    · Gen {fish.lineage.generation}
+                                  </span>
+                                </div>
+                                <div className="text-xs text-slate-400">
+                                  {sp.name} · Brain:{' '}
+                                  <span className="font-mono text-slate-300">
+                                    {fish.lineage.modelVersion}
+                                  </span>
+                                </div>
                               </div>
                             </div>
-                            <span
-                              className={`px-2.5 py-1 rounded text-[11px] font-mono font-bold uppercase ${
-                                fish.state.isGravid
-                                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                                  : 'bg-cyan-500/15 text-cyan-300'
-                              }`}
-                            >
-                              {fish.state.isGravid ? 'Expecting Babies' : fish.state.lifeStage}
+                            <span className="text-xs font-mono text-cyan-300">
+                              {fish.state.isGravid
+                                ? 'Expecting Babies'
+                                : fish.state.lifeStage.toUpperCase()}
                             </span>
                           </div>
 
-                          {/* Energy & Satisfaction Progress Bars */}
                           <div className="space-y-2 text-xs">
                             <div>
                               <div className="flex justify-between font-mono mb-1">
@@ -948,7 +1665,7 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="grid grid-cols-2 gap-2 pt-1 text-xs font-mono text-slate-300">
+                          <div className="grid grid-cols-2 gap-2 pt-1 text-xs font-mono text-slate-300 tabular-nums">
                             <div>
                               Age: {fish.state.ageSimHours.toFixed(1)}h /{' '}
                               {sp.lifespan.lifespanSimHours}h
@@ -956,12 +1673,6 @@ export default function App() {
                             <div>Food Eaten: {fish.state.metrics.foodPelletsEaten}</div>
                             <div>Babies Hatched: {fish.state.metrics.offspringProduced}</div>
                             <div>Speed Gene: {fish.genetics.maxSpeedGene}x</div>
-                            <div className="col-span-2 text-slate-400 truncate">
-                              Lineage:{' '}
-                              {fish.lineage.motherId
-                                ? 'Inherited Mother Brain + Mutations'
-                                : 'Founding Pair (Base Brain Model)'}
-                            </div>
                           </div>
                         </div>
                       );
@@ -976,8 +1687,9 @@ export default function App() {
                       </span>
                       <button
                         type="button"
+                        data-tv-focusable="true"
                         onClick={handleRestockStarterPair}
-                        className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300"
+                        className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 focus:ring-4 focus:ring-white focus:outline-none"
                       >
                         Restock 2 Starter Fishes (Free)
                       </button>
@@ -986,10 +1698,412 @@ export default function App() {
                 </div>
               )}
 
-              {/* TAB 2: 3D POLYGON & GRAPHICS SETTINGS */}
+              {/* TAB 2: AQUARIUM SHOP — BUY FISHES (BY OWNER LEVEL) & UPGRADE TANK SPACE (3 -> 4 -> 5 -> 6) */}
+              {settingsTab === 'aquarium_shop' && (
+                <div className="space-y-6">
+                  {/* Top Care & Auto-Feeder Bar */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        <span>Water Filter &amp; Owner Top Auto-Feeder</span>
+                        <button
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={() => setHelpModalTopic(HELP_TOPICS.water_care)}
+                          className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                        >
+                          ?
+                        </button>
+                      </div>
+                      <div className="text-xs text-slate-400 mt-0.5">
+                        Water Quality:{' '}
+                        {Math.round(ecosystem.evolutionConfig.environment.waterQuality * 100)}% ·
+                        Owner Top Auto-Feeders Installed:{' '}
+                        {ecosystem.autoFeederCountByTank[currentTank.id] || 0}/
+                        {currentTank.maxAutoFeeders} (Used by 24/7 Keeper when offline)
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={handleCleanAquariumWater}
+                        className="px-3.5 py-2 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400 focus:ring-4 focus:ring-white focus:outline-none"
+                      >
+                        Refresh Water &amp; Filter (+12 XP)
+                      </button>
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={handleBuyAutoFeeder}
+                        className="px-3.5 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 focus:ring-4 focus:ring-white focus:outline-none"
+                      >
+                        Buy Owner Auto-Feeder (75 Credits)
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Section A: Buy Fishes Unlocked by Owner Level */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-bold text-white">
+                          Buy Fishes for Your Aquarium — Tank Space: {aliveFishes.length}/
+                          {currentTank.maxFishCapacity} Fishes
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Fish species unlock as your Owner Level increases (Current: Owner Lv.
+                          {ownerLevel} · {ownerXp}/100 XP). You can buy fishes up to your active
+                          aquarium&rsquo;s space limit ({currentTank.maxFishCapacity}).
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => setHelpModalTopic(HELP_TOPICS.owner_level_shop)}
+                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                      >
+                        ?
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                      {sortedShopSpecies.map((sp) => {
+                        const reqLv = sp.requiredOwnerLevel || 1;
+                        const price = sp.shopPriceCredits || 45;
+                        const unlockedByLevel = ownerLevel >= reqLv;
+                        const hasSpace = aliveFishes.length < currentTank.maxFishCapacity;
+                        const canAfford = ecosystem.bioCredits >= price;
+
+                        return (
+                          <div
+                            key={sp.id}
+                            className={`p-4 rounded-xl border flex flex-col justify-between gap-3 ${
+                              unlockedByLevel
+                                ? 'bg-slate-900/95 border-slate-700'
+                                : 'bg-slate-950/75 border-slate-800/80 opacity-80'
+                            }`}
+                          >
+                            <div>
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2">
+                                  <span
+                                    className="w-3.5 h-3.5 rounded-full shrink-0 border border-white/30"
+                                    style={{
+                                      background: `linear-gradient(135deg, ${sp.primaryColorHex}, ${sp.secondaryColorHex})`,
+                                    }}
+                                  />
+                                  <span className="text-xs font-bold text-white">{sp.name}</span>
+                                </div>
+                                <span className="text-xs font-mono text-amber-300 font-semibold">
+                                  {price} Cr
+                                </span>
+                              </div>
+                              <div className="text-[11px] font-mono text-slate-400 mt-1">
+                                {sp.scientificName} · Lifespan {sp.lifespan.lifespanSimHours}h ·
+                                Requires Lv.{reqLv}
+                              </div>
+                              <p className="text-xs text-slate-300 mt-1.5 line-clamp-2">
+                                {sp.description}
+                              </p>
+                            </div>
+
+                            <button
+                              type="button"
+                              data-tv-focusable="true"
+                              onClick={() => handleBuyFishFromShop(sp)}
+                              className={`w-full py-2 px-3 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                                !unlockedByLevel
+                                  ? 'bg-slate-800 text-slate-400'
+                                  : !hasSpace
+                                  ? 'bg-slate-800 text-amber-300'
+                                  : canAfford
+                                  ? 'bg-cyan-400 text-slate-950 hover:bg-cyan-300'
+                                  : 'bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              {!unlockedByLevel
+                                ? `Unlocks at Owner Lv.${reqLv}`
+                                : !hasSpace
+                                ? `Tank Full (${currentTank.maxFishCapacity}/${currentTank.maxFishCapacity}) — Upgrade Tank`
+                                : `Buy Fish (${price} Credits)`}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Section B: Upgrade Aquarium Tank for More Space (3 -> 4 -> 5 -> 6 Max) */}
+                  <div className="space-y-3 pt-2 border-t border-slate-800">
+                    <div>
+                      <h3 className="text-sm font-bold text-white">
+                        Aquarium Tanks — Upgrade for More Space (3 → 4 → 5 → 6 Max Fishes)
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Changing tanks expands your aquarium&rsquo;s space capacity up to the
+                        maximum of 6 adult fishes, while allowing babies to exist over the max.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {TANK_TIERS.map((tier) => {
+                        const unlocked = ecosystem.unlockedTankTiers.includes(tier.tierIndex);
+                        const isCurrent = ecosystem.activeTankTier === tier.tierIndex;
+                        return (
+                          <div
+                            key={tier.id}
+                            className={`p-4 rounded-xl border flex flex-col justify-between ${
+                              isCurrent
+                                ? 'bg-cyan-950/40 border-cyan-400'
+                                : unlocked
+                                ? 'bg-slate-900/90 border-slate-700'
+                                : 'bg-slate-950/80 border-slate-800/80'
+                            }`}
+                          >
+                            <div>
+                              <div className="flex items-center justify-between">
+                                <span className="text-sm font-bold text-white">{tier.name}</span>
+                                <span className="text-xs font-mono text-amber-300">
+                                  {unlocked ? 'OWNED' : `${tier.costCredits} Credits`}
+                                </span>
+                              </div>
+                              <div className="text-xs font-mono text-cyan-300 mt-0.5">
+                                Space Capacity: {tier.maxFishCapacity} Adult Fishes (+ Babies Over
+                                Max)
+                              </div>
+                              <p className="text-xs text-slate-400 mt-2">{tier.description}</p>
+                            </div>
+
+                            <button
+                              type="button"
+                              data-tv-focusable="true"
+                              onClick={() => handleBuyOrSelectTank(tier.tierIndex)}
+                              className={`mt-4 w-full py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                                isCurrent
+                                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-500/40'
+                                  : unlocked
+                                  ? 'bg-cyan-400 text-slate-950 hover:bg-cyan-300'
+                                  : 'bg-amber-400 text-slate-950 hover:bg-amber-300'
+                              }`}
+                            >
+                              {isCurrent
+                                ? `Active Tank (${tier.maxFishCapacity} Fish Space)`
+                                : unlocked
+                                ? `Switch to Tank (${tier.maxFishCapacity} Fish Space)`
+                                : `Buy Tank for ${tier.maxFishCapacity} Fish Space (${tier.costCredits} Cr)`}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 3: 3D POLYGON & GRAPHICS SETTINGS */}
               {settingsTab === 'graphics_polygons' && (
                 <div className="space-y-5">
-                  {/* 3D Fish Polygon Density Selector */}
+                  {/* Full-Screen Frameless TV Aquarium Mode Toggle (Default ON) */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/40 flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        <span>Full-Screen TV Aquarium Mode (No Tank Frames — Default)</span>
+                        <button
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={() => setHelpModalTopic(HELP_TOPICS.frameless_tv)}
+                          className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                        >
+                          ?
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Removes tank metal frames and borders so your entire TV screen becomes a
+                        living edge-to-edge aquarium. Arrow keys control focus on the top buttons.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      data-tv-focusable="true"
+                      onClick={handleToggleFramelessTvMode}
+                      className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                        isFramelessTvMode
+                          ? 'bg-emerald-400 text-slate-950 hover:bg-emerald-300'
+                          : 'bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700'
+                      }`}
+                    >
+                      {isFramelessTvMode
+                        ? 'Full-Screen TV Mode: ON (Frameless)'
+                        : 'Full-Screen TV Mode: OFF (Show Tank Frame)'}
+                    </button>
+                  </div>
+
+                  {/* Customizable Aquarium Background Blue & Overhead Lighting Tuner */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/30 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-bold text-white">
+                          Aquarium Background Blue &amp; Lighting Intensity
+                        </div>
+                        <p className="text-xs text-slate-400">
+                          Customize how dark or bright the blue water at the back of the tank looks,
+                          plus overhead reef lamp intensity to match your room and TV.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {(
+                          [
+                            ['Abyssal Night', 0.06, 0.55],
+                            ['Deep Ocean (Default)', 0.22, 0.95],
+                            ['Natural Reef', 0.45, 1.15],
+                            ['Bright Lagoon', 0.78, 1.4],
+                          ] as Array<[string, number, number]>
+                        ).map(([presetName, bgVal, lightVal]) => {
+                          const isSelected =
+                            Math.abs(currentBgBrightness - bgVal) < 0.04 &&
+                            Math.abs(currentLightIntensity - lightVal) < 0.08;
+                          return (
+                            <button
+                              key={presetName}
+                              type="button"
+                              data-tv-focusable="true"
+                              onClick={() =>
+                                handleUpdateLightingSettings(
+                                  {
+                                    backgroundBrightness: bgVal,
+                                    lightIntensity: lightVal,
+                                  },
+                                  `Lighting preset set to ${presetName}`
+                                )
+                              }
+                              className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                                isSelected
+                                  ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                                  : 'bg-slate-950 text-slate-300 border-slate-700 hover:border-cyan-400/60'
+                              }`}
+                            >
+                              {presetName}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+                      {/* Control 1: Back-of-Tank Blue Brightness */}
+                      <div className="p-3.5 rounded-xl bg-slate-950/85 border border-slate-800 space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-slate-200">
+                            Back-of-Tank Blue Brightness
+                          </span>
+                          <span className="text-xs font-mono font-bold text-cyan-300 tabular-nums">
+                            {Math.round(currentBgBrightness * 100)}%
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          0% = Pitch-Black Abyss · 22% = Deep Dark Ocean · 100% = Bright Lagoon Blue
+                        </p>
+                        <div className="flex items-center gap-2.5 pt-0.5">
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() =>
+                              handleUpdateLightingSettings({
+                                backgroundBrightness: currentBgBrightness - 0.08,
+                              })
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold text-white border border-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            - Darker
+                          </button>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={2}
+                            value={Math.round(currentBgBrightness * 100)}
+                            onChange={(e) =>
+                              handleUpdateLightingSettings({
+                                backgroundBrightness: Number(e.target.value) / 100,
+                              })
+                            }
+                            className="flex-1 accent-cyan-400 cursor-pointer"
+                            aria-label="Back of Tank Blue Brightness"
+                          />
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() =>
+                              handleUpdateLightingSettings({
+                                backgroundBrightness: currentBgBrightness + 0.08,
+                              })
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold text-white border border-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            + Brighter
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Control 2: Overhead Aquarium Light Intensity */}
+                      <div className="p-3.5 rounded-xl bg-slate-950/85 border border-slate-800 space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-slate-200">
+                            Overhead Aquarium Light Intensity
+                          </span>
+                          <span className="text-xs font-mono font-bold text-amber-300 tabular-nums">
+                            {Math.round(currentLightIntensity * 100)}%
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          15% = Dim Moonlight Sanctuary · 95% = Natural Sun · 180% = High-Output Reef
+                        </p>
+                        <div className="flex items-center gap-2.5 pt-0.5">
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() =>
+                              handleUpdateLightingSettings({
+                                lightIntensity: currentLightIntensity - 0.1,
+                              })
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold text-white border border-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            - Dimmer
+                          </button>
+                          <input
+                            type="range"
+                            min={15}
+                            max={180}
+                            step={5}
+                            value={Math.round(currentLightIntensity * 100)}
+                            onChange={(e) =>
+                              handleUpdateLightingSettings({
+                                lightIntensity: Number(e.target.value) / 100,
+                              })
+                            }
+                            className="flex-1 accent-amber-400 cursor-pointer"
+                            aria-label="Overhead Aquarium Light Intensity"
+                          />
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() =>
+                              handleUpdateLightingSettings({
+                                lightIntensity: currentLightIntensity + 0.1,
+                              })
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold text-white border border-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            + Brighter
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
                     <div className="flex items-center justify-between">
                       <div>
@@ -1006,8 +2120,9 @@ export default function App() {
                       </div>
                       <button
                         type="button"
+                        data-tv-focusable="true"
                         onClick={() => setHelpModalTopic(HELP_TOPICS.fish_polygons)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30"
+                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
                       >
                         ?
                       </button>
@@ -1025,8 +2140,9 @@ export default function App() {
                         <button
                           key={qId}
                           type="button"
+                          data-tv-focusable="true"
                           onClick={() => handleUpdatePolygonQuality(qId)}
-                          className={`p-3 rounded-xl border text-left transition-colors ${
+                          className={`p-3 rounded-xl border text-left transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
                             currentPolyQuality === qId
                               ? 'bg-cyan-500/20 border-cyan-400 text-white'
                               : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:border-slate-600'
@@ -1052,8 +2168,9 @@ export default function App() {
                       </div>
                       <button
                         type="button"
+                        data-tv-focusable="true"
                         onClick={() => setHelpModalTopic(HELP_TOPICS.lighting_quality)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30"
+                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
                       >
                         ?
                       </button>
@@ -1064,6 +2181,7 @@ export default function App() {
                         <button
                           key={tier}
                           type="button"
+                          data-tv-focusable="true"
                           onClick={() => {
                             const eco = ecosystemRef.current;
                             eco.graphicsSettings = {
@@ -1079,7 +2197,7 @@ export default function App() {
                             saveEcosystemState(eco);
                             setEcosystem({ ...eco });
                           }}
-                          className={`px-4 py-2 rounded-lg text-xs font-bold border ${
+                          className={`px-4 py-2 rounded-lg text-xs font-bold border focus:ring-4 focus:ring-white focus:outline-none ${
                             currentEnvQuality === tier
                               ? 'bg-cyan-400 text-slate-950 border-cyan-300'
                               : 'bg-slate-950 text-slate-300 border-slate-800'
@@ -1089,195 +2207,73 @@ export default function App() {
                         </button>
                       ))}
 
-                      <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer ml-2">
-                        <input
-                          type="checkbox"
-                          checked={ecosystem.graphicsSettings?.showCaustics !== false}
-                          onChange={(e) => {
-                            const eco = ecosystemRef.current;
-                            eco.graphicsSettings = {
-                              ...(eco.graphicsSettings || {
-                                fishPolygonQuality: 'high',
-                                environmentQuality: 'high',
-                                showCaustics: true,
-                                showParticles: true,
-                                antiAliasing: true,
-                              }),
-                              showCaustics: e.target.checked,
-                            };
-                            saveEcosystemState(eco);
-                            setEcosystem({ ...eco });
-                          }}
-                        />
-                        <span>Underwater Caustic Shimmer</span>
-                      </label>
-
-                      <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer ml-2">
-                        <input
-                          type="checkbox"
-                          checked={ecosystem.graphicsSettings?.showParticles !== false}
-                          onChange={(e) => {
-                            const eco = ecosystemRef.current;
-                            eco.graphicsSettings = {
-                              ...(eco.graphicsSettings || {
-                                fishPolygonQuality: 'high',
-                                environmentQuality: 'high',
-                                showCaustics: true,
-                                showParticles: true,
-                                antiAliasing: true,
-                              }),
-                              showParticles: e.target.checked,
-                            };
-                            saveEcosystemState(eco);
-                            setEcosystem({ ...eco });
-                          }}
-                        />
-                        <span>Oxygen Bubbles</span>
-                      </label>
-                    </div>
-                  </div>
-
-                  {/* Biological Clock Speed */}
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-sm font-bold text-white">
-                          Aquarium Time Speed ({ecosystem.timeMultiplier}x)
-                        </div>
-                        <div className="text-xs text-slate-400">
-                          Controls how fast simulation hours pass for aging, feeding, and natural
-                          breeding.
-                        </div>
-                      </div>
                       <button
                         type="button"
-                        onClick={() => setHelpModalTopic(HELP_TOPICS.time_speed)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30"
+                        data-tv-focusable="true"
+                        onClick={() => {
+                          const eco = ecosystemRef.current;
+                          const nextVal = eco.graphicsSettings?.showCaustics === false;
+                          eco.graphicsSettings = {
+                            ...(eco.graphicsSettings || {
+                              fishPolygonQuality: 'high',
+                              environmentQuality: 'high',
+                              showCaustics: true,
+                              showParticles: true,
+                              antiAliasing: true,
+                            }),
+                            showCaustics: nextVal,
+                          };
+                          saveEcosystemState(eco);
+                          setEcosystem({ ...eco });
+                        }}
+                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
                       >
-                        ?
+                        Caustic Shimmer:{' '}
+                        {ecosystem.graphicsSettings?.showCaustics !== false ? 'ON' : 'OFF'}
+                      </button>
+
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => {
+                          const eco = ecosystemRef.current;
+                          const nextVal = eco.graphicsSettings?.showParticles === false;
+                          eco.graphicsSettings = {
+                            ...(eco.graphicsSettings || {
+                              fishPolygonQuality: 'high',
+                              environmentQuality: 'high',
+                              showCaustics: true,
+                              showParticles: true,
+                              antiAliasing: true,
+                            }),
+                            showParticles: nextVal,
+                          };
+                          saveEcosystemState(eco);
+                          setEcosystem({ ...eco });
+                        }}
+                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                      >
+                        Oxygen Bubbles:{' '}
+                        {ecosystem.graphicsSettings?.showParticles !== false ? 'ON' : 'OFF'}
                       </button>
                     </div>
-
-                    <div className="flex flex-wrap gap-3">
-                      {[
-                        [1, '1x Real-Time (Calm Screensaver)'],
-                        [6, '6x Accelerated'],
-                        [24, '24x Fast Evolution (1 Day / Real Hour)'],
-                      ].map(([spd, label]) => (
-                        <button
-                          key={spd}
-                          type="button"
-                          onClick={() => {
-                            ecosystemRef.current.timeMultiplier = Number(spd);
-                            saveEcosystemState(ecosystemRef.current);
-                            setEcosystem({ ...ecosystemRef.current });
-                          }}
-                          className={`px-4 py-2 rounded-lg text-xs font-bold border ${
-                            ecosystem.timeMultiplier === spd
-                              ? 'bg-emerald-400 text-slate-950 border-emerald-300'
-                              : 'bg-slate-950 text-slate-300 border-slate-800'
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
                   </div>
-                </div>
-              )}
 
-              {/* TAB 3: AQUARIUM SHOP & WATER CARE */}
-              {settingsTab === 'aquarium_shop' && (
-                <div className="space-y-5">
-                  {/* Real-Life Owner Care Actions */}
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
+                  {/* Real-Time Clock Status (Time Acceleration Disabled in Player Game) */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between">
                     <div>
-                      <div className="text-sm font-bold text-white flex items-center gap-2">
-                        <span>Water Filter &amp; Top-Surface Feeding</span>
-                        <button
-                          type="button"
-                          onClick={() => setHelpModalTopic(HELP_TOPICS.water_care)}
-                          className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold"
-                        >
-                          ?
-                        </button>
+                      <div className="text-sm font-bold text-white">
+                        Aquarium Simulation Clock: Locked to 1x Real-Time
                       </div>
-                      <div className="text-xs text-slate-400 mt-0.5">
-                        Water Quality:{' '}
-                        {Math.round(ecosystem.evolutionConfig.environment.waterQuality * 100)}% ·
-                        Top Auto-Feeders Installed:{' '}
-                        {ecosystem.autoFeederCountByTank[currentTank.id] || 0}/
-                        {currentTank.maxAutoFeeders}
+                      <div className="text-xs text-slate-400">
+                        Your aquarium runs in authentic 1x real-time ({ecosystem.simHoursTotal.toFixed(2)}h
+                        elapsed) and continues living 24/7 in the Offline Fish Keeper when you close
+                        the game.
                       </div>
                     </div>
-
-                    <div className="flex flex-wrap items-center gap-2.5">
-                      <button
-                        type="button"
-                        onClick={handleCleanAquariumWater}
-                        className="px-3.5 py-2 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400"
-                      >
-                        Refresh Water &amp; Filter (100% Clean)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleBuyAutoFeeder}
-                        className="px-3.5 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400"
-                      >
-                        Buy Top Auto-Feeder (75 Credits)
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Upgradable Aquariums */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    {TANK_TIERS.map((tier) => {
-                      const unlocked = ecosystem.unlockedTankTiers.includes(tier.tierIndex);
-                      const isCurrent = ecosystem.activeTankTier === tier.tierIndex;
-                      return (
-                        <div
-                          key={tier.id}
-                          className={`p-4 rounded-xl border flex flex-col justify-between ${
-                            isCurrent
-                              ? 'bg-cyan-950/40 border-cyan-400'
-                              : unlocked
-                              ? 'bg-slate-900/90 border-slate-700'
-                              : 'bg-slate-950/80 border-slate-800/80'
-                          }`}
-                        >
-                          <div>
-                            <div className="flex items-center justify-between">
-                              <span className="text-sm font-bold text-white">{tier.name}</span>
-                              <span className="text-xs font-mono text-amber-300">
-                                {unlocked ? 'OWNED' : `${tier.costCredits} Credits`}
-                              </span>
-                            </div>
-                            <div className="text-xs font-mono text-cyan-300 mt-0.5">
-                              {tier.subtitle} · Holds up to {tier.maxFishCapacity} Fishes
-                            </div>
-                            <p className="text-xs text-slate-400 mt-2">{tier.description}</p>
-                          </div>
-
-                          <button
-                            type="button"
-                            onClick={() => handleBuyOrSelectTank(tier.tierIndex)}
-                            className={`mt-4 w-full py-2 rounded-lg text-xs font-bold transition-colors ${
-                              isCurrent
-                                ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-500/40'
-                                : unlocked
-                                ? 'bg-cyan-400 text-slate-950 hover:bg-cyan-300'
-                                : 'bg-amber-400 text-slate-950 hover:bg-amber-300'
-                            }`}
-                          >
-                            {isCurrent
-                              ? 'Active Aquarium'
-                              : unlocked
-                              ? 'Switch to This Aquarium'
-                              : `Buy Aquarium (${tier.costCredits} Credits)`}
-                          </button>
-                        </div>
-                      );
-                    })}
+                    <span className="text-xs font-mono text-emerald-300 font-bold">
+                      1x REAL-TIME
+                    </span>
                   </div>
                 </div>
               )}
@@ -1292,17 +2288,19 @@ export default function App() {
           role="dialog"
           aria-modal="true"
           aria-label={helpModalTopic.title}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-[#02060d]/80 p-4 pointer-events-auto"
+          data-modal-scope="help"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#02060d]/85 p-4 pointer-events-auto"
         >
           <div className="w-full max-w-md rounded-2xl bg-[#09192f] border border-cyan-400/60 p-6 shadow-2xl space-y-4 text-slate-100">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-white">{helpModalTopic.title}</h3>
               <button
                 type="button"
+                data-tv-focusable="true"
                 onClick={() => setHelpModalTopic(null)}
-                className="px-2.5 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:text-white"
+                className="px-3 py-1 rounded bg-slate-800 text-xs text-slate-200 hover:text-white focus:ring-4 focus:ring-cyan-300 focus:outline-none"
               >
-                Close
+                Close [B / OK]
               </button>
             </div>
             <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
@@ -1321,34 +2319,37 @@ export default function App() {
           role="dialog"
           aria-modal="true"
           aria-label="Aquarium Paused"
+          data-modal-scope="paused"
           className="fixed inset-0 z-40 flex items-center justify-center bg-[#02060d]/80 p-6 pointer-events-auto"
         >
           <div className="w-full max-w-sm rounded-2xl bg-[#071324] border border-cyan-500/40 p-6 shadow-2xl space-y-4 text-center">
-            <h2 className="text-xl font-bold text-white">{t.paused}</h2>
+            <h2 className="text-xl font-bold text-white">{t.pausedTitle || 'Sanctuary Paused'}</h2>
             <p className="text-xs text-slate-400">
               Aquarium clock paused at {ecosystem.simHoursTotal.toFixed(2)} simulation hours.
             </p>
             <div className="flex flex-col gap-2.5 pt-2">
               <button
                 type="button"
+                data-tv-focusable="true"
                 onClick={() => {
                   ecosystemRef.current.paused = false;
                   setScreenState('playing');
                 }}
-                className="w-full py-2.5 rounded-lg bg-cyan-400 text-slate-950 text-xs font-bold hover:bg-cyan-300"
+                className="w-full py-2.5 rounded-lg bg-cyan-400 text-slate-950 text-xs font-bold hover:bg-cyan-300 focus:ring-4 focus:ring-white focus:outline-none"
               >
                 {t.resume}
               </button>
               <button
                 type="button"
+                data-tv-focusable="true"
                 onClick={() => {
                   ecosystemRef.current.paused = false;
                   setScreenState('playing');
                   setSettingsOpen(true);
                 }}
-                className="w-full py-2.5 rounded-lg bg-slate-800 text-cyan-300 text-xs font-semibold hover:bg-slate-700"
+                className="w-full py-2.5 rounded-lg bg-slate-800 text-cyan-300 text-xs font-semibold hover:bg-slate-700 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
               >
-                Open Fish Stats &amp; Settings
+                Open Owner Menu &amp; Shop
               </button>
             </div>
           </div>

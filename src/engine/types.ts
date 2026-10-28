@@ -10,6 +10,11 @@ export interface UserGraphicsSettings {
   showCaustics: boolean;
   showParticles: boolean;
   antiAliasing: boolean;
+  framelessTvMode?: boolean;
+  /** Overall overhead & key lighting intensity multiplier (0.15 .. 1.80, default 0.95) */
+  lightIntensity?: number;
+  /** Back-of-tank & water background brightness (0.00 pitch abyss .. 1.00 bright blue, default 0.22) */
+  backgroundBrightness?: number;
 }
 
 export interface AdminUserRecord {
@@ -77,6 +82,9 @@ export interface SpeciesConfig {
   name: string;
   scientificName: string;
   description: string;
+  category?: 'freshwater' | 'marine' | 'cichlid' | 'specialty';
+  requiredOwnerLevel?: number;
+  shopPriceCredits?: number;
   bodyStyle: 'fusiform_reef' | 'angel_disc' | 'biolum_Latern' | 'mandarin_dragonet';
   primaryColorHex: string;
   secondaryColorHex: string;
@@ -316,6 +324,7 @@ export interface ModelVersionRecord {
   isPromotedBase: boolean;
   notes: string;
   brainConfig: BrainConfig;
+  speciesConfig?: SpeciesConfig;
   weights: number[][];
   biases: number[][];
   benchmark: BenchmarkTaskScores;
@@ -375,6 +384,8 @@ export interface SavedEcosystemState {
   timeMultiplier: number;
   paused: boolean;
   bioCredits: number;
+  ownerLevel?: number;
+  ownerXp?: number;
   unlockedTankTiers: number[];
   activeTankTier: number;
   autoFeederCountByTank: Record<string, number>;
