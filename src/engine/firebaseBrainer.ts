@@ -82,6 +82,7 @@ export interface CloudUserBrainRecord {
   username: string;
   profileId: string;
   updatedAtMs: number;
+  updatedAtIso?: string;
   adminOverrideAtMs?: number;
   lastAdminAction?: string;
   isActivelyPlaying: boolean;
@@ -89,6 +90,8 @@ export interface CloudUserBrainRecord {
   autoFeederStock: number;
   fishBrains: CloudUserFishBrainItem[];
 }
+
+export type UserFishBrainItem = CloudUserFishBrainItem;
 
 export const MAX_VERSIONS_PER_SPECIES = 10;
 
@@ -729,15 +732,38 @@ export function syncUserBrainsToFirestore(
  * their live game immediately receives the override via `onSnapshot` and applies it!
  */
 export async function saveAdminOverrideForUserInFirestore(
-  record: CloudUserBrainRecord,
-  actionSummary: string
+  recordOrUsername: CloudUserBrainRecord | string,
+  profileIdOrActionSummary?: string,
+  fishBrains?: CloudUserFishBrainItem[],
+  isActivelyPlaying?: boolean,
+  autoFeederStock?: number,
+  actionSummary?: string
 ): Promise<boolean> {
   try {
+    let record: CloudUserBrainRecord;
+    let summary: string;
+
+    if (typeof recordOrUsername === 'object' && recordOrUsername !== null) {
+      record = recordOrUsername;
+      summary = typeof profileIdOrActionSummary === 'string' ? profileIdOrActionSummary : 'Admin Override';
+    } else {
+      summary = actionSummary || 'Admin Override';
+      record = {
+        username: String(recordOrUsername),
+        profileId: typeof profileIdOrActionSummary === 'string' ? profileIdOrActionSummary : 'local-caretaker',
+        updatedAtMs: Date.now(),
+        isActivelyPlaying: Boolean(isActivelyPlaying),
+        lastGameHeartbeatMs: isActivelyPlaying ? Date.now() : 0,
+        autoFeederStock: Number(autoFeederStock || 0),
+        fishBrains: Array.isArray(fishBrains) ? fishBrains : [],
+      };
+    }
+
     const docId = sanitizeKey(record.username);
     const now = Date.now();
     record.updatedAtMs = now;
     record.adminOverrideAtMs = now;
-    record.lastAdminAction = actionSummary;
+    record.lastAdminAction = summary;
     _lastCloudUserFirestoreWriteMs.set(docId, now);
 
     await setDoc(
@@ -746,7 +772,7 @@ export async function saveAdminOverrideForUserInFirestore(
         ...record,
         updatedAtMs: now,
         adminOverrideAtMs: now,
-        lastAdminAction: actionSummary,
+        lastAdminAction: summary,
         fishBrains: record.fishBrains.map((fb) => ({
           ...fb,
           brain: toFirestoreSafeBrain(fb.brain),

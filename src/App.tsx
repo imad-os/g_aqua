@@ -69,8 +69,8 @@ const HELP_TOPICS: Record<string, HelpTopic> = {
     tip: 'Set to "High" for realistic seabed shadows beneath swimming fishes.',
   },
   owner_level_shop: {
-    title: 'Owner Level, Fish Shop & Tank Space (3 to 6 Max)',
-    body: 'Feeding fishes, keeping water clean, and raising babies earns Owner XP and raises your Owner Level. Higher Owner Levels unlock new famous fish species in the shop! Upgrading your aquarium tank is strictly for more space: Tank 1 holds 3 fishes, Tank 2 holds 4, Tank 3 holds 5, and Tank 4 holds the maximum of 6 fishes.',
+    title: 'Fish Shop & Tank Space (3 to 6 Max)',
+    body: 'Feeding fishes, keeping water clean, and raising babies earns XP and raises your level. Higher levels unlock new famous fish species in the shop! Upgrading your aquarium tank is strictly for more space: Tank 1 holds 3 fishes, Tank 2 holds 4, Tank 3 holds 5, and Tank 4 holds the maximum of 6 fishes.',
     tip: 'Babies hatched by AI breeding are allowed to exist OVER your tank’s max capacity! When those babies mature into adults over the limit, they stay safely in your tank and new breeding pauses until space frees up.',
   },
   ai_breeding: {
@@ -562,15 +562,16 @@ export default function App() {
     saveEcosystemStateAsync(eco, 800);
     audioEngine.playPelletDrop();
 
+    const uName = mypc.info()?.profile?.name || 'Keeper';
     if (xpRes.leveledUp) {
       setEcosystem({ ...eco });
       showToast(
-        `Sprinkled food on top! Owner Level Up → Level ${xpRes.newLevel} (New shop fishes unlocked!)`
+        `Sprinkled food on top! ${uName} Level Up → Level ${xpRes.newLevel} (New shop fishes unlocked!)`
       );
     } else if (settingsOpenRef.current) {
       setEcosystem({ ...eco });
     }
-  }, [showToast]);
+  }, [mypc, showToast]);
 
   // Refresh aquarium water quality & comfort
   const handleCleanAquariumWater = () => {
@@ -586,10 +587,11 @@ export default function App() {
     const xpRes = awardOwnerXp(eco, 12);
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
+    const uName = mypc.info()?.profile?.name || 'Keeper';
     showToast(
       xpRes.leveledUp
-        ? `Water filtered to 100%! Owner Level Up → Level ${xpRes.newLevel}!`
-        : 'Water filtered & conditioned to 100% quality (25.0°C). Fish comfort restored (+12 Owner XP)!'
+        ? `Water filtered to 100%! ${uName} Level Up → Level ${xpRes.newLevel}!`
+        : `Water filtered & conditioned to 100% quality (25.0°C). Fish comfort restored (+12 XP)!`
     );
   };
 
@@ -603,8 +605,9 @@ export default function App() {
     const price = species.shopPriceCredits || 45;
 
     if (ownerLevel < reqLevel) {
+      const uName = mypc.info()?.profile?.name || 'Keeper';
       showToast(
-        `${species.name} requires Owner Level ${reqLevel} (you are Level ${ownerLevel}). Feed & care for your fishes to level up!`
+        `${species.name} requires ${uName} Level ${reqLevel} (you are Level ${ownerLevel}). Feed & care for your fishes to level up!`
       );
       return;
     }
@@ -659,7 +662,7 @@ export default function App() {
 
     showToast(
       xpRes.leveledUp
-        ? `Bought ${species.name} (${newFish.lineage.name})! Owner Level Up → Level ${xpRes.newLevel}!`
+        ? `Bought ${species.name} (${newFish.lineage.name})! ${username} Level Up → Level ${xpRes.newLevel}!`
         : `Purchased ${species.name} (${newFish.lineage.name})! Tank space: ${
             aliveFishes.length + 1
           }/${tank.maxFishCapacity}.`
@@ -1547,6 +1550,7 @@ export default function App() {
 
   const lang = mypcInfo.lang || 'en';
   const t = I18N[lang] || I18N.en;
+  const username = mypcInfo.profile?.name || mypc.info()?.profile?.name || 'Keeper';
   const currentTank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
   const aliveFishes = ecosystem.fishes.filter((f) => f.lineage.alive);
   const deadFishes = ecosystem.fishes.filter((f) => !f.lineage.alive);
@@ -1705,7 +1709,7 @@ export default function App() {
 
             <p className="text-sm sm:text-base text-slate-200 leading-relaxed max-w-md">
               Start with 2 living 3D fishes powered by individual neural brains. Sprinkle food on
-              the top water surface, level up as an Owner to unlock famous species in the shop, and
+              the top water surface, level up as <span className="text-cyan-300 font-semibold">{username}</span> to unlock famous species in the shop, and
               upgrade your tank from 3 up to 6 fishes (+ babies).
             </p>
 
@@ -1783,7 +1787,7 @@ export default function App() {
               </span>
               <span className="text-slate-500">·</span>
               <span className="text-violet-300 font-semibold">
-                Owner Lv.{ownerLevel} ({ownerXp}/100 XP)
+                {username} Lv.{ownerLevel} ({ownerXp}/100 XP)
               </span>
               <span className="text-slate-500">·</span>
               <span className="text-emerald-300">Gen {highestGeneration}</span>
@@ -1829,7 +1833,7 @@ export default function App() {
                     : ''
                 }`}
               >
-                Owner Menu &amp; Shop [Play/Pause · +/Start]
+                {username} Menu &amp; Shop [Play/Pause · +/Start]
               </button>
 
               <button
@@ -1951,7 +1955,7 @@ export default function App() {
         <div
           role="dialog"
           aria-modal="true"
-          aria-label="Aquarium Owner Menu and Settings"
+          aria-label={`${username}'s Aquarium Menu and Settings`}
           data-modal-scope="settings"
           className="fixed inset-0 z-30 flex items-center justify-center bg-[#02060d]/80 p-4 pointer-events-auto"
         >
@@ -1960,9 +1964,9 @@ export default function App() {
             <div className="px-6 py-4 bg-[#09192f] border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h2 className="text-lg font-bold text-white flex items-center gap-2.5">
-                  <span>Aquarium Owner Menu &amp; Shop</span>
+                  <span>{username}&rsquo;s Aquarium Menu &amp; Shop</span>
                   <span className="text-xs font-mono font-normal text-cyan-300">
-                    Owner Lv.{ownerLevel} ({ownerXp}/100 XP) · {Math.round(ecosystem.bioCredits)}{' '}
+                    {username} Lv.{ownerLevel} ({ownerXp}/100 XP) · {Math.round(ecosystem.bioCredits)}{' '}
                     Credits
                   </span>
                 </h2>
@@ -2245,7 +2249,7 @@ export default function App() {
                   <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
                     <div>
                       <div className="text-sm font-bold text-white flex items-center gap-2">
-                        <span>Water Filter &amp; Owner Top Auto-Feeder</span>
+                        <span>Water Filter &amp; {username}&rsquo;s Top Auto-Feeder</span>
                         <button
                           type="button"
                           data-tv-focusable="true"
@@ -2258,7 +2262,7 @@ export default function App() {
                       <div className="text-xs text-slate-400 mt-0.5">
                         Water Quality:{' '}
                         {Math.round(ecosystem.evolutionConfig.environment.waterQuality * 100)}% ·
-                        Owner Top Auto-Feeders Installed:{' '}
+                        {username}&rsquo;s Top Auto-Feeders Installed:{' '}
                         {ecosystem.autoFeederCountByTank[currentTank.id] || 0}/
                         {currentTank.maxAutoFeeders} (Used by 24/7 Keeper when offline)
                       </div>
@@ -2279,7 +2283,7 @@ export default function App() {
                         onClick={handleBuyAutoFeeder}
                         className="px-3.5 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 focus:ring-4 focus:ring-white focus:outline-none"
                       >
-                        Buy Owner Auto-Feeder (75 Credits)
+                        Buy Auto-Feeder (75 Credits)
                       </button>
                     </div>
                   </div>
@@ -2293,7 +2297,7 @@ export default function App() {
                           {currentTank.maxFishCapacity} Fishes
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Fish species unlock as your Owner Level increases (Current: Owner Lv.
+                          Fish species unlock as {username} Level increases (Current: {username} Lv.
                           {ownerLevel} · {ownerXp}/100 XP). You can buy fishes up to your active
                           aquarium&rsquo;s space limit ({currentTank.maxFishCapacity}).
                         </p>
@@ -2364,7 +2368,7 @@ export default function App() {
                               }`}
                             >
                               {!unlockedByLevel
-                                ? `Unlocks at Owner Lv.${reqLv}`
+                                ? `Unlocks at ${username} Lv.${reqLv}`
                                 : !hasSpace
                                 ? `Tank Full (${currentTank.maxFishCapacity}/${currentTank.maxFishCapacity}) — Upgrade Tank`
                                 : `Buy Fish (${price} Credits)`}
