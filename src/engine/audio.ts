@@ -76,11 +76,20 @@ class AquariumAudioEngine {
     }, 4500);
   }
 
+  private lastPelletDropMs = 0;
+  private lastPelletEatMs = 0;
+
   public playPelletDrop(): void {
+    const now = performance.now();
+    if (now - this.lastPelletDropMs < 140) return;
+    this.lastPelletDropMs = now;
     this.playTone(580, 0.12, 'sine', this.sfxVolume * 0.22, 320);
   }
 
   public playPelletEat(): void {
+    const now = performance.now();
+    if (now - this.lastPelletEatMs < 140) return;
+    this.lastPelletEatMs = now;
     this.playTone(420 + Math.random() * 120, 0.09, 'triangle', this.sfxVolume * 0.18, 680);
   }
 
@@ -99,27 +108,42 @@ class AquariumAudioEngine {
     gainLevel: number,
     endFreq?: number
   ): void {
-    if (this.muted || gainLevel <= 0.005) return;
-    this.initOrResume();
-    if (!this.ctx || this.ctx.state !== 'running') return;
+    if (this.muted || gainLevel <= 0.005 || typeof window === 'undefined') return;
+    window.setTimeout(() => {
+      try {
+        if (this.muted) return;
+        this.initOrResume();
+        if (!this.ctx || this.ctx.state !== 'running') return;
 
-    const now = this.ctx.currentTime;
-    const osc = this.ctx.createOscillator();
-    const gain = this.ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(startFreq, now);
-    if (endFreq) {
-      osc.frequency.exponentialRampToValueAtTime(endFreq, now + durationSec);
-    }
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(startFreq, now);
+        if (endFreq) {
+          osc.frequency.exponentialRampToValueAtTime(endFreq, now + durationSec);
+        }
 
-    gain.gain.setValueAtTime(0.001, now);
-    gain.gain.linearRampToValueAtTime(gainLevel, now + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0008, now + durationSec);
+        gain.gain.setValueAtTime(0.001, now);
+        gain.gain.linearRampToValueAtTime(gainLevel, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0008, now + durationSec);
 
-    osc.connect(gain);
-    gain.connect(this.ctx.destination);
-    osc.start(now);
-    osc.stop(now + durationSec + 0.02);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.onended = () => {
+          try {
+            osc.disconnect();
+            gain.disconnect();
+          } catch {
+            // ignore
+          }
+        };
+        osc.start(now);
+        osc.stop(now + durationSec + 0.02);
+      } catch {
+        // ignore audio errors
+      }
+    }, 0);
   }
 }
 

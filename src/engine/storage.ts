@@ -101,6 +101,8 @@ export function createInitialEcosystemState(
       framelessTvMode: true,
       lightIntensity: 0.95,
       backgroundBrightness: 0.22,
+      daylightMode: true,
+      timeOfDayOverride: 'auto',
     },
     speciesList,
     evolutionConfig,
@@ -154,6 +156,8 @@ export function resetFishesKeepBaseModels(currentState: SavedEcosystemState): Sa
         framelessTvMode: true,
         lightIntensity: 0.95,
         backgroundBrightness: 0.22,
+        daylightMode: true,
+        timeOfDayOverride: 'auto' as const,
       };
   const preservedExperiments = JSON.parse(JSON.stringify(currentState.experiments || []));
 
@@ -244,6 +248,8 @@ function normalizeLoadedEcosystem(parsed: SavedEcosystemState): SavedEcosystemSt
       framelessTvMode: true,
       lightIntensity: 0.95,
       backgroundBrightness: 0.22,
+      daylightMode: true,
+      timeOfDayOverride: 'auto',
     };
   } else {
     if (parsed.graphicsSettings.framelessTvMode === undefined) {
@@ -254,6 +260,12 @@ function normalizeLoadedEcosystem(parsed: SavedEcosystemState): SavedEcosystemSt
     }
     if (typeof parsed.graphicsSettings.backgroundBrightness !== 'number') {
       parsed.graphicsSettings.backgroundBrightness = 0.22;
+    }
+    if (parsed.graphicsSettings.daylightMode === undefined) {
+      parsed.graphicsSettings.daylightMode = true;
+    }
+    if (!parsed.graphicsSettings.timeOfDayOverride) {
+      parsed.graphicsSettings.timeOfDayOverride = 'auto';
     }
   }
   // Ensure famous starter species are present in speciesList
@@ -324,6 +336,38 @@ export function saveEcosystemState(state: SavedEcosystemState): void {
   } catch (e) {
     mypc.report(e, { stage: 'saveEcosystemState' });
   }
+}
+
+let _pendingAsyncSaveTimer: number | null = null;
+let _latestPendingState: SavedEcosystemState | null = null;
+
+/**
+ * Non-blocking, debounced background save so gameplay interactions (such as dropping food pellets,
+ * fish eating pellets, or periodic runtime checkpoints) never block the requestAnimationFrame loop
+ * with synchronous JSON.stringify + localStorage.setItem.
+ */
+export function saveEcosystemStateAsync(state: SavedEcosystemState, delayMs = 350): void {
+  _latestPendingState = state;
+  if (typeof window === 'undefined') return;
+  if (_pendingAsyncSaveTimer !== null) {
+    window.clearTimeout(_pendingAsyncSaveTimer);
+  }
+  _pendingAsyncSaveTimer = window.setTimeout(() => {
+    _pendingAsyncSaveTimer = null;
+    const target = _latestPendingState;
+    if (!target) return;
+    const runSave = () => {
+      if (_latestPendingState) {
+        saveEcosystemState(_latestPendingState);
+      }
+    };
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void }).requestIdleCallback;
+    if (typeof ric === 'function') {
+      ric(runSave, { timeout: 1200 });
+    } else {
+      window.setTimeout(runSave, 0);
+    }
+  }, delayMs);
 }
 
 /**

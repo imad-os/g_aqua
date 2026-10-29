@@ -171,20 +171,24 @@ interface FirestoreSafeBrain {
   lastOutputs: number[];
 }
 
+function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
 export function toFirestoreSafeBrain(brain: FishBrainInstance): FirestoreSafeBrain {
   const layers = brain.inheritedWeights.map((iw, idx) => ({
-    iw: iw.map((n) => Number(n.toFixed(4))),
-    ib: (brain.inheritedBiases[idx] || []).map((n) => Number(n.toFixed(4))),
-    dw: (brain.learnedDeltaWeights[idx] || []).map((n) => Number(n.toFixed(4))),
-    db: (brain.learnedDeltaBiases[idx] || []).map((n) => Number(n.toFixed(4))),
+    iw: iw.map(round4),
+    ib: (brain.inheritedBiases[idx] || []).map(round4),
+    dw: (brain.learnedDeltaWeights[idx] || []).map(round4),
+    db: (brain.learnedDeltaBiases[idx] || []).map(round4),
   }));
   return {
     architecture: { ...brain.architecture },
     layers,
-    recurrentState: brain.recurrentState.map((n) => Number(n.toFixed(4))),
-    attentionGates: brain.attentionGates.map((n) => Number(n.toFixed(4))),
-    lastInputs: brain.lastInputs.map((n) => Number(n.toFixed(4))),
-    lastOutputs: brain.lastOutputs.map((n) => Number(n.toFixed(4))),
+    recurrentState: brain.recurrentState.map(round4),
+    attentionGates: brain.attentionGates.map(round4),
+    lastInputs: brain.lastInputs.map(round4),
+    lastOutputs: brain.lastOutputs.map(round4),
   };
 }
 
@@ -472,8 +476,8 @@ export async function saveModelVersionToFirestore(
   model: ModelVersionRecord
 ): Promise<boolean> {
   const layers = model.weights.map((w, idx) => ({
-    w: w.map((n) => Number(n.toFixed(4))),
-    b: (model.biases[idx] || []).map((n) => Number(n.toFixed(4))),
+    w: w.map(round4),
+    b: (model.biases[idx] || []).map(round4),
   }));
 
   const payload = {
@@ -610,30 +614,35 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
  * on session transitions (open/close/visibility change) so the 24/7 Fish Keeper
  * dynamically removes their fishes when they open the game and brings them back when they close it.
  */
-export async function setUserOnlineStatusInFirestore(
+export function setUserOnlineStatusInFirestore(
   username: string,
   profileId: string,
   isActivelyPlaying: boolean,
   autoFeederStock: number
 ): Promise<void> {
-  try {
-    const docId = sanitizeKey(username);
-    const now = Date.now();
-    await setDoc(
-      doc(aiFirestore, 'mypc_user_brains', docId),
-      {
-        username: username || 'Keeper',
-        profileId: profileId || 'default',
-        updatedAtMs: now,
-        isActivelyPlaying,
-        lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
-        autoFeederStock,
-      },
-      { merge: true }
-    );
-  } catch {
-    // ignore transient offline
-  }
+  return new Promise((resolve) => {
+    setTimeout(async () => {
+      try {
+        const docId = sanitizeKey(username);
+        const now = Date.now();
+        await setDoc(
+          doc(aiFirestore, 'mypc_user_brains', docId),
+          {
+            username: username || 'Keeper',
+            profileId: profileId || 'default',
+            updatedAtMs: now,
+            isActivelyPlaying,
+            lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
+            autoFeederStock,
+          },
+          { merge: true }
+        );
+      } catch {
+        // ignore transient offline
+      }
+      resolve();
+    }, 0);
+  });
 }
 
 export function serializeFishEntityToCloudBrainItem(f: FishEntity, lifespanHours = 24): CloudUserFishBrainItem {
@@ -647,19 +656,17 @@ export function serializeFishEntityToCloudBrainItem(f: FishEntity, lifespanHours
     fatherId: f.lineage.fatherId,
     alive: f.lineage.alive,
     causeOfDeath: f.lineage.causeOfDeath,
-    energy: Number(f.state.energy.toFixed(2)),
-    hunger: Number(f.state.hunger.toFixed(2)),
-    ageSimHours: Number(f.state.ageSimHours.toFixed(3)),
+    energy: Math.round(f.state.energy * 100) / 100,
+    hunger: Math.round(f.state.hunger * 100) / 100,
+    ageSimHours: Math.round(f.state.ageSimHours * 1000) / 1000,
     lifespanSimHours: lifespanHours,
     brain: toFirestoreSafeBrain(f.brain) as unknown as FishBrainInstance,
-    foragingEfficiency: Number(
-      (
-        (f.state.metrics.foodPelletsEaten /
-          Math.max(1, f.state.metrics.foragingAttempts)) *
-        100
-      ).toFixed(1)
-    ),
-    lifetimeReward: Number(f.state.metrics.lifetimeReward.toFixed(2)),
+    foragingEfficiency: Math.round(
+      (f.state.metrics.foodPelletsEaten /
+        Math.max(1, f.state.metrics.foragingAttempts)) *
+        1000
+    ) / 10,
+    lifetimeReward: Math.round(f.state.metrics.lifetimeReward * 100) / 100,
     decisionsMade: f.state.metrics.decisionsMade,
     foodPelletsEaten: f.state.metrics.foodPelletsEaten,
     inheritedMutations: f.lineage.inheritedMutations.slice(0, 8),
@@ -669,10 +676,10 @@ export function serializeFishEntityToCloudBrainItem(f: FishEntity, lifespanHours
 /**
  * Syncs AI-specific data (individual fish brains + active play status) to Firestore
  * keyed by the MyPC username (`MyPC.info().profile.name`).
- * Called on significant events (open/close game, birth, death, purchase, admin override)
- * and 3-5 minute checkpoints to stay well under the 20k daily Firestore write quota.
+ * Runs 100% asynchronously in a background macrotask so serialization and network I/O
+ * never block a single animation frame!
  */
-export async function syncUserBrainsToFirestore(
+export function syncUserBrainsToFirestore(
   username: string,
   profileId: string,
   fishes: FishEntity[],
@@ -680,36 +687,40 @@ export async function syncUserBrainsToFirestore(
   autoFeederStock: number,
   adminOverrideOpts?: { adminOverrideAtMs?: number; lastAdminAction?: string }
 ): Promise<boolean> {
-  try {
-    const docId = sanitizeKey(username);
-    const now = Date.now();
-    _lastCloudUserFirestoreWriteMs.set(docId, now);
+  return new Promise((resolve) => {
+    setTimeout(async () => {
+      try {
+        const docId = sanitizeKey(username);
+        const now = Date.now();
+        _lastCloudUserFirestoreWriteMs.set(docId, now);
 
-    const firestorePayload: Record<string, any> = {
-      username: username || 'Keeper',
-      profileId: profileId || 'default',
-      updatedAtMs: now,
-      isActivelyPlaying,
-      lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
-      autoFeederStock,
-      fishBrains: fishes.slice(0, 50).map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
-    };
+        const firestorePayload: Record<string, any> = {
+          username: username || 'Keeper',
+          profileId: profileId || 'default',
+          updatedAtMs: now,
+          isActivelyPlaying,
+          lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
+          autoFeederStock,
+          fishBrains: fishes.slice(0, 50).map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
+        };
 
-    if (adminOverrideOpts?.adminOverrideAtMs) {
-      firestorePayload.adminOverrideAtMs = adminOverrideOpts.adminOverrideAtMs;
-    }
-    if (adminOverrideOpts?.lastAdminAction) {
-      firestorePayload.lastAdminAction = adminOverrideOpts.lastAdminAction;
-    }
+        if (adminOverrideOpts?.adminOverrideAtMs) {
+          firestorePayload.adminOverrideAtMs = adminOverrideOpts.adminOverrideAtMs;
+        }
+        if (adminOverrideOpts?.lastAdminAction) {
+          firestorePayload.lastAdminAction = adminOverrideOpts.lastAdminAction;
+        }
 
-    await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), firestorePayload, {
-      merge: true,
-    });
-    return true;
-  } catch (err) {
-    console.warn('[Firestore Brain Sync] Offline or restricted, using local cache:', err);
-    return false;
-  }
+        await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), firestorePayload, {
+          merge: true,
+        });
+        resolve(true);
+      } catch (err) {
+        console.warn('[Firestore Brain Sync] Offline or restricted, using local cache:', err);
+        resolve(false);
+      }
+    }, 0);
+  });
 }
 
 /**
@@ -784,18 +795,26 @@ export function subscribeToSingleUserBrainRecord(
 ): () => void {
   try {
     const docId = sanitizeKey(username);
+    let lastProcessedAdminTs = 0;
     return onSnapshot(
       doc(aiFirestore, 'mypc_user_brains', docId),
       (snap) => {
-        if (!snap.exists()) return;
+        // Ignore our own local writes echoing back so we never waste CPU parsing self-writes
+        if (!snap.exists() || snap.metadata.hasPendingWrites) return;
         const data = snap.data() as any;
-        onUpdate({
-          ...data,
-          fishBrains: (data.fishBrains || []).map((fb: any) => ({
-            ...fb,
-            brain: fromFirestoreSafeBrain(fb.brain),
-          })),
-        } as CloudUserBrainRecord);
+        const adminTs = Number(data?.adminOverrideAtMs || 0);
+        // Only parse full brain weights if there is a new admin override timestamp
+        if (!adminTs || adminTs <= lastProcessedAdminTs) return;
+        lastProcessedAdminTs = adminTs;
+        setTimeout(() => {
+          onUpdate({
+            ...data,
+            fishBrains: (data.fishBrains || []).map((fb: any) => ({
+              ...fb,
+              brain: fromFirestoreSafeBrain(fb.brain),
+            })),
+          } as CloudUserBrainRecord);
+        }, 0);
       },
       () => {
         // Ignore snapshot error when offline

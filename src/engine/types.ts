@@ -18,6 +18,10 @@ export interface UserGraphicsSettings {
   lightIntensity?: number;
   /** Back-of-tank & water background brightness (0.00 pitch abyss .. 1.00 bright blue, default 0.22) */
   backgroundBrightness?: number;
+  /** Daylight Mode ON/OFF: when ON, uses natural Daylight during the day and Bulb Light at night; when OFF, always uses Bulb Light */
+  daylightMode?: boolean;
+  /** Optional time-of-day override ('auto' uses real fish clock, 'day' forces daytime, 'night' forces nighttime) */
+  timeOfDayOverride?: 'auto' | 'day' | 'night';
 }
 
 export interface AdminUserRecord {

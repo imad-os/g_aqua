@@ -29,6 +29,7 @@ import {
   loadEcosystemState,
   publishActiveGameSessionLease,
   saveEcosystemState,
+  saveEcosystemStateAsync,
   setForceOfflineOverride,
 } from './engine/storage';
 import {
@@ -91,6 +92,11 @@ const HELP_TOPICS: Record<string, HelpTopic> = {
     title: 'Full-Screen TV Aquarium Mode (No Tank Frames)',
     body: 'Turns your entire TV or monitor into a frameless, edge-to-edge living aquarium window with no metal tank borders or hood. This is the default mode.',
     tip: 'In Full-Screen TV Mode, use the Left / Right / Up / Down arrows on your TV remote or controller to move focus across the buttons on top, and press OK / A to activate the focused button.',
+  },
+  daylight_mode: {
+    title: 'Daylight (ON / OFF) & Automatic Night Bulb Lights',
+    body: 'When Daylight is ON, your aquarium is illuminated by natural solar Daylight during daytime (06:00 AM – 06:30 PM) and automatically switches to warm overhead Aquarium Bulb Lights at night (06:30 PM – 06:00 AM). When Daylight is OFF, solar daylight is disabled and the aquarium always uses overhead Bulb Lights.',
+    tip: 'You can also switch the Fish Time Clock between Real-Time Auto Clock, Preview Day, or Preview Night to test Daylight vs. Bulb Lights anytime.',
   },
 };
 
@@ -158,6 +164,7 @@ export default function App() {
 
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [nowClock, setNowClock] = useState<Date>(() => new Date());
   const [lastControllerInputLabel, setLastControllerInputLabel] = useState<string>(
     'TV Remote [Play/Pause] or Gamepad [+ / Select / Start] opens Menu'
   );
@@ -191,6 +198,14 @@ export default function App() {
     const t = window.setTimeout(() => setToastMessage(null), 4200);
     return () => window.clearTimeout(t);
   }, [toastMessage]);
+
+  // Update the top-bar Fish Date & Time clock every 15 seconds (lightweight, zero simulation lag)
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowClock(new Date());
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (typeof document !== 'undefined') {
@@ -520,6 +535,7 @@ export default function App() {
   }, [screenState, ecosystem.activeTankTier, mypc, applyCloudRecordToEcosystem]);
 
   // Sprinkle food across the TOP water surface (just like a real aquarium owner)
+  // 100% non-blocking: no synchronous localStorage JSON.stringify or Firestore writes on food drop!
   const handleSprinkleFoodOnTop = useCallback(() => {
     const eco = ecosystemRef.current;
     const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
@@ -542,14 +558,18 @@ export default function App() {
       });
     }
     const xpRes = awardOwnerXp(eco, 6);
-    saveEcosystemState(eco);
-    setEcosystem({ ...eco });
+    // Schedule background async localStorage save so dropping food never blocks the render frame
+    saveEcosystemStateAsync(eco, 800);
     audioEngine.playPelletDrop();
-    showToast(
-      xpRes.leveledUp
-        ? `Sprinkled food on top! Owner Level Up → Level ${xpRes.newLevel} (New shop fishes unlocked!)`
-        : 'Sprinkled food flakes across the top water surface (+6 Owner XP).'
-    );
+
+    if (xpRes.leveledUp) {
+      setEcosystem({ ...eco });
+      showToast(
+        `Sprinkled food on top! Owner Level Up → Level ${xpRes.newLevel} (New shop fishes unlocked!)`
+      );
+    } else if (settingsOpenRef.current) {
+      setEcosystem({ ...eco });
+    }
   }, [showToast]);
 
   // Refresh aquarium water quality & comfort
@@ -887,9 +907,17 @@ export default function App() {
     );
   }, [showToast]);
 
-  // Update Aquarium Overhead Light Intensity & Back-of-Tank Blue Brightness
+  // Update Aquarium Overhead Light Intensity, Back-of-Tank Blue Brightness & Daylight / Bulb Mode
   const handleUpdateLightingSettings = useCallback(
-    (patch: { lightIntensity?: number; backgroundBrightness?: number }, labelMsg?: string) => {
+    (
+      patch: {
+        lightIntensity?: number;
+        backgroundBrightness?: number;
+        daylightMode?: boolean;
+        timeOfDayOverride?: 'auto' | 'day' | 'night';
+      },
+      labelMsg?: string
+    ) => {
       const eco = ecosystemRef.current;
       const cur = eco.graphicsSettings || {
         fishPolygonQuality: 'high',
@@ -898,8 +926,11 @@ export default function App() {
         showParticles: true,
         antiAliasing: true,
         framelessTvMode: true,
+        showFps: false,
         lightIntensity: 0.95,
         backgroundBrightness: 0.22,
+        daylightMode: true,
+        timeOfDayOverride: 'auto',
       };
       const nextLight =
         patch.lightIntensity !== undefined
@@ -909,13 +940,21 @@ export default function App() {
         patch.backgroundBrightness !== undefined
           ? Math.max(0.0, Math.min(1.0, Number(patch.backgroundBrightness.toFixed(2))))
           : cur.backgroundBrightness ?? 0.22;
+      const nextDaylight =
+        patch.daylightMode !== undefined ? patch.daylightMode : cur.daylightMode !== false;
+      const nextTimeOverride =
+        patch.timeOfDayOverride !== undefined
+          ? patch.timeOfDayOverride
+          : cur.timeOfDayOverride || 'auto';
 
       eco.graphicsSettings = {
         ...cur,
         lightIntensity: nextLight,
         backgroundBrightness: nextBg,
+        daylightMode: nextDaylight,
+        timeOfDayOverride: nextTimeOverride,
       };
-      saveEcosystemState(eco);
+      saveEcosystemStateAsync(eco, 300);
       setEcosystem({ ...eco });
       if (labelMsg) {
         showToast(labelMsg);
@@ -923,6 +962,19 @@ export default function App() {
     },
     [showToast]
   );
+
+  // Toggle Daylight Mode (ON = Solar Daylight by day & Bulb Lights at night; OFF = Always Bulb Lights)
+  const handleToggleDaylightMode = useCallback(() => {
+    const eco = ecosystemRef.current;
+    const currentlyOn = eco.graphicsSettings?.daylightMode !== false;
+    const nextOn = !currentlyOn;
+    handleUpdateLightingSettings(
+      { daylightMode: nextOn },
+      nextOn
+        ? 'Daylight Mode: ON (Natural Daylight by day, automatic Bulb Lights at night).'
+        : 'Daylight Mode: OFF (Using overhead Aquarium Bulb Lights continuously).'
+    );
+  }, [handleUpdateLightingSettings]);
 
   const handleStartAquarium = useCallback(() => {
     audioEngine.initOrResume();
@@ -1431,7 +1483,7 @@ export default function App() {
           audioEngine.playBirthChime();
           const maxGen = Math.max(...eco.fishes.map((f) => f.lineage.generation));
           mypc.submitScore(maxGen * 100 + eco.bioCredits);
-          saveEcosystemState(eco);
+          saveEcosystemStateAsync(eco, 400);
           setEcosystem({ ...eco });
           const username = mypc.info()?.profile?.name || 'Keeper';
           const profileId = mypc.info()?.profile?.id || 'local-caretaker';
@@ -1442,7 +1494,7 @@ export default function App() {
           );
         },
         onDeath: (fish, reason) => {
-          saveEcosystemState(eco);
+          saveEcosystemStateAsync(eco, 400);
           setEcosystem({ ...eco });
           const username = mypc.info()?.profile?.name || 'Keeper';
           const profileId = mypc.info()?.profile?.id || 'local-caretaker';
@@ -1453,14 +1505,15 @@ export default function App() {
       });
 
       const nowMs = performance.now();
-      if (nowMs - lastHudSyncMsRef.current > 2000) {
+      const hudSyncInterval = settingsOpenRef.current ? 1500 : 3500;
+      if (nowMs - lastHudSyncMsRef.current > hudSyncInterval) {
         lastHudSyncMsRef.current = nowMs;
         setEcosystem({ ...eco });
       }
 
-      if (nowMs - lastLocalSaveMsRef.current > 20000) {
+      if (nowMs - lastLocalSaveMsRef.current > 25000) {
         lastLocalSaveMsRef.current = nowMs;
-        saveEcosystemState(eco);
+        saveEcosystemStateAsync(eco, 900);
       }
 
       if (nowMs - lastFirestoreSyncMsRef.current > FIRESTORE_CHECKPOINT_INTERVAL_MS) {
@@ -1517,6 +1570,28 @@ export default function App() {
   const isShowFpsEnabled = ecosystem.graphicsSettings?.showFps === true;
   const currentLightIntensity = ecosystem.graphicsSettings?.lightIntensity ?? 0.95;
   const currentBgBrightness = ecosystem.graphicsSettings?.backgroundBrightness ?? 0.22;
+  const isDaylightModeOn = ecosystem.graphicsSettings?.daylightMode !== false;
+  const currentTimeOverride = ecosystem.graphicsSettings?.timeOfDayOverride || 'auto';
+
+  const clockHourFloat = nowClock.getHours() + nowClock.getMinutes() / 60;
+  const isDaytimeForFish =
+    currentTimeOverride === 'day'
+      ? true
+      : currentTimeOverride === 'night'
+      ? false
+      : clockHourFloat >= 6.0 && clockHourFloat < 18.5;
+  const isUsingSolarDaylight = isDaylightModeOn && isDaytimeForFish;
+
+  const formattedFishDate = nowClock.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  const formattedFishTime = nowClock.toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  const fishSimDay = Math.floor((ecosystem.simHoursTotal || 0) / 24) + 1;
 
   const sortedShopSpecies = [...ecosystem.speciesList].sort(
     (a, b) => (a.requiredOwnerLevel || 1) - (b.requiredOwnerLevel || 1)
@@ -1673,7 +1748,7 @@ export default function App() {
           data-modal-scope="hud"
           className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-5"
         >
-          {/* Minimal Top Bar: Tank Space, Owner Level & Credits on Left; Actions on Right */}
+          {/* Minimal Top Bar: Tank Space, Fish Date & Time, Owner Level & Credits on Left; Actions on Right */}
           <div className="w-full flex flex-wrap items-start justify-between gap-4">
             <div className="pointer-events-auto px-3.5 py-2 rounded-lg bg-[#06101e]/80 border border-slate-700/60 text-xs font-mono text-slate-200 tabular-nums flex flex-wrap items-center gap-2.5">
               <span className="text-cyan-300 font-semibold">{currentTank.name}</span>
@@ -1682,6 +1757,29 @@ export default function App() {
                 Space: {adultFishes.length}/{currentTank.maxFishCapacity} Fishes
                 {babyFishes.length > 0 ? ` (+${babyFishes.length} Babies)` : ''}
                 {deadFishes.length > 0 ? ` · ${deadFishes.length} Dead` : ''}
+              </span>
+              <span className="text-slate-500">·</span>
+              <span
+                data-testid="fish-date-time-top"
+                className="text-sky-200 font-semibold flex items-center gap-1.5"
+                title="Current Date & Time for the Fishes"
+              >
+                <span>
+                  {formattedFishDate} · {formattedFishTime} (Day {fishSimDay})
+                </span>
+                <span
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                    isUsingSolarDaylight
+                      ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                      : 'bg-amber-500/20 border-amber-400/50 text-amber-200'
+                  }`}
+                >
+                  {isUsingSolarDaylight
+                    ? 'DAYLIGHT'
+                    : isDaylightModeOn
+                    ? 'NIGHT · BULB LIGHTS'
+                    : 'BULB LIGHTS'}
+                </span>
               </span>
               <span className="text-slate-500">·</span>
               <span className="text-violet-300 font-semibold">
@@ -1723,33 +1821,10 @@ export default function App() {
                   setFocusedBtnIndex(1);
                 }}
                 onClick={() => {
-                  handleToggleFramelessTvMode();
-                }}
-                className={`px-3.5 py-2 rounded-lg border text-xs font-semibold transition-all shadow-lg whitespace-nowrap focus:ring-4 focus:ring-cyan-300 focus:outline-none ${
-                  isFramelessTvMode
-                    ? 'bg-emerald-500/20 border-emerald-400/70 text-emerald-200 hover:bg-emerald-500/30'
-                    : 'bg-[#071324]/90 border-slate-600 text-slate-200 hover:bg-slate-800'
-                } ${
-                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 1
-                    ? 'ring-4 ring-cyan-300 scale-[1.03]'
-                    : ''
-                }`}
-              >
-                {isFramelessTvMode ? 'TV Full-Screen: ON (No Frames)' : 'TV Full-Screen: OFF (Framed)'}
-              </button>
-
-              <button
-                type="button"
-                data-tv-focusable="true"
-                onFocus={() => {
-                  focusedBtnIndexRef.current = 2;
-                  setFocusedBtnIndex(2);
-                }}
-                onClick={() => {
                   setSettingsOpen((v) => !v);
                 }}
                 className={`px-3.5 py-2 rounded-lg bg-[#071324]/90 border border-cyan-500/50 text-xs font-semibold text-cyan-200 hover:bg-slate-800 focus:ring-4 focus:ring-cyan-300 focus:outline-none transition-all shadow-lg whitespace-nowrap ${
-                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 2
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 1
                     ? 'ring-4 ring-cyan-300 scale-[1.03]'
                     : ''
                 }`}
@@ -1762,8 +1837,8 @@ export default function App() {
                 data-tv-focusable="true"
                 aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
                 onFocus={() => {
-                  focusedBtnIndexRef.current = 3;
-                  setFocusedBtnIndex(3);
+                  focusedBtnIndexRef.current = 2;
+                  setFocusedBtnIndex(2);
                 }}
                 onClick={() => {
                   const nextMute = !isMuted;
@@ -1771,7 +1846,7 @@ export default function App() {
                   audioEngine.setMuted(nextMute);
                 }}
                 className={`p-2 rounded-lg bg-[#071324]/85 border border-slate-700 text-slate-200 hover:border-cyan-400 focus:ring-4 focus:ring-cyan-300 focus:outline-none transition-all ${
-                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 3
+                  !settingsOpen && !helpModalTopic && focusedBtnIndex === 2
                     ? 'ring-4 ring-cyan-300 scale-[1.05]'
                     : ''
                 }`}
@@ -2561,11 +2636,100 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 3. THIRD IN TAB: Full-Screen Frameless TV Aquarium Mode Toggle (Default ON) */}
+                  {/* 3. THIRD IN TAB: Daylight Mode (ON / OFF) & Automatic Night Bulb Lights */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-amber-500/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-bold text-white flex items-center gap-2">
+                          <span>3. Daylight Lighting (ON / OFF) &amp; Night Bulb Lights</span>
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() => setHelpModalTopic(HELP_TOPICS.daylight_mode)}
+                            className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            ?
+                          </button>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          When <strong>Daylight is ON</strong>, the aquarium shows natural solar
+                          daylight during the day (06:00–18:30) and automatically turns on warm
+                          overhead <strong>Bulb Lights</strong> at night. When{' '}
+                          <strong>Daylight is OFF</strong>, overhead Bulb Lights are used all the
+                          time.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold border ${
+                            isUsingSolarDaylight
+                              ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                              : 'bg-amber-500/20 border-amber-400/50 text-amber-200'
+                          }`}
+                        >
+                          Active Now:{' '}
+                          {isUsingSolarDaylight ? 'SOLAR DAYLIGHT' : 'AQUARIUM BULB LIGHTS'}
+                        </span>
+                        <button
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={handleToggleDaylightMode}
+                          className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                            isDaylightModeOn
+                              ? 'bg-sky-400 text-slate-950 hover:bg-sky-300'
+                              : 'bg-amber-400 text-slate-950 hover:bg-amber-300'
+                          }`}
+                        >
+                          {isDaylightModeOn
+                            ? 'Daylight: ON (Day Sun / Night Bulbs)'
+                            : 'Daylight: OFF (Bulb Lights Only)'}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80 text-xs">
+                      <span className="text-slate-300 font-mono">
+                        Fish Date &amp; Time: {formattedFishDate} · {formattedFishTime} (Sim Day{' '}
+                        {fishSimDay})
+                      </span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-slate-400">Time of Day Cycle:</span>
+                        {(
+                          [
+                            ['auto', 'Auto Real-Time Clock'],
+                            ['day', 'Force Day (Sun)'],
+                            ['night', 'Force Night (Bulb Lights)'],
+                          ] as Array<['auto' | 'day' | 'night', string]>
+                        ).map(([modeId, modeLabel]) => (
+                          <button
+                            key={modeId}
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() =>
+                              handleUpdateLightingSettings(
+                                { timeOfDayOverride: modeId },
+                                `Fish time cycle set to ${modeLabel}`
+                              )
+                            }
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                              currentTimeOverride === modeId
+                                ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                                : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-600'
+                            }`}
+                          >
+                            {modeLabel}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 4. FOURTH IN TAB: Full-Screen Frameless TV Aquarium Mode Toggle (Default ON) */}
                   <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/40 flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <div className="text-sm font-bold text-white flex items-center gap-2">
-                        <span>3. Full-Screen TV Aquarium Mode</span>
+                        <span>4. Full-Screen TV Aquarium Mode</span>
                         <button
                           type="button"
                           data-tv-focusable="true"

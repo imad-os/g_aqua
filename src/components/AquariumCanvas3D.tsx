@@ -345,6 +345,7 @@ function attachGpuSpineWaveShader(
   material: FishMaterialType,
   uniforms: { uTailPhase: { value: number }; uSwimAmp: { value: number } }
 ) {
+  material.customProgramCacheKey = () => 'fish-gpu-spine-wave-v1';
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uTailPhase = uniforms.uTailPhase;
     shader.uniforms.uSwimAmp = uniforms.uSwimAmp;
@@ -358,6 +359,183 @@ function attachGpuSpineWaveShader(
         transformed.x += sin(uTailPhase - spineU * 4.2) * uSwimAmp * spineEnv;`
       );
   };
+}
+
+interface CachedFishGeometrySet {
+  mergedBodyGeo: THREE.BufferGeometry;
+  staticFinsGeo: THREE.BufferGeometry;
+  tailGeo: THREE.BufferGeometry;
+  pecGeo: THREE.BufferGeometry;
+  pecRightGeo: THREE.BufferGeometry;
+  mergedIrisGeo: THREE.BufferGeometry;
+  mergedPupilGeo: THREE.BufferGeometry;
+  mergedCatchGeo: THREE.BufferGeometry | null;
+  ringGeo: THREE.BufferGeometry;
+  shadowGeo: THREE.BufferGeometry;
+  triangleCount: number;
+}
+
+const _fishGeometrySetCache = new Map<string, CachedFishGeometrySet>();
+
+function getOrCreateCachedFishGeometrySet(
+  bodyStyle: string,
+  polygonQuality: FishPolygonQuality
+): CachedFishGeometrySet {
+  const cacheKey = `${bodyStyle}|${polygonQuality}`;
+  const existing = _fishGeometrySetCache.get(cacheKey);
+  if (existing) return existing;
+
+  const polySpec = getPolygonSpecForQuality(polygonQuality);
+  const isVeryLowPoly = polygonQuality === 'very_low';
+  const isAngel = bodyStyle === 'angel_disc';
+
+  // 1. Body + Gills
+  const coreBodyGeo = buildSculptedFishBodyGeometry(
+    bodyStyle,
+    polySpec.lengthRings,
+    polySpec.radialSegments
+  );
+  let mergedBodyGeo: THREE.BufferGeometry = coreBodyGeo;
+  if (!isVeryLowPoly) {
+    const gillLeftGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
+    gillLeftGeo.scale(0.28, 1.35, 0.95);
+    gillLeftGeo.rotateY(0.22);
+    gillLeftGeo.translate(0.21, -0.01, 0.31);
+
+    const gillRightGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
+    gillRightGeo.scale(0.28, 1.35, 0.95);
+    gillRightGeo.rotateY(-0.22);
+    gillRightGeo.translate(-0.21, -0.01, 0.31);
+
+    mergedBodyGeo =
+      mergeGeometries([coreBodyGeo, gillLeftGeo, gillRightGeo], false) || coreBodyGeo;
+  }
+
+  // 2. Static Fins
+  const dorsalGeo = build3DVolumetricFinGeometry(
+    'dorsal',
+    bodyStyle,
+    polySpec.finSegmentsU,
+    polySpec.finSegmentsV
+  );
+  dorsalGeo.translate(0, isAngel ? 0.44 : 0.26, -0.04);
+
+  const analGeo = build3DVolumetricFinGeometry(
+    'anal',
+    bodyStyle,
+    Math.max(2, Math.floor(polySpec.finSegmentsU * 0.75)),
+    Math.max(2, Math.floor(polySpec.finSegmentsV * 0.75))
+  );
+  analGeo.translate(0, isAngel ? -0.38 : -0.22, -0.22);
+
+  const finPartsToMerge: THREE.BufferGeometry[] = [dorsalGeo, analGeo];
+  if (!isVeryLowPoly) {
+    const pelvicSegU = Math.max(3, Math.floor(polySpec.finSegmentsU * 0.65));
+    const pelvicSegV = Math.max(3, Math.floor(polySpec.finSegmentsV * 0.65));
+    const pelvicLeftGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
+    pelvicLeftGeo.rotateZ(0.32);
+    pelvicLeftGeo.translate(0.08, isAngel ? -0.36 : -0.23, 0.14);
+
+    const pelvicRightGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
+    pelvicRightGeo.rotateZ(-0.32);
+    pelvicRightGeo.translate(-0.08, isAngel ? -0.36 : -0.23, 0.14);
+
+    const lureGeo = new THREE.SphereGeometry(0.045, 6, 6);
+    lureGeo.translate(0, isAngel ? 0.48 : 0.28, 0.25);
+    finPartsToMerge.push(pelvicLeftGeo, pelvicRightGeo, lureGeo);
+  }
+  const staticFinsGeo = mergeGeometries(finPartsToMerge, false) || dorsalGeo;
+
+  // 3. Caudal Tail
+  const tailGeo = build3DVolumetricFinGeometry(
+    'caudal',
+    bodyStyle,
+    polySpec.finSegmentsU,
+    polySpec.finSegmentsV
+  );
+
+  // 4. Pectoral Fins
+  const pecGeo = build3DVolumetricFinGeometry(
+    'pectoral',
+    bodyStyle,
+    polySpec.finSegmentsU,
+    polySpec.finSegmentsV
+  );
+  const pecRightGeo = pecGeo.clone();
+  pecRightGeo.scale(-1, 1, 1);
+  const pecRightIdx = pecRightGeo.index;
+  if (pecRightIdx) {
+    const arr = pecRightIdx.array as Uint16Array | Uint32Array;
+    for (let i = 0; i < arr.length; i += 3) {
+      const tmp = arr[i + 1];
+      arr[i + 1] = arr[i + 2];
+      arr[i + 2] = tmp;
+    }
+  }
+
+  // 5. Eyes
+  const irisL = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
+  irisL.scale(0.65, 1.0, 1.0);
+  irisL.rotateY(0.24);
+  irisL.translate(0.165, 0.075, 0.44);
+  const irisR = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
+  irisR.scale(0.65, 1.0, 1.0);
+  irisR.rotateY(-0.24);
+  irisR.translate(-0.165, 0.075, 0.44);
+  const mergedIrisGeo = mergeGeometries([irisL, irisR], false) || irisL;
+
+  const pupilL = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
+  pupilL.translate(0.19, 0.075, 0.455);
+  const pupilR = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
+  pupilR.translate(-0.19, 0.075, 0.455);
+  const mergedPupilGeo = mergeGeometries([pupilL, pupilR], false) || pupilL;
+
+  let mergedCatchGeo: THREE.BufferGeometry | null = null;
+  if (!isVeryLowPoly) {
+    const catchL = new THREE.SphereGeometry(0.018, 6, 6);
+    catchL.translate(0.207, 0.097, 0.468);
+    const catchR = new THREE.SphereGeometry(0.018, 6, 6);
+    catchR.translate(-0.207, 0.097, 0.468);
+    mergedCatchGeo = mergeGeometries([catchL, catchR], false) || catchL;
+  }
+
+  const ringGeo = new THREE.RingGeometry(0.72, 0.82, isVeryLowPoly ? 12 : 24);
+  ringGeo.rotateX(-Math.PI / 2);
+
+  const shadowGeo = new THREE.CircleGeometry(0.55, isVeryLowPoly ? 8 : 14);
+  shadowGeo.rotateX(-Math.PI / 2);
+
+  const countGeoTris = (g: THREE.BufferGeometry | null) => {
+    if (!g) return 0;
+    if (g.index) return g.index.count / 3;
+    return g.attributes.position ? g.attributes.position.count / 3 : 0;
+  };
+  const triangleCount = Math.round(
+    countGeoTris(mergedBodyGeo) +
+      countGeoTris(staticFinsGeo) +
+      countGeoTris(tailGeo) +
+      countGeoTris(pecGeo) +
+      countGeoTris(pecRightGeo) +
+      countGeoTris(mergedIrisGeo) +
+      countGeoTris(mergedPupilGeo) +
+      countGeoTris(mergedCatchGeo)
+  );
+
+  const created: CachedFishGeometrySet = {
+    mergedBodyGeo,
+    staticFinsGeo,
+    tailGeo,
+    pecGeo,
+    pecRightGeo,
+    mergedIrisGeo,
+    mergedPupilGeo,
+    mergedCatchGeo,
+    ringGeo,
+    shadowGeo,
+    triangleCount,
+  };
+  _fishGeometrySetCache.set(cacheKey, created);
+  return created;
 }
 
 /**
@@ -683,95 +861,25 @@ function createSculpted3DFishRig(
   attachGpuSpineWaveShader(bodyMat, spineUniforms);
   attachGpuSpineWaveShader(finMat, spineUniforms);
 
-  // 1. Merge Sculpted Fish Body + Left/Right Gill Operculum Plates into ONE single draw call
-  const coreBodyGeo = buildSculptedFishBodyGeometry(
-    bodyStyle,
-    polySpec.lengthRings,
-    polySpec.radialSegments
-  );
-  let mergedBodyGeo: THREE.BufferGeometry = coreBodyGeo;
-  if (!isVeryLowPoly) {
-    const gillLeftGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
-    gillLeftGeo.scale(0.28, 1.35, 0.95);
-    gillLeftGeo.rotateY(0.22);
-    gillLeftGeo.translate(0.21, -0.01, 0.31);
+  const cachedGeos = getOrCreateCachedFishGeometrySet(bodyStyle, polygonQuality);
 
-    const gillRightGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
-    gillRightGeo.scale(0.28, 1.35, 0.95);
-    gillRightGeo.rotateY(-0.22);
-    gillRightGeo.translate(-0.21, -0.01, 0.31);
-
-    mergedBodyGeo =
-      mergeGeometries([coreBodyGeo, gillLeftGeo, gillRightGeo], false) || coreBodyGeo;
-  }
-  const bodyMesh = new THREE.Mesh(mergedBodyGeo, bodyMat);
+  const bodyMesh = new THREE.Mesh(cachedGeos.mergedBodyGeo, bodyMat);
   bodyMesh.castShadow = materialTier === 'high';
   bodyMesh.receiveShadow = materialTier === 'high';
   group.add(bodyMesh);
 
-  // 2. Merge Dorsal Fin + Anal Fin + Left/Right Pelvic Fins + Bioluminescent Lure into ONE single draw call
-  const isAngel = bodyStyle === 'angel_disc';
-  const dorsalGeo = build3DVolumetricFinGeometry(
-    'dorsal',
-    bodyStyle,
-    polySpec.finSegmentsU,
-    polySpec.finSegmentsV
-  );
-  dorsalGeo.translate(0, isAngel ? 0.44 : 0.26, -0.04);
-
-  const analGeo = build3DVolumetricFinGeometry(
-    'anal',
-    bodyStyle,
-    Math.max(2, Math.floor(polySpec.finSegmentsU * 0.75)),
-    Math.max(2, Math.floor(polySpec.finSegmentsV * 0.75))
-  );
-  analGeo.translate(0, isAngel ? -0.38 : -0.22, -0.22);
-
-  const finPartsToMerge: THREE.BufferGeometry[] = [dorsalGeo, analGeo];
-  if (!isVeryLowPoly) {
-    const pelvicSegU = Math.max(3, Math.floor(polySpec.finSegmentsU * 0.65));
-    const pelvicSegV = Math.max(3, Math.floor(polySpec.finSegmentsV * 0.65));
-    const pelvicLeftGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
-    pelvicLeftGeo.rotateZ(0.32);
-    pelvicLeftGeo.translate(0.08, isAngel ? -0.36 : -0.23, 0.14);
-
-    const pelvicRightGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
-    pelvicRightGeo.rotateZ(-0.32);
-    pelvicRightGeo.translate(-0.08, isAngel ? -0.36 : -0.23, 0.14);
-
-    const lureGeo = new THREE.SphereGeometry(0.045, 6, 6);
-    lureGeo.translate(0, isAngel ? 0.48 : 0.28, 0.25);
-    finPartsToMerge.push(pelvicLeftGeo, pelvicRightGeo, lureGeo);
-  }
-
-  const staticFinsGeo = mergeGeometries(finPartsToMerge, false) || dorsalGeo;
-  const staticFinsMesh = new THREE.Mesh(staticFinsGeo, finMat);
+  const staticFinsMesh = new THREE.Mesh(cachedGeos.staticFinsGeo, finMat);
   group.add(staticFinsMesh);
 
-  // 3. Articulated 3D Caudal Tail Fan (Mounted at rear peduncle z = -0.61)
   const tailPeduncleGroup = new THREE.Group();
   tailPeduncleGroup.position.set(0, 0, -0.61);
-  const tailGeo = build3DVolumetricFinGeometry(
-    'caudal',
-    bodyStyle,
-    polySpec.finSegmentsU,
-    polySpec.finSegmentsV
-  );
-  const tailBladeMesh = new THREE.Mesh(tailGeo, finMat);
+  const tailBladeMesh = new THREE.Mesh(cachedGeos.tailGeo, finMat);
   tailPeduncleGroup.add(tailBladeMesh);
   group.add(tailPeduncleGroup);
 
-  // 4 & 5. Paired 3D Pectoral Wing Fins (Left +X and Right -X)
-  const pecGeo = build3DVolumetricFinGeometry(
-    'pectoral',
-    bodyStyle,
-    polySpec.finSegmentsU,
-    polySpec.finSegmentsV
-  );
-
   const pectoralLeftGroup = new THREE.Group();
   pectoralLeftGroup.position.set(0.21, -0.06, 0.22);
-  const pecLeftMesh = new THREE.Mesh(pecGeo, finMat);
+  const pecLeftMesh = new THREE.Mesh(cachedGeos.pecGeo, finMat);
   pecLeftMesh.rotation.y = 0.58;
   pecLeftMesh.rotation.z = -0.24;
   pectoralLeftGroup.add(pecLeftMesh);
@@ -779,60 +887,25 @@ function createSculpted3DFishRig(
 
   const pectoralRightGroup = new THREE.Group();
   pectoralRightGroup.position.set(-0.21, -0.06, 0.22);
-  const pecRightGeo = pecGeo.clone();
-  pecRightGeo.scale(-1, 1, 1);
-  // Flip winding after negative X scale so FrontSide normals stay outward
-  const pecRightIdx = pecRightGeo.index;
-  if (pecRightIdx) {
-    const arr = pecRightIdx.array as Uint16Array | Uint32Array;
-    for (let i = 0; i < arr.length; i += 3) {
-      const tmp = arr[i + 1];
-      arr[i + 1] = arr[i + 2];
-      arr[i + 2] = tmp;
-    }
-  }
-  const pecRightMesh = new THREE.Mesh(pecRightGeo, finMat);
+  const pecRightMesh = new THREE.Mesh(cachedGeos.pecRightGeo, finMat);
   pecRightMesh.rotation.y = -0.58;
   pecRightMesh.rotation.z = 0.24;
   pectoralRightGroup.add(pecRightMesh);
   group.add(pectoralRightGroup);
 
-  // 6. Merged Bilateral Eyes
-  const irisL = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
-  irisL.scale(0.65, 1.0, 1.0);
-  irisL.rotateY(0.24);
-  irisL.translate(0.165, 0.075, 0.44);
-  const irisR = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
-  irisR.scale(0.65, 1.0, 1.0);
-  irisR.rotateY(-0.24);
-  irisR.translate(-0.165, 0.075, 0.44);
-  const mergedIrisGeo = mergeGeometries([irisL, irisR], false) || irisL;
   const irisMat = new THREE.MeshBasicMaterial({
     color: new THREE.Color(accentHex).lerp(new THREE.Color('#fbbf24'), 0.5),
   });
-  group.add(new THREE.Mesh(mergedIrisGeo, irisMat));
+  group.add(new THREE.Mesh(cachedGeos.mergedIrisGeo, irisMat));
 
-  const pupilL = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
-  pupilL.translate(0.19, 0.075, 0.455);
-  const pupilR = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
-  pupilR.translate(-0.19, 0.075, 0.455);
-  const mergedPupilGeo = mergeGeometries([pupilL, pupilR], false) || pupilL;
   const pupilMat = new THREE.MeshBasicMaterial({ color: 0x030712 });
-  group.add(new THREE.Mesh(mergedPupilGeo, pupilMat));
+  group.add(new THREE.Mesh(cachedGeos.mergedPupilGeo, pupilMat));
 
-  if (!isVeryLowPoly) {
-    const catchL = new THREE.SphereGeometry(0.018, 6, 6);
-    catchL.translate(0.207, 0.097, 0.468);
-    const catchR = new THREE.SphereGeometry(0.018, 6, 6);
-    catchR.translate(-0.207, 0.097, 0.468);
-    const mergedCatchGeo = mergeGeometries([catchL, catchR], false) || catchL;
+  if (cachedGeos.mergedCatchGeo) {
     const eyeHighlightMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    group.add(new THREE.Mesh(mergedCatchGeo, eyeHighlightMat));
+    group.add(new THREE.Mesh(cachedGeos.mergedCatchGeo, eyeHighlightMat));
   }
 
-  // Selection Halo Ring
-  const ringGeo = new THREE.RingGeometry(0.72, 0.82, isVeryLowPoly ? 12 : 24);
-  ringGeo.rotateX(-Math.PI / 2);
   const ringMat = new THREE.MeshBasicMaterial({
     color: 0x22d3ee,
     side: THREE.DoubleSide,
@@ -840,38 +913,23 @@ function createSculpted3DFishRig(
     opacity: 0.85,
     depthWrite: false,
   });
-  const selectionRing = new THREE.Mesh(ringGeo, ringMat);
+  const selectionRing = new THREE.Mesh(cachedGeos.ringGeo, ringMat);
   selectionRing.position.set(0, -0.48, 0);
   selectionRing.visible = false;
   group.add(selectionRing);
 
-  // Soft Radial Contact Shadow Disc on Seabed
-  const shadowGeo = new THREE.CircleGeometry(0.55, isVeryLowPoly ? 8 : 14);
-  shadowGeo.rotateX(-Math.PI / 2);
   const shadowMat = new THREE.MeshBasicMaterial({
     color: 0x02060d,
     transparent: true,
     opacity: 0.36,
     depthWrite: false,
   });
-  const shadowDisc = new THREE.Mesh(shadowGeo, shadowMat);
-
-  let triangleCount = 0;
-  group.traverse((obj) => {
-    if ((obj as THREE.Mesh).isMesh) {
-      const g = (obj as THREE.Mesh).geometry;
-      if (g.index) {
-        triangleCount += g.index.count / 3;
-      } else if (g.attributes.position) {
-        triangleCount += g.attributes.position.count / 3;
-      }
-    }
-  });
+  const shadowDisc = new THREE.Mesh(cachedGeos.shadowGeo, shadowMat);
 
   return {
     group,
-    bodyGeo: mergedBodyGeo,
-    staticFinsGeo,
+    bodyGeo: cachedGeos.mergedBodyGeo,
+    staticFinsGeo: cachedGeos.staticFinsGeo,
     bodyMat,
     finMat,
     liveSkinMap: skinMap,
@@ -888,7 +946,7 @@ function createSculpted3DFishRig(
     polygonQuality,
     materialTier,
     isDeadVisualApplied: false,
-    triangleCount: Math.round(triangleCount),
+    triangleCount: cachedGeos.triangleCount,
   };
 }
 
@@ -1030,6 +1088,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     scene.add(habitatGroup);
 
     let causticOverlayPlane: THREE.Mesh | null = null;
+    let bulbLightGroup: THREE.Group | null = null;
     let activeFrustumWallsMat: THREE.MeshBasicMaterial | null = null;
     let activeWaterSurfaceMat: THREE.MeshBasicMaterial | null = null;
     let kelpInstancedMesh: THREE.InstancedMesh | null = null;
@@ -1039,17 +1098,25 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     let builtFramelessMode: boolean | null = null;
     let builtAspect = camera.aspect;
     const _abyssBlack = new THREE.Color(0x010409);
+    const _daylightSkyTint = new THREE.Color(0x0ea5e9);
+    const _bulbNightTint = new THREE.Color(0x070d19);
     const _baseWaterColor = new THREE.Color();
     const _ambientWaterColor = new THREE.Color();
     const _computedBgColor = new THREE.Color();
 
     function computeUserBackgroundColor(
       tank: { waterTintHex: string; ambientLightColorHex: string },
-      bgBrightness: number
+      bgBrightness: number,
+      useSolarDaylight: boolean = true
     ): THREE.Color {
       const b = Math.max(0, Math.min(1, bgBrightness));
       _baseWaterColor.set(tank.waterTintHex);
       _ambientWaterColor.set(tank.ambientLightColorHex);
+      if (useSolarDaylight) {
+        _baseWaterColor.lerp(_daylightSkyTint, 0.24);
+      } else {
+        _baseWaterColor.lerp(_bulbNightTint, 0.35);
+      }
       if (b <= 0.35) {
         const t = b / 0.35;
         return _computedBgColor.copy(_abyssBlack).lerp(_baseWaterColor, t);
@@ -1198,6 +1265,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       kelpBasePositions.length = 0;
       activeFrustumWallsMat = null;
       activeWaterSurfaceMat = null;
+      bulbLightGroup = null;
 
       const tank = TANK_TIERS[tierIdx] || TANK_TIERS[0];
       const aspect = camera.aspect || 16 / 9;
@@ -1365,6 +1433,64 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         waterSurfaceMesh.position.set(0, H * 0.355, 0);
         habitatGroup.add(waterSurfaceMesh);
       }
+
+      // C2. Overhead 3D Aquarium Bulb Light Fixtures & Volumetric Cones (Visible when Bulb Light Mode is active)
+      const bulbsContainer = new THREE.Group();
+      const centerTopSlice = getTankBoundsAtZ(tank, 0, isFrameless, aspect);
+      const topLampY = isFrameless ? centerTopSlice.surfaceY - 0.08 : H * 0.42;
+      const spanHalfX = isFrameless ? centerTopSlice.halfW * 0.64 : W * 0.32;
+
+      const housingMat = new THREE.MeshBasicMaterial({ color: 0x0f172a });
+      const warmBulbMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
+      const actinicBulbMat = new THREE.MeshBasicMaterial({ color: 0x818cf8 });
+      const warmConeMat = new THREE.MeshBasicMaterial({
+        color: 0xfde68a,
+        transparent: true,
+        opacity: 0.11,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      const actinicConeMat = new THREE.MeshBasicMaterial({
+        color: 0x6366f1,
+        transparent: true,
+        opacity: 0.09,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+
+      const lampOffsets = [-spanHalfX, 0, spanHalfX];
+      for (let li = 0; li < lampOffsets.length; li++) {
+        const lx = lampOffsets[li];
+        const isCenterActinic = li === 1;
+        const capMesh = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.22, 0.34, 0.18, isVeryLowTier ? 6 : 12),
+          housingMat
+        );
+        capMesh.position.set(lx, topLampY + 0.12, 0);
+
+        const bulbOrb = new THREE.Mesh(
+          new THREE.SphereGeometry(0.18, isVeryLowTier ? 6 : 10, isVeryLowTier ? 6 : 10),
+          isCenterActinic ? actinicBulbMat : warmBulbMat
+        );
+        bulbOrb.position.set(lx, topLampY - 0.02, 0);
+
+        bulbsContainer.add(capMesh, bulbOrb);
+
+        if (!isVeryLowTier) {
+          const coneH = H * 0.72;
+          const coneGeo = new THREE.ConeGeometry(1.9, coneH, 12, 1, true);
+          const coneMesh = new THREE.Mesh(
+            coneGeo,
+            isCenterActinic ? actinicConeMat : warmConeMat
+          );
+          coneMesh.position.set(lx, topLampY - coneH * 0.5, 0);
+          bulbsContainer.add(coneMesh);
+        }
+      }
+      bulbLightGroup = bulbsContainer;
+      habitatGroup.add(bulbsContainer);
 
       // D. Batched Basalt Rock Arches & Reef Formations
       const rockMat =
@@ -1548,18 +1674,20 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       bubbleStates[i * 4 + 3] = 0.65 + Math.random() * 0.9;
     }
 
-    // 6. Food Pellet `InstancedMesh` Pool
+    // 6. Food Pellet `InstancedMesh` Pool (Pre-warmed with MeshBasicMaterial so dropping food never triggers lazy shader compilation)
     const MAX_PELLETS = 64;
     const pelletGeo = new THREE.SphereGeometry(0.11, isVeryLowTier ? 5 : 8, isVeryLowTier ? 5 : 8);
-    const pelletMat = isVeryLowTier
-      ? new THREE.MeshBasicMaterial({ color: 0xf59e0b })
-      : new THREE.MeshLambertMaterial({
-          color: 0xf59e0b,
-          emissive: 0xd97706,
-          emissiveIntensity: 0.45,
-        });
+    const pelletMat = new THREE.MeshBasicMaterial({ color: 0xfbbf24 });
     const pelletInstanced = new THREE.InstancedMesh(pelletGeo, pelletMat, MAX_PELLETS);
     pelletInstanced.frustumCulled = false;
+    pelletInstanced.visible = true;
+    pelletInstanced.count = 1;
+    _vec3A.set(0, -999, 0);
+    _quat.identity();
+    _scaleVec.set(0.0001, 0.0001, 0.0001);
+    _mat4.compose(_vec3A, _quat, _scaleVec);
+    pelletInstanced.setMatrixAt(0, _mat4);
+    pelletInstanced.instanceMatrix.needsUpdate = true;
     scene.add(pelletInstanced);
 
     // 7. Caretaker 3D Cursor Ring
@@ -1650,6 +1778,25 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       const targetPolyQuality =
         eco.graphicsSettings?.fishPolygonQuality || fishPolygonQualityRef.current || 'high';
 
+      // Determine Daylight vs Bulb Light mode:
+      // - When Daylight Mode is ON: use natural solar Daylight during daytime (06:00 - 18:30), and automatically switch to Bulb Lights at night!
+      // - When Daylight Mode is OFF: always use warm aquarium Bulb Lights.
+      const daylightModeEnabled = eco.graphicsSettings?.daylightMode !== false;
+      const timeOverride = eco.graphicsSettings?.timeOfDayOverride || 'auto';
+      const nowClock = new Date();
+      const currentHourFloat = nowClock.getHours() + nowClock.getMinutes() / 60;
+      const isDaytimeHours =
+        timeOverride === 'day'
+          ? true
+          : timeOverride === 'night'
+          ? false
+          : currentHourFloat >= 6.0 && currentHourFloat < 18.5;
+      const useSolarDaylight = daylightModeEnabled && isDaytimeHours;
+
+      if (bulbLightGroup) {
+        bulbLightGroup.visible = !useSolarDaylight;
+      }
+
       // Apply user lighting & back-of-tank background brightness settings in real time
       const userLightIntensity = Math.max(
         0.15,
@@ -1659,7 +1806,11 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         0.0,
         Math.min(1.0, eco.graphicsSettings?.backgroundBrightness ?? 0.22)
       );
-      const liveBgCol = computeUserBackgroundColor(tank, userBgBrightness);
+      const liveBgCol = computeUserBackgroundColor(
+        tank,
+        useSolarDaylight ? Math.min(1.0, userBgBrightness * 1.12 + 0.03) : userBgBrightness * 0.85,
+        useSolarDaylight
+      );
       if (scene.background instanceof THREE.Color) {
         scene.background.copy(liveBgCol);
       } else {
@@ -1672,16 +1823,38 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         activeFrustumWallsMat.color.copy(liveBgCol);
       }
       if (activeWaterSurfaceMat) {
+        activeWaterSurfaceMat.color.setHex(useSolarDaylight ? 0xbae6fd : 0xfde68a);
         activeWaterSurfaceMat.opacity =
           (isFramelessNow ? 0.14 : 0.2) * Math.min(1.25, userLightIntensity);
       }
 
-      hemiLight.intensity = 1.05 * userLightIntensity;
-      if (!isVeryLowTier) {
-        sunKeyLight.intensity = 1.65 * userLightIntensity;
-        rimLight.intensity = 0.8 * userLightIntensity;
-        frontFillLight.intensity = 0.55 * userLightIntensity;
-        renderer.toneMappingExposure = 0.85 + 0.28 * Math.min(1.4, userLightIntensity);
+      if (useSolarDaylight) {
+        hemiLight.color.setHex(0xbae6fd);
+        hemiLight.groundColor.setHex(0x0c4a6e);
+        hemiLight.intensity = 1.22 * userLightIntensity;
+        if (!isVeryLowTier) {
+          sunKeyLight.color.setHex(0xfffbeb);
+          sunKeyLight.intensity = 1.85 * userLightIntensity;
+          rimLight.color.setHex(0x38bdf8);
+          rimLight.intensity = 0.88 * userLightIntensity;
+          frontFillLight.color.setHex(0xe0f2fe);
+          frontFillLight.intensity = 0.62 * userLightIntensity;
+          renderer.toneMappingExposure = 0.92 + 0.28 * Math.min(1.4, userLightIntensity);
+        }
+      } else {
+        // Bulb Light Mode (Nighttime or when Daylight is switched OFF)
+        hemiLight.color.setHex(0xfde68a);
+        hemiLight.groundColor.setHex(0x050b16);
+        hemiLight.intensity = 0.92 * userLightIntensity;
+        if (!isVeryLowTier) {
+          sunKeyLight.color.setHex(0xffb74d);
+          sunKeyLight.intensity = 1.48 * userLightIntensity;
+          rimLight.color.setHex(0x818cf8);
+          rimLight.intensity = 0.95 * userLightIntensity;
+          frontFillLight.color.setHex(0xfef08a);
+          frontFillLight.intensity = 0.48 * userLightIntensity;
+          renderer.toneMappingExposure = 0.8 + 0.25 * Math.min(1.4, userLightIntensity);
+        }
       }
 
       // Animate caustics & swaying kelp
@@ -1693,6 +1866,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
           causticMap.offset.y = (elapsedTotal * 0.022) % 1;
           const cMat = causticOverlayPlane.material as THREE.MeshBasicMaterial;
           if (cMat) {
+            cMat.color.setHex(useSolarDaylight ? 0xffffff : 0xfde68a);
             cMat.opacity = 0.32 * tank.causticsIntensity * Math.min(1.3, userLightIntensity);
           }
         }
@@ -1744,11 +1918,10 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         bubbleInstanced.instanceMatrix.needsUpdate = true;
       }
 
-      // Sync Food Pellets (Skip GPU upload when 0 pellets are active)
+      // Sync Food Pellets (Always keep pelletInstanced.visible = true so WebGL never lazily compiles shaders on first drop)
       const pellets = pelletsRef.current;
       const pCount = Math.min(MAX_PELLETS, pellets.length);
-      pelletInstanced.visible = pCount > 0;
-      if (pCount > 0 || lastSyncedPelletCount !== 0) {
+      if (pCount > 0) {
         pelletInstanced.count = pCount;
         for (let i = 0; i < pCount; i++) {
           const p = pellets[i];
@@ -1758,10 +1931,17 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
           _mat4.compose(_vec3A, _quat, _scaleVec);
           pelletInstanced.setMatrixAt(i, _mat4);
         }
-        if (pCount > 0) {
-          pelletInstanced.instanceMatrix.needsUpdate = true;
-        }
+        pelletInstanced.instanceMatrix.needsUpdate = true;
         lastSyncedPelletCount = pCount;
+      } else if (lastSyncedPelletCount !== 0) {
+        pelletInstanced.count = 1;
+        _vec3A.set(0, -999, 0);
+        _quat.identity();
+        _scaleVec.set(0.0001, 0.0001, 0.0001);
+        _mat4.compose(_vec3A, _quat, _scaleVec);
+        pelletInstanced.setMatrixAt(0, _mat4);
+        pelletInstanced.instanceMatrix.needsUpdate = true;
+        lastSyncedPelletCount = 0;
       }
 
       cursorGroup.visible = false;
@@ -1785,8 +1965,6 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         ) {
           fishContainer.remove(rig.group);
           fishContainer.remove(rig.shadowDisc);
-          rig.bodyGeo.dispose();
-          rig.staticFinsGeo.dispose();
           rig.bodyMat.dispose();
           rig.finMat.dispose();
           fishRigs.delete(fish.lineage.fishId);
@@ -1921,14 +2099,12 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         rig.shadowDisc.scale.set(shadowScale, shadowScale, shadowScale);
       }
 
-      // Dispose rigs of removed fishes
+      // Dispose rigs of removed fishes (keep cached geometries intact)
       if (fishRigs.size !== activeIds.size) {
         for (const [id, rig] of fishRigs.entries()) {
           if (!activeIds.has(id)) {
             fishContainer.remove(rig.group);
             fishContainer.remove(rig.shadowDisc);
-            rig.bodyGeo.dispose();
-            rig.staticFinsGeo.dispose();
             rig.bodyMat.dispose();
             rig.finMat.dispose();
             fishRigs.delete(id);
