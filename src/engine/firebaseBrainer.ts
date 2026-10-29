@@ -82,10 +82,70 @@ export interface CloudUserBrainRecord {
   username: string;
   profileId: string;
   updatedAtMs: number;
+  adminOverrideAtMs?: number;
+  lastAdminAction?: string;
   isActivelyPlaying: boolean;
   lastGameHeartbeatMs: number;
   autoFeederStock: number;
   fishBrains: CloudUserFishBrainItem[];
+}
+
+export const MAX_VERSIONS_PER_SPECIES = 10;
+
+// Track last Firestore write timestamp per username so background Keeper ticks only write every 4 minutes
+const _lastCloudUserFirestoreWriteMs = new Map<string, number>();
+export const FIRESTORE_CHECKPOINT_INTERVAL_MS = 240_000; // 4 minutes (3-5 min range)
+
+/**
+ * Enforces that each fish species keeps at most the last 10 versions (`MAX_VERSIONS_PER_SPECIES`).
+ * Always preserves the promoted base version within the 10 kept versions.
+ */
+export function pruneSpeciesModelVersions(
+  registry: ModelVersionRecord[],
+  speciesId: string,
+  maxPerSpecies: number = MAX_VERSIONS_PER_SPECIES
+): { keptRegistry: ModelVersionRecord[]; prunedForSpecies: ModelVersionRecord[] } {
+  const otherSpeciesModels: ModelVersionRecord[] = [];
+  const sameSpeciesModels: ModelVersionRecord[] = [];
+
+  for (const m of registry) {
+    if (m.speciesId === speciesId) {
+      sameSpeciesModels.push(m);
+    } else {
+      otherSpeciesModels.push(m);
+    }
+  }
+
+  // Sort sameSpeciesModels newest first (by createdAtIso descending, keeping current order as tie-breaker)
+  sameSpeciesModels.sort((a, b) => {
+    const tA = Date.parse(a.createdAtIso || '') || 0;
+    const tB = Date.parse(b.createdAtIso || '') || 0;
+    return tB - tA;
+  });
+
+  if (sameSpeciesModels.length <= maxPerSpecies) {
+    return {
+      keptRegistry: [...sameSpeciesModels, ...otherSpeciesModels],
+      prunedForSpecies: [],
+    };
+  }
+
+  const keptForSpecies = sameSpeciesModels.slice(0, maxPerSpecies);
+  const prunedForSpecies = sameSpeciesModels.slice(maxPerSpecies);
+
+  // Ensure the promoted base model is never accidentally dropped
+  const promotedInPrunedIdx = prunedForSpecies.findIndex((m) => m.isPromotedBase);
+  if (promotedInPrunedIdx >= 0 && keptForSpecies.length > 0) {
+    const promoted = prunedForSpecies.splice(promotedInPrunedIdx, 1)[0];
+    const dropped = keptForSpecies.pop()!;
+    keptForSpecies.push(promoted);
+    prunedForSpecies.unshift(dropped);
+  }
+
+  return {
+    keptRegistry: [...keptForSpecies, ...otherSpeciesModels],
+    prunedForSpecies,
+  };
 }
 
 function sanitizeKey(name: string): string {
@@ -400,8 +460,8 @@ export function subscribeToFirebaseAuth(cb: (user: User | null) => void): () => 
 // ============================================================================
 
 /**
- * Saves a trained or active Base Brain Model to the `base_models` collection in Firestore (`aquarium-caa2b`)
- * as well as `mypc_ai_models`, and mirrors it to local storage so both the Trainer and the Game can read it immediately.
+ * Saves a trained or active Base Brain Model to the `base_models` collection in Firestore (`aquarium-caa2b`),
+ * and enforces the strict retention cap of at most 10 versions per species (`MAX_VERSIONS_PER_SPECIES`).
  *
  * Firestore Path:
  * - Version doc: `base_models/{speciesId}__{versionId}`
@@ -433,7 +493,9 @@ export async function saveModelVersionToFirestore(
     firestorePath: `base_models/${model.speciesId}__${model.versionId}`,
   };
 
-  // Mirror to local base models cache
+  let prunedVersionsToDelete: ModelVersionRecord[] = [];
+
+  // Mirror to local base models cache and enforce Max 10 Versions per Species
   try {
     if (typeof localStorage !== 'undefined') {
       const existingRaw = localStorage.getItem(LOCAL_BASE_MODELS_CACHE_KEY);
@@ -447,7 +509,14 @@ export async function saveModelVersionToFirestore(
         });
       }
       filtered.unshift(model);
-      localStorage.setItem(LOCAL_BASE_MODELS_CACHE_KEY, JSON.stringify(filtered.slice(0, 65)));
+
+      const { keptRegistry, prunedForSpecies } = pruneSpeciesModelVersions(
+        filtered,
+        model.speciesId,
+        MAX_VERSIONS_PER_SPECIES
+      );
+      prunedVersionsToDelete = prunedForSpecies;
+      localStorage.setItem(LOCAL_BASE_MODELS_CACHE_KEY, JSON.stringify(keptRegistry.slice(0, 150)));
     }
   } catch {
     // ignore
@@ -461,6 +530,17 @@ export async function saveModelVersionToFirestore(
       const activeDocId = `active__${sanitizeKey(model.speciesId)}`;
       await setDoc(doc(aiFirestore, 'base_models', activeDocId), payload, { merge: true });
     }
+
+    // Delete any overflow versions beyond the last 10 for this species from Firestore
+    if (prunedVersionsToDelete.length > 0) {
+      await Promise.allSettled(
+        prunedVersionsToDelete.map((oldVer) => {
+          const oldDocId = `${sanitizeKey(oldVer.speciesId)}__${sanitizeKey(oldVer.versionId)}`;
+          return deleteDoc(doc(aiFirestore, 'base_models', oldDocId));
+        })
+      );
+    }
+
     return true;
   } catch {
     return false;
@@ -468,12 +548,13 @@ export async function saveModelVersionToFirestore(
 }
 
 /**
- * Loads all trained Base Brain Models from the Firestore `base_models` collection.
+ * Loads all trained Base Brain Models from the Firestore `base_models` collection,
+ * capped at the latest 10 versions per species.
  */
 export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord[]> {
   try {
-    const snap = await getDocs(query(collection(aiFirestore, 'base_models'), limit(80)));
-    const models: ModelVersionRecord[] = [];
+    const snap = await getDocs(query(collection(aiFirestore, 'base_models'), limit(120)));
+    let models: ModelVersionRecord[] = [];
     snap.forEach((d) => {
       if (d.id.startsWith('active__')) return; // Skip pointer duplicates in version list
       const data = d.data() as any;
@@ -495,6 +576,14 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
         });
       }
     });
+
+    // Enforce Max 10 Versions per Species across loaded models
+    const speciesIds = Array.from(new Set(models.map((m) => m.speciesId)));
+    for (const spId of speciesIds) {
+      const res = pruneSpeciesModelVersions(models, spId, MAX_VERSIONS_PER_SPECIES);
+      models = res.keptRegistry;
+    }
+
     if (models.length > 0 && typeof localStorage !== 'undefined') {
       localStorage.setItem(LOCAL_BASE_MODELS_CACHE_KEY, JSON.stringify(models));
     }
@@ -517,9 +606,9 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
 // ============================================================================
 
 /**
- * Immediately marks a MyPC user as Online (in-game) or Offline (in Keeper) in Firestore
- * so the 24/7 Fish Keeper dynamically removes their fishes when they open the game
- * and brings them back when they close the game.
+ * Marks a MyPC user as Online (in-game) or Offline (in Keeper) in Firestore
+ * on session transitions (open/close/visibility change) so the 24/7 Fish Keeper
+ * dynamically removes their fishes when they open the game and brings them back when they close it.
  */
 export async function setUserOnlineStatusInFirestore(
   username: string,
@@ -547,56 +636,71 @@ export async function setUserOnlineStatusInFirestore(
   }
 }
 
+export function serializeFishEntityToCloudBrainItem(f: FishEntity, lifespanHours = 24): CloudUserFishBrainItem {
+  return {
+    fishId: f.lineage.fishId,
+    name: f.lineage.name,
+    speciesId: f.lineage.speciesId,
+    generation: f.lineage.generation,
+    modelVersion: f.lineage.modelVersion,
+    motherId: f.lineage.motherId,
+    fatherId: f.lineage.fatherId,
+    alive: f.lineage.alive,
+    causeOfDeath: f.lineage.causeOfDeath,
+    energy: Number(f.state.energy.toFixed(2)),
+    hunger: Number(f.state.hunger.toFixed(2)),
+    ageSimHours: Number(f.state.ageSimHours.toFixed(3)),
+    lifespanSimHours: lifespanHours,
+    brain: toFirestoreSafeBrain(f.brain) as unknown as FishBrainInstance,
+    foragingEfficiency: Number(
+      (
+        (f.state.metrics.foodPelletsEaten /
+          Math.max(1, f.state.metrics.foragingAttempts)) *
+        100
+      ).toFixed(1)
+    ),
+    lifetimeReward: Number(f.state.metrics.lifetimeReward.toFixed(2)),
+    decisionsMade: f.state.metrics.decisionsMade,
+    foodPelletsEaten: f.state.metrics.foodPelletsEaten,
+    inheritedMutations: f.lineage.inheritedMutations.slice(0, 8),
+  };
+}
+
 /**
- * Syncs AI-specific data (individual fish brains + active play heartbeat) to Firestore
- * keyed by the MyPC username (`MyPC.info().profile.name`), while game progress/items
- * remain in `MyPC.save`.
+ * Syncs AI-specific data (individual fish brains + active play status) to Firestore
+ * keyed by the MyPC username (`MyPC.info().profile.name`).
+ * Called on significant events (open/close game, birth, death, purchase, admin override)
+ * and 3-5 minute checkpoints to stay well under the 20k daily Firestore write quota.
  */
 export async function syncUserBrainsToFirestore(
   username: string,
   profileId: string,
   fishes: FishEntity[],
   isActivelyPlaying: boolean,
-  autoFeederStock: number
+  autoFeederStock: number,
+  adminOverrideOpts?: { adminOverrideAtMs?: number; lastAdminAction?: string }
 ): Promise<boolean> {
   try {
     const docId = sanitizeKey(username);
     const now = Date.now();
-    const firestorePayload = {
+    _lastCloudUserFirestoreWriteMs.set(docId, now);
+
+    const firestorePayload: Record<string, any> = {
       username: username || 'Keeper',
       profileId: profileId || 'default',
       updatedAtMs: now,
       isActivelyPlaying,
       lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
       autoFeederStock,
-      fishBrains: fishes.slice(0, 40).map((f) => ({
-        fishId: f.lineage.fishId,
-        name: f.lineage.name,
-        speciesId: f.lineage.speciesId,
-        generation: f.lineage.generation,
-        modelVersion: f.lineage.modelVersion,
-        motherId: f.lineage.motherId,
-        fatherId: f.lineage.fatherId,
-        alive: f.lineage.alive,
-        causeOfDeath: f.lineage.causeOfDeath,
-        energy: Number(f.state.energy.toFixed(2)),
-        hunger: Number(f.state.hunger.toFixed(2)),
-        ageSimHours: Number(f.state.ageSimHours.toFixed(3)),
-        lifespanSimHours: 24,
-        brain: toFirestoreSafeBrain(f.brain),
-        foragingEfficiency: Number(
-          (
-            (f.state.metrics.foodPelletsEaten /
-              Math.max(1, f.state.metrics.foragingAttempts)) *
-            100
-          ).toFixed(1)
-        ),
-        lifetimeReward: Number(f.state.metrics.lifetimeReward.toFixed(2)),
-        decisionsMade: f.state.metrics.decisionsMade,
-        foodPelletsEaten: f.state.metrics.foodPelletsEaten,
-        inheritedMutations: f.lineage.inheritedMutations.slice(0, 8),
-      })),
+      fishBrains: fishes.slice(0, 50).map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
     };
+
+    if (adminOverrideOpts?.adminOverrideAtMs) {
+      firestorePayload.adminOverrideAtMs = adminOverrideOpts.adminOverrideAtMs;
+    }
+    if (adminOverrideOpts?.lastAdminAction) {
+      firestorePayload.lastAdminAction = adminOverrideOpts.lastAdminAction;
+    }
 
     await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), firestorePayload, {
       merge: true,
@@ -609,9 +713,45 @@ export async function syncUserBrainsToFirestore(
 }
 
 /**
+ * Authoritatively saves an Admin action (Kill/Starve, Revive, Reproduce, Give Fish, or Replace Fish)
+ * on any CloudUserBrainRecord directly to Firestore so even if the user has the game open,
+ * their live game immediately receives the override via `onSnapshot` and applies it!
+ */
+export async function saveAdminOverrideForUserInFirestore(
+  record: CloudUserBrainRecord,
+  actionSummary: string
+): Promise<boolean> {
+  try {
+    const docId = sanitizeKey(record.username);
+    const now = Date.now();
+    record.updatedAtMs = now;
+    record.adminOverrideAtMs = now;
+    record.lastAdminAction = actionSummary;
+    _lastCloudUserFirestoreWriteMs.set(docId, now);
+
+    await setDoc(
+      doc(aiFirestore, 'mypc_user_brains', docId),
+      {
+        ...record,
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
+        lastAdminAction: actionSummary,
+        fishBrains: record.fishBrains.map((fb) => ({
+          ...fb,
+          brain: toFirestoreSafeBrain(fb.brain),
+        })),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Loads saved AI fish brains for a MyPC username from Firestore on startup so
- * any 24/7 offline evolution or training done while the player was away is applied
- * to their fishes.
+ * any 24/7 offline evolution or admin action done while the player was away is applied.
  */
 export async function loadUserBrainsFromFirestore(
   username: string
@@ -634,13 +774,46 @@ export async function loadUserBrainsFromFirestore(
 }
 
 /**
+ * Real-time subscription to a SINGLE user's `mypc_user_brains/{username}` document.
+ * Used by the player game (`App.tsx`) so if an Admin kills, revives, gives, or replaces a fish
+ * while the player has the game open, the player's game immediately applies the change in real time!
+ */
+export function subscribeToSingleUserBrainRecord(
+  username: string,
+  onUpdate: (record: CloudUserBrainRecord) => void
+): () => void {
+  try {
+    const docId = sanitizeKey(username);
+    return onSnapshot(
+      doc(aiFirestore, 'mypc_user_brains', docId),
+      (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data() as any;
+        onUpdate({
+          ...data,
+          fishBrains: (data.fishBrains || []).map((fb: any) => ({
+            ...fb,
+            brain: fromFirestoreSafeBrain(fb.brain),
+          })),
+        } as CloudUserBrainRecord);
+      },
+      () => {
+        // Ignore snapshot error when offline
+      }
+    );
+  } catch {
+    return () => {};
+  }
+}
+
+/**
  * Queries all MyPC users' fish brain records for the AI Trainer's 24/7 Offline Simulation Service.
  */
 export async function fetchAllUserBrainRecordsFromFirestore(): Promise<
   CloudUserBrainRecord[]
 > {
   try {
-    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(25));
+    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(100));
     const snap = await getDocs(q);
     const list: CloudUserBrainRecord[] = [];
     snap.forEach((d) => {
@@ -661,13 +834,14 @@ export async function fetchAllUserBrainRecordsFromFirestore(): Promise<
 
 /**
  * Real-time subscription to `mypc_user_brains` so the 24/7 Fish Keeper immediately
- * removes a user's fishes when they open the game and restores them when they leave.
+ * shows all users and their fishes, removes a user's fishes when they open the game,
+ * and restores them when they leave.
  */
 export function subscribeToAllUserBrainRecords(
   onUpdate: (records: CloudUserBrainRecord[]) => void
 ): () => void {
   try {
-    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(25));
+    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(100));
     return onSnapshot(
       q,
       (snap) => {
@@ -696,21 +870,23 @@ export function subscribeToAllUserBrainRecords(
 const _cloudSensory = new Float32Array(32);
 
 /**
- * Steps a remote MyPC user's offline fishes in the 24/7 Trainer Offline Service and persists
- * updated brains, energy, hunger, and starvation status back to Firestore (`mypc_user_brains`).
- *
- * When `trainerAutoFeedOverride` is disabled (`false`), the Keeper checks the owner's own
- * auto-feeder (`record.autoFeederStock > 0`) so fishes whose owner installed an auto-feeder
- * are still fed automatically using the owner's feeder!
+ * Steps a remote MyPC user's offline fishes in the 24/7 Trainer Offline Service.
+ * To respect the 20,000 daily Firestore write quota, this function updates the user's
+ * fishes in memory on every tick and ONLY writes to Firestore when:
+ * 1. A fish dies of starvation or old age (`newlyStarvedNames.length > 0`), OR
+ * 2. `forceWriteNow` is true, OR
+ * 3. At least 4 minutes (`FIRESTORE_CHECKPOINT_INTERVAL_MS`) have elapsed since the last write for this user.
  */
 export async function stepAndSyncCloudUserOfflineFishes(
   record: CloudUserBrainRecord,
   simHoursDelta: number,
-  trainerAutoFeedOverride: boolean
+  trainerAutoFeedOverride: boolean,
+  forceWriteNow = false
 ): Promise<{
   updatedLiveCount: number;
   newlyStarvedNames: string[];
   usedOwnerAutoFeeder: boolean;
+  wroteToFirestore: boolean;
 }> {
   let updatedLiveCount = 0;
   const newlyStarvedNames: string[] = [];
@@ -756,31 +932,45 @@ export async function stepAndSyncCloudUserOfflineFishes(
     } else if (fb.ageSimHours >= (fb.lifespanSimHours || 24)) {
       fb.alive = false;
       fb.causeOfDeath = 'old_age';
+      newlyStarvedNames.push(`${fb.name} (${record.username})`);
     }
   }
 
-  try {
-    const docId = sanitizeKey(record.username);
-    await setDoc(
-      doc(aiFirestore, 'mypc_user_brains', docId),
-      {
-        ...record,
-        updatedAtMs: Date.now(),
-        fishBrains: record.fishBrains.map((fb) => ({
-          ...fb,
-          brain: toFirestoreSafeBrain(fb.brain),
-        })),
-      },
-      { merge: true }
-    );
-  } catch {
-    // ignore transient offline
+  const docId = sanitizeKey(record.username);
+  const now = Date.now();
+  const lastWrite = _lastCloudUserFirestoreWriteMs.get(docId) || 0;
+  const shouldWriteToFirestore =
+    forceWriteNow ||
+    newlyStarvedNames.length > 0 ||
+    (updatedLiveCount > 0 && now - lastWrite >= FIRESTORE_CHECKPOINT_INTERVAL_MS);
+
+  let wroteToFirestore = false;
+  if (shouldWriteToFirestore) {
+    _lastCloudUserFirestoreWriteMs.set(docId, now);
+    try {
+      await setDoc(
+        doc(aiFirestore, 'mypc_user_brains', docId),
+        {
+          ...record,
+          updatedAtMs: now,
+          fishBrains: record.fishBrains.map((fb) => ({
+            ...fb,
+            brain: toFirestoreSafeBrain(fb.brain),
+          })),
+        },
+        { merge: true }
+      );
+      wroteToFirestore = true;
+    } catch {
+      // ignore transient offline
+    }
   }
 
   return {
     updatedLiveCount,
     newlyStarvedNames,
     usedOwnerAutoFeeder: !trainerAutoFeedOverride && ownerHasAutoFeeder,
+    wroteToFirestore,
   };
 }
 
@@ -795,7 +985,7 @@ export async function resetAllUserFishesInFirestore(
   autoFeederStock: number
 ): Promise<boolean> {
   try {
-    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(25));
+    const q = query(collection(aiFirestore, 'mypc_user_brains'), limit(100));
     const snap = await getDocs(q);
     const primaryDocId = sanitizeKey(username);
     const deletePromises: Promise<void>[] = [];
@@ -812,7 +1002,11 @@ export async function resetAllUserFishesInFirestore(
       profileId,
       freshFishes,
       false,
-      autoFeederStock
+      autoFeederStock,
+      {
+        adminOverrideAtMs: Date.now(),
+        lastAdminAction: 'Reset all fishes to fresh Gen 1 starters',
+      }
     );
   } catch {
     return false;
@@ -838,4 +1032,5 @@ export async function saveExperimentToFirestore(
     return false;
   }
 }
+
 

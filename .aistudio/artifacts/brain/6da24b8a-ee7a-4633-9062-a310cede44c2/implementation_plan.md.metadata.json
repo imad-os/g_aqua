@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for TV Remote & Gamepad controller support, Owner Level fish unlocking, 3/4/5/6 tank capacity upgrades with baby overflow, dynamic 24/7 Fish Keeper live hand-off & owner auto-feeder check, and the restored Advanced AI Trainer with a 50 Famous Aquarium Fishes catalog.",
-  "updatedAt":  "2026-10-28T09:25:15.801542179Z",
+  "summary":  "Implementation plan for 3D FPS & Graphics Optimization (GPU shader spine, merged meshes, tier-aware materials, decoupled state saves), Trainer Keeper Service upgrades (clickable users list, show all fishes, authoritative live kill sync, greyed-out dead fishes, admin Give/Replace fish), Model Version Retention (1 version saved at end of training, max 10 versions per species), and Firestore Write Quota Optimization (3-5 min checkpoints + event writes).",
+  "updatedAt":  "2026-10-29T11:41:13.382241399Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

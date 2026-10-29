@@ -1163,17 +1163,29 @@ export function evaluateBrainOnBenchmarks(
  * Runs an accelerated headless multi-generation simulation in the AI Trainer Lab
  * without rendering any graphics. Evaluates candidate offspring brains against the
  * current base model and promotes a new model ONLY if it passes the quality threshold.
+ *
+ * When `options.commitVersionToRegistry === false` (used for intermediate chunks of a 100G-1000G run),
+ * it evolves `bestBrain` in memory without adding intermediate versions to `modelRegistry`.
+ * When `commitVersionToRegistry !== false` (the final step of training), it saves ONLY 1 new version
+ * (the final generation of the training run) and prunes `modelRegistry` so each fish species keeps
+ * at most the last 10 versions.
  */
 export function runAcceleratedHeadlessTraining(
   ecosystem: SavedEcosystemState,
   speciesId: string,
   generationsToRun: number,
   populationSize: number,
-  promotionThresholdDelta = 0.5
+  promotionThresholdDelta = 0.5,
+  options?: {
+    commitVersionToRegistry?: boolean;
+    initialBrainOverride?: FishBrainInstance;
+    totalGenerationsTrained?: number;
+  }
 ): {
   generationsCompleted: number;
   fishSimulatedCount: number;
   candidateModel: ModelVersionRecord;
+  evolvedBrain: FishBrainInstance;
   promoted: boolean;
   historyAdded: GenerationHistoryEntry[];
 } {
@@ -1182,9 +1194,13 @@ export function runAcceleratedHeadlessTraining(
   const currentBase =
     ecosystem.modelRegistry.find(
       (m) => m.speciesId === species.id && m.isPromotedBase
-    ) || ecosystem.modelRegistry[0];
+    ) ||
+    ecosystem.modelRegistry.find((m) => m.speciesId === species.id) ||
+    ecosystem.modelRegistry[0];
 
-  const baseBrain: FishBrainInstance = currentBase
+  const baseBrain: FishBrainInstance = options?.initialBrainOverride
+    ? deepCloneBrain(options.initialBrainOverride)
+    : currentBase && currentBase.speciesId === species.id
     ? {
         architecture: {
           inputCount: currentBase.brainConfig.inputCount,
@@ -1219,7 +1235,7 @@ export function runAcceleratedHeadlessTraining(
   const startGen =
     ecosystem.generationHistory.length > 0
       ? ecosystem.generationHistory[ecosystem.generationHistory.length - 1].generation + 1
-      : 2;
+      : 1;
 
   let totalFishSimulated = 0;
   const rng = createSeededRng(Date.now() & 0xffffff);
@@ -1309,27 +1325,38 @@ export function runAcceleratedHeadlessTraining(
     ecosystem.generationHistory.push(entry);
   }
 
-  const baselineScore = currentBase ? currentBase.benchmark.overallComposite : 0;
+  // Cap generationHistory to 120 entries so storage remains fast and compact
+  if (ecosystem.generationHistory.length > 120) {
+    ecosystem.generationHistory = ecosystem.generationHistory.slice(-120);
+  }
+
+  const baselineScore =
+    currentBase && currentBase.speciesId === species.id
+      ? currentBase.benchmark.overallComposite
+      : 0;
   const promoted = bestScore.overallComposite >= baselineScore + promotionThresholdDelta;
 
-  const newVersionId = `v1.${ecosystem.modelRegistry.length}-G${
-    startGen + generationsToRun - 1
-  }`;
+  const existingSpeciesModels = ecosystem.modelRegistry.filter((m) => m.speciesId === species.id);
+  const finalGenLabel =
+    options?.totalGenerationsTrained ||
+    (existingSpeciesModels[0]?.generationTrained || 0) + generationsToRun;
+
+  const nextVerSeq = existingSpeciesModels.length + 1;
+  const newVersionId = `v1.${nextVerSeq}-G${finalGenLabel}`;
 
   const candidateModel: ModelVersionRecord = {
     versionId: newVersionId,
     speciesId: species.id,
-    parentVersionId: currentBase ? currentBase.versionId : null,
+    parentVersionId:
+      currentBase && currentBase.speciesId === species.id ? currentBase.versionId : null,
     createdAtIso: new Date().toISOString(),
-    generationTrained: startGen + generationsToRun - 1,
+    generationTrained: finalGenLabel,
     isPromotedBase: promoted,
     notes: promoted
-      ? `Passed evaluation gate (+${(bestScore.overallComposite - baselineScore).toFixed(1)} composite vs ${
+      ? `Trained ${finalGenLabel}G (+${(bestScore.overallComposite - baselineScore).toFixed(1)} composite vs ${
           currentBase?.versionId || 'baseline'
         })`
-      : `Held in registry (score ${bestScore.overallComposite} did not exceed ${
-          currentBase?.versionId || 'baseline'
-        } by +${promotionThresholdDelta})`,
+      : `Trained ${finalGenLabel}G (score ${bestScore.overallComposite}%)`,
     brainConfig: { ...species.baseBrainConfig },
     speciesConfig: { ...species },
     weights: bestBrain.inheritedWeights.map((w) => [...w]),
@@ -1337,18 +1364,35 @@ export function runAcceleratedHeadlessTraining(
     benchmark: bestScore,
   };
 
-  if (promoted) {
-    ecosystem.modelRegistry.forEach((m) => {
-      if (m.speciesId === species.id) m.isPromotedBase = false;
-    });
-    species.activeBaseModelVersion = newVersionId;
+  const shouldCommit = options?.commitVersionToRegistry !== false;
+  if (shouldCommit) {
+    if (promoted) {
+      ecosystem.modelRegistry.forEach((m) => {
+        if (m.speciesId === species.id) m.isPromotedBase = false;
+      });
+      species.activeBaseModelVersion = newVersionId;
+    }
+    ecosystem.modelRegistry.unshift(candidateModel);
+
+    // Strictly keep only the last 10 versions for this fish species
+    const sameSp = ecosystem.modelRegistry.filter((m) => m.speciesId === species.id);
+    if (sameSp.length > 10) {
+      const otherSp = ecosystem.modelRegistry.filter((m) => m.speciesId !== species.id);
+      const keptSameSp = sameSp.slice(0, 10);
+      // Ensure promoted model stays inside the 10 kept versions
+      const droppedPromoted = sameSp.slice(10).find((m) => m.isPromotedBase);
+      if (droppedPromoted) {
+        keptSameSp[keptSameSp.length - 1] = droppedPromoted;
+      }
+      ecosystem.modelRegistry = [...keptSameSp, ...otherSp];
+    }
   }
-  ecosystem.modelRegistry.unshift(candidateModel);
 
   return {
     generationsCompleted: generationsToRun,
     fishSimulatedCount: totalFishSimulated,
     candidateModel,
+    evolvedBrain: bestBrain,
     promoted,
     historyAdded,
   };

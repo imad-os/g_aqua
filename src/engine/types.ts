@@ -381,6 +381,8 @@ export interface OfflineServiceTelemetry {
 export interface SavedEcosystemState {
   version: number;
   lastSavedAtMs?: number;
+  adminOverrideAtMs?: number;
+  lastAdminAction?: string;
   simHoursTotal: number;
   timeMultiplier: number;
   paused: boolean;
@@ -399,4 +401,5 @@ export interface SavedEcosystemState {
   modelRegistry: ModelVersionRecord[];
   experiments: ExperimentComparisonResult[];
 }
+
 
