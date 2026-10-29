@@ -2,15 +2,18 @@ export type ActivationType = 'tanh' | 'relu' | 'leaky_relu' | 'sigmoid';
 export type LearningMethod = 'reinforce_hebbian' | 'td_reward' | 'evolution_only';
 export type LifeStage = 'egg' | 'juvenile' | 'adult' | 'elder';
 export type CauseOfDeath = 'starvation' | 'old_age' | 'predation' | 'stress' | 'disease' | null;
-export type FishPolygonQuality = 'low' | 'medium' | 'high' | 'ultra';
+export type FishPolygonQuality = 'very_low' | 'low' | 'medium' | 'high' | 'ultra';
+export type EnvironmentQualityTier = 'very_low' | 'low' | 'mid' | 'high';
 
 export interface UserGraphicsSettings {
   fishPolygonQuality: FishPolygonQuality;
-  environmentQuality: 'low' | 'mid' | 'high';
+  environmentQuality: EnvironmentQualityTier;
   showCaustics: boolean;
   showParticles: boolean;
   antiAliasing: boolean;
   framelessTvMode?: boolean;
+  /** Show real-time FPS counter badge on the top-right corner of the screen */
+  showFps?: boolean;
   /** Overall overhead & key lighting intensity multiplier (0.15 .. 1.80, default 0.95) */
   lightIntensity?: number;
   /** Back-of-tank & water background brightness (0.00 pitch abyss .. 1.00 bright blue, default 0.22) */

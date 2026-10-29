@@ -5,6 +5,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { DEFAULT_SPECIES_LIST, TANK_TIERS } from '../engine/defaults';
 import { getTankBoundsAtZ } from '../engine/simulation';
 import {
+  EnvironmentQualityTier,
   FishPolygonQuality,
   FoodPellet,
   SavedEcosystemState,
@@ -29,7 +30,7 @@ export interface AquariumCanvas3DProps {
   cameraOrbitRef: React.MutableRefObject<{ yaw: number; pitch: number; zoom: number }>;
   selectedFishId: string | null;
   screensaverMode: boolean;
-  qualityTier: 'low' | 'mid' | 'high';
+  qualityTier: EnvironmentQualityTier;
   fishPolygonQuality?: FishPolygonQuality;
   framelessTvMode?: boolean;
   activeTankTier: number;
@@ -37,9 +38,11 @@ export interface AquariumCanvas3DProps {
   onTickSimulation: (dt: number) => void;
   onSelectFish?: (fishId: string) => void;
   onPolygonStatsUpdate?: (stats: { trianglesPerFish: number; totalFishTriangles: number }) => void;
+  onFpsUpdate?: (fps: number) => void;
 }
 
 type FishMaterialType =
+  | THREE.MeshBasicMaterial
   | THREE.MeshLambertMaterial
   | THREE.MeshStandardMaterial
   | THREE.MeshPhysicalMaterial;
@@ -65,7 +68,7 @@ interface FishMeshRig {
   shadowDisc: THREE.Mesh;
   speciesId: string;
   polygonQuality: FishPolygonQuality;
-  materialTier: 'low' | 'mid' | 'high';
+  materialTier: EnvironmentQualityTier;
   isDeadVisualApplied: boolean;
   triangleCount: number;
 }
@@ -79,6 +82,15 @@ export function getPolygonSpecForQuality(quality: FishPolygonQuality): {
   label: string;
 } {
   switch (quality) {
+    case 'very_low':
+      return {
+        lengthRings: 8,
+        radialSegments: 6,
+        finSegmentsU: 2,
+        finSegmentsV: 2,
+        eyeSegments: 4,
+        label: 'Very Low (~140 Polygons/Fish)',
+      };
     case 'low':
       return {
         lengthRings: 14,
@@ -579,10 +591,11 @@ function createSculpted3DFishRig(
   accentHex: string,
   bodyStyle: string,
   polygonQuality: FishPolygonQuality,
-  materialTier: 'low' | 'mid' | 'high'
+  materialTier: EnvironmentQualityTier
 ): FishMeshRig {
   const group = new THREE.Group();
   const polySpec = getPolygonSpecForQuality(polygonQuality);
+  const isVeryLowPoly = polygonQuality === 'very_low';
   const { skinMap, skinBump, finMap } = getOrCreateFishSkinTextures(
     primaryHex,
     secondaryHex,
@@ -596,11 +609,22 @@ function createSculpted3DFishRig(
 
   const liveAccentColor = new THREE.Color(accentHex).lerp(new THREE.Color('#ffffff'), 0.35);
 
-  // Quality-tiered materials with FrontSide culling (huge GPU speedup on Low/Mid)
+  // Quality-tiered materials with FrontSide culling (huge GPU speedup on Very Low / Low / Mid)
   let bodyMat: FishMaterialType;
   let finMat: FishMaterialType;
 
-  if (materialTier === 'low') {
+  if (materialTier === 'very_low') {
+    bodyMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color('#ffffff'),
+      map: skinMap,
+      side: THREE.FrontSide,
+    });
+    finMat = new THREE.MeshBasicMaterial({
+      color: liveAccentColor.clone(),
+      map: finMap,
+      side: THREE.FrontSide,
+    });
+  } else if (materialTier === 'low') {
     bodyMat = new THREE.MeshLambertMaterial({
       color: new THREE.Color('#ffffff'),
       map: skinMap,
@@ -665,18 +689,21 @@ function createSculpted3DFishRig(
     polySpec.lengthRings,
     polySpec.radialSegments
   );
-  const gillLeftGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
-  gillLeftGeo.scale(0.28, 1.35, 0.95);
-  gillLeftGeo.rotateY(0.22);
-  gillLeftGeo.translate(0.21, -0.01, 0.31);
+  let mergedBodyGeo: THREE.BufferGeometry = coreBodyGeo;
+  if (!isVeryLowPoly) {
+    const gillLeftGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
+    gillLeftGeo.scale(0.28, 1.35, 0.95);
+    gillLeftGeo.rotateY(0.22);
+    gillLeftGeo.translate(0.21, -0.01, 0.31);
 
-  const gillRightGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
-  gillRightGeo.scale(0.28, 1.35, 0.95);
-  gillRightGeo.rotateY(-0.22);
-  gillRightGeo.translate(-0.21, -0.01, 0.31);
+    const gillRightGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
+    gillRightGeo.scale(0.28, 1.35, 0.95);
+    gillRightGeo.rotateY(-0.22);
+    gillRightGeo.translate(-0.21, -0.01, 0.31);
 
-  const mergedBodyGeo =
-    mergeGeometries([coreBodyGeo, gillLeftGeo, gillRightGeo], false) || coreBodyGeo;
+    mergedBodyGeo =
+      mergeGeometries([coreBodyGeo, gillLeftGeo, gillRightGeo], false) || coreBodyGeo;
+  }
   const bodyMesh = new THREE.Mesh(mergedBodyGeo, bodyMat);
   bodyMesh.castShadow = materialTier === 'high';
   bodyMesh.receiveShadow = materialTier === 'high';
@@ -695,27 +722,29 @@ function createSculpted3DFishRig(
   const analGeo = build3DVolumetricFinGeometry(
     'anal',
     bodyStyle,
-    Math.max(4, Math.floor(polySpec.finSegmentsU * 0.75)),
-    Math.max(4, Math.floor(polySpec.finSegmentsV * 0.75))
+    Math.max(2, Math.floor(polySpec.finSegmentsU * 0.75)),
+    Math.max(2, Math.floor(polySpec.finSegmentsV * 0.75))
   );
   analGeo.translate(0, isAngel ? -0.38 : -0.22, -0.22);
 
-  const pelvicSegU = Math.max(4, Math.floor(polySpec.finSegmentsU * 0.65));
-  const pelvicSegV = Math.max(4, Math.floor(polySpec.finSegmentsV * 0.65));
-  const pelvicLeftGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
-  pelvicLeftGeo.rotateZ(0.32);
-  pelvicLeftGeo.translate(0.08, isAngel ? -0.36 : -0.23, 0.14);
+  const finPartsToMerge: THREE.BufferGeometry[] = [dorsalGeo, analGeo];
+  if (!isVeryLowPoly) {
+    const pelvicSegU = Math.max(3, Math.floor(polySpec.finSegmentsU * 0.65));
+    const pelvicSegV = Math.max(3, Math.floor(polySpec.finSegmentsV * 0.65));
+    const pelvicLeftGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
+    pelvicLeftGeo.rotateZ(0.32);
+    pelvicLeftGeo.translate(0.08, isAngel ? -0.36 : -0.23, 0.14);
 
-  const pelvicRightGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
-  pelvicRightGeo.rotateZ(-0.32);
-  pelvicRightGeo.translate(-0.08, isAngel ? -0.36 : -0.23, 0.14);
+    const pelvicRightGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
+    pelvicRightGeo.rotateZ(-0.32);
+    pelvicRightGeo.translate(-0.08, isAngel ? -0.36 : -0.23, 0.14);
 
-  const lureGeo = new THREE.SphereGeometry(0.045, 8, 8);
-  lureGeo.translate(0, isAngel ? 0.48 : 0.28, 0.25);
+    const lureGeo = new THREE.SphereGeometry(0.045, 6, 6);
+    lureGeo.translate(0, isAngel ? 0.48 : 0.28, 0.25);
+    finPartsToMerge.push(pelvicLeftGeo, pelvicRightGeo, lureGeo);
+  }
 
-  const staticFinsGeo =
-    mergeGeometries([dorsalGeo, analGeo, pelvicLeftGeo, pelvicRightGeo, lureGeo], false) ||
-    dorsalGeo;
+  const staticFinsGeo = mergeGeometries(finPartsToMerge, false) || dorsalGeo;
   const staticFinsMesh = new THREE.Mesh(staticFinsGeo, finMat);
   group.add(staticFinsMesh);
 
@@ -768,7 +797,7 @@ function createSculpted3DFishRig(
   pectoralRightGroup.add(pecRightMesh);
   group.add(pectoralRightGroup);
 
-  // 6. Merged Bilateral Eyes (Irises + Pupils + Specular Catchlights in 3 tiny draw calls)
+  // 6. Merged Bilateral Eyes
   const irisL = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
   irisL.scale(0.65, 1.0, 1.0);
   irisL.rotateY(0.24);
@@ -791,16 +820,18 @@ function createSculpted3DFishRig(
   const pupilMat = new THREE.MeshBasicMaterial({ color: 0x030712 });
   group.add(new THREE.Mesh(mergedPupilGeo, pupilMat));
 
-  const catchL = new THREE.SphereGeometry(0.018, 6, 6);
-  catchL.translate(0.207, 0.097, 0.468);
-  const catchR = new THREE.SphereGeometry(0.018, 6, 6);
-  catchR.translate(-0.207, 0.097, 0.468);
-  const mergedCatchGeo = mergeGeometries([catchL, catchR], false) || catchL;
-  const eyeHighlightMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-  group.add(new THREE.Mesh(mergedCatchGeo, eyeHighlightMat));
+  if (!isVeryLowPoly) {
+    const catchL = new THREE.SphereGeometry(0.018, 6, 6);
+    catchL.translate(0.207, 0.097, 0.468);
+    const catchR = new THREE.SphereGeometry(0.018, 6, 6);
+    catchR.translate(-0.207, 0.097, 0.468);
+    const mergedCatchGeo = mergeGeometries([catchL, catchR], false) || catchL;
+    const eyeHighlightMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    group.add(new THREE.Mesh(mergedCatchGeo, eyeHighlightMat));
+  }
 
   // Selection Halo Ring
-  const ringGeo = new THREE.RingGeometry(0.72, 0.82, 24);
+  const ringGeo = new THREE.RingGeometry(0.72, 0.82, isVeryLowPoly ? 12 : 24);
   ringGeo.rotateX(-Math.PI / 2);
   const ringMat = new THREE.MeshBasicMaterial({
     color: 0x22d3ee,
@@ -815,7 +846,7 @@ function createSculpted3DFishRig(
   group.add(selectionRing);
 
   // Soft Radial Contact Shadow Disc on Seabed
-  const shadowGeo = new THREE.CircleGeometry(0.55, 14);
+  const shadowGeo = new THREE.CircleGeometry(0.55, isVeryLowPoly ? 8 : 14);
   shadowGeo.rotateX(-Math.PI / 2);
   const shadowMat = new THREE.MeshBasicMaterial({
     color: 0x02060d,
@@ -876,6 +907,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
   isPaused,
   onTickSimulation,
   onPolygonStatsUpdate,
+  onFpsUpdate,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
 
@@ -903,37 +935,33 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
   const onPolyStatsRef = useRef(onPolygonStatsUpdate);
   onPolyStatsRef.current = onPolygonStatsUpdate;
 
+  const onFpsUpdateRef = useRef(onFpsUpdate);
+  onFpsUpdateRef.current = onFpsUpdate;
+
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
 
-    // 1. Software-WebGL Detection from GPU Renderer String
-    const isSoftwareGl = (() => {
-      try {
-        const probeCanvas = document.createElement('canvas');
-        const gl = probeCanvas.getContext('webgl2') || probeCanvas.getContext('webgl');
-        if (!gl) return true;
-        const ext = gl.getExtension('WEBGL_debug_renderer_info');
-        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
-        const gpu = String(gl.getParameter(param));
-        gl.getExtension('WEBGL_lose_context')?.loseContext();
-        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-      } catch {
-        return true;
-      }
-    })();
+    const isVeryLowTier = qualityTier === 'very_low';
+    const isLowOrVeryLow = qualityTier === 'low' || isVeryLowTier;
 
     const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl && qualityTier !== 'low',
+      antialias: !isLowOrVeryLow && qualityTier === 'high',
       powerPreference: 'high-performance',
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMapping = isLowOrVeryLow ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.18;
     renderer.setPixelRatio(
-      isSoftwareGl || qualityTier === 'low' ? 1 : Math.min(window.devicePixelRatio || 1, 2)
+      isVeryLowTier
+        ? 0.55
+        : qualityTier === 'low'
+        ? 0.75
+        : qualityTier === 'mid'
+        ? 1.0
+        : Math.min(window.devicePixelRatio || 1, 1.5)
     );
-    renderer.shadowMap.enabled = !isSoftwareGl && qualityTier !== 'low';
+    renderer.shadowMap.enabled = qualityTier === 'high';
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.setSize(
       container.clientWidth || window.innerWidth,
@@ -953,21 +981,22 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     );
     camera.position.set(0, 2.2, 18.5);
 
-    // 2. Studio Environment Map via RoomEnvironment + PMREMGenerator (Skipped on Low / SoftwareGL for fast startup & FPS)
-    if (!isSoftwareGl && qualityTier === 'high') {
+    // 2. Studio Environment Map via RoomEnvironment + PMREMGenerator (Only on High tier)
+    if (qualityTier === 'high') {
       const pmremGenerator = new THREE.PMREMGenerator(renderer);
       scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
       pmremGenerator.dispose();
     }
 
-    // 3. Multi-Light Underwater Studio Rig (Overhead Sun + Cyan Rim + Front Fill so fish faces are well-lit)
+    // 3. Multi-Light Underwater Studio Rig (On 'very_low', only 1 light is active to minimize shader overhead)
     const hemiLight = new THREE.HemisphereLight(0x7dd3fc, 0x081c30, 1.15);
     hemiLight.position.set(0, 25, 0);
     scene.add(hemiLight);
 
     const sunKeyLight = new THREE.DirectionalLight(0xfff7e0, 1.85);
     sunKeyLight.position.set(7, 22, 12);
-    if (!isSoftwareGl && qualityTier === 'high') {
+    sunKeyLight.visible = !isVeryLowTier;
+    if (qualityTier === 'high') {
       sunKeyLight.castShadow = true;
       sunKeyLight.shadow.mapSize.width = 512;
       sunKeyLight.shadow.mapSize.height = 512;
@@ -985,13 +1014,15 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
     const rimLight = new THREE.DirectionalLight(0x22d3ee, 0.9);
     rimLight.position.set(-12, 8, -14);
+    rimLight.visible = !isVeryLowTier;
     scene.add(rimLight);
 
     const frontFillLight = new THREE.DirectionalLight(0xbae6fd, 0.65);
     frontFillLight.position.set(0, 4, 18);
+    frontFillLight.visible = !isVeryLowTier;
     scene.add(frontFillLight);
 
-    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+    const maxAniso = isVeryLowTier ? 1 : renderer.capabilities.getMaxAnisotropy();
     const { sandMap, sandBump, causticMap } = createProceduralSandAndCausticsTextures(maxAniso);
 
     // 4. Aquarium Habitat Container Group
@@ -1028,19 +1059,14 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       }
     }
 
-    /**
-     * Builds a custom 3D Trapezoidal Perspective-Frustum surface mesh (smaller width in front `z > 0`,
-     * wider width in back `z < 0`, sloped along the camera frustum's bottom or top ray) so Full-Screen
-     * TV Mode shows 100% of the tank's contents edge-to-edge without hiding front sides or seeing outside.
-     */
     function buildTrapezoidalFrustumSurfaceGeometry(
       tank: { width: number; height: number; depth: number },
       aspect: number,
       mode: 'floor' | 'caustic' | 'surface',
       widthScale: number = 1.12
     ): THREE.BufferGeometry {
-      const segX = 16;
-      const segZ = 12;
+      const segX = isVeryLowTier ? 6 : 16;
+      const segZ = isVeryLowTier ? 4 : 12;
       const cols = segX + 1;
       const rows = segZ + 1;
       const positions = new Float32Array(cols * rows * 3);
@@ -1198,7 +1224,13 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       causticMap.repeat.set(isFrameless ? 5 : 3, isFrameless ? 4 : 3);
 
       const floorMat =
-        qualityTier === 'low'
+        qualityTier === 'very_low'
+          ? new THREE.MeshBasicMaterial({
+              color: 0xcbd5e1,
+              map: sandMap,
+              side: THREE.FrontSide,
+            })
+          : qualityTier === 'low'
           ? new THREE.MeshLambertMaterial({
               color: 0xffffff,
               map: sandMap,
@@ -1240,24 +1272,28 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         floorMesh.receiveShadow = qualityTier === 'high';
         habitatGroup.add(floorMesh);
 
-        const frustumCausticGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'caustic', 1.12);
-        causticOverlayPlane = new THREE.Mesh(frustumCausticGeo, causticMat);
-        habitatGroup.add(causticOverlayPlane);
+        if (!isVeryLowTier) {
+          const frustumCausticGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'caustic', 1.12);
+          causticOverlayPlane = new THREE.Mesh(frustumCausticGeo, causticMat);
+          habitatGroup.add(causticOverlayPlane);
 
-        const frustumSurfaceGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'surface', 1.14);
-        const waterSurfaceMesh = new THREE.Mesh(frustumSurfaceGeo, surfaceMat);
-        habitatGroup.add(waterSurfaceMesh);
+          const frustumSurfaceGeo = buildTrapezoidalFrustumSurfaceGeometry(tank, aspect, 'surface', 1.14);
+          const waterSurfaceMesh = new THREE.Mesh(frustumSurfaceGeo, surfaceMat);
+          habitatGroup.add(waterSurfaceMesh);
+        }
 
-        const frustumWallsGeo = buildFrustumEnclosureWallsGeometry(tank, aspect);
-        const frustumWallsMat = new THREE.MeshBasicMaterial({
-          color: bgCol.clone(),
-          vertexColors: true,
-          side: THREE.DoubleSide,
-          fog: true,
-        });
-        activeFrustumWallsMat = frustumWallsMat;
-        const frustumWallsMesh = new THREE.Mesh(frustumWallsGeo, frustumWallsMat);
-        habitatGroup.add(frustumWallsMesh);
+        if (!isLowOrVeryLow) {
+          const frustumWallsGeo = buildFrustumEnclosureWallsGeometry(tank, aspect);
+          const frustumWallsMat = new THREE.MeshBasicMaterial({
+            color: bgCol.clone(),
+            vertexColors: true,
+            side: THREE.DoubleSide,
+            fog: true,
+          });
+          activeFrustumWallsMat = frustumWallsMat;
+          const frustumWallsMesh = new THREE.Mesh(frustumWallsGeo, frustumWallsMat);
+          habitatGroup.add(frustumWallsMesh);
+        }
       } else {
         const floorGeo = new THREE.BoxGeometry(W, 0.45, D);
         const floorMesh = new THREE.Mesh(floorGeo, floorMat);
@@ -1271,7 +1307,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         causticOverlayPlane.position.set(0, floorY + 0.025, 0);
         habitatGroup.add(causticOverlayPlane);
 
-        const frameMat = new THREE.MeshLambertMaterial({ color: 0x0f172a });
+        const frameMat = new THREE.MeshBasicMaterial({ color: 0x0f172a });
         const trimMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
 
         const pillarGeo = new THREE.BoxGeometry(0.24, H + 0.4, 0.24);
@@ -1330,9 +1366,11 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         habitatGroup.add(waterSurfaceMesh);
       }
 
-      // D. Batched Basalt Rock Arches & Reef Formations (2 draw calls total instead of 4 * rockArchCount)
+      // D. Batched Basalt Rock Arches & Reef Formations
       const rockMat =
-        qualityTier === 'low'
+        qualityTier === 'very_low'
+          ? new THREE.MeshBasicMaterial({ color: 0x1e293b })
+          : qualityTier === 'low'
           ? new THREE.MeshLambertMaterial({ color: 0x1e293b })
           : new THREE.MeshStandardMaterial({
               color: 0x1e293b,
@@ -1340,7 +1378,9 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
               metalness: 0.12,
             });
       const mossMat =
-        qualityTier === 'low'
+        qualityTier === 'very_low'
+          ? new THREE.MeshBasicMaterial({ color: 0x0f766e })
+          : qualityTier === 'low'
           ? new THREE.MeshLambertMaterial({ color: 0x0f766e })
           : new THREE.MeshStandardMaterial({
               color: 0x0f766e,
@@ -1351,9 +1391,12 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       const dodecaGeo = new THREE.DodecahedronGeometry(1.1, 0);
       const rockSubGeos: THREE.BufferGeometry[] = [];
       const mossSubGeos: THREE.BufferGeometry[] = [];
+      const effectiveRockCount = isVeryLowTier
+        ? Math.min(2, tank.rockArchCount)
+        : tank.rockArchCount;
 
-      for (let r = 0; r < tank.rockArchCount; r++) {
-        const angle = (r / Math.max(1, tank.rockArchCount)) * Math.PI * 1.6 - Math.PI * 0.8;
+      for (let r = 0; r < effectiveRockCount; r++) {
+        const angle = (r / Math.max(1, effectiveRockCount)) * Math.PI * 1.6 - Math.PI * 0.8;
         const rz = -D * 0.14 + Math.cos(angle * 2) * (D * 0.22);
         const rSlice = getTankBoundsAtZ(tank, rz, isFrameless, aspect);
         const rx = Math.sin(angle) * (rSlice.halfW * 0.72);
@@ -1391,22 +1434,26 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         if (mergedMoss) habitatGroup.add(new THREE.Mesh(mergedMoss, mossMat));
       }
 
-      // E. Batched Bioluminescent Coral Colonies (5 draw calls total instead of 8 * coralCount)
+      // E. Batched Bioluminescent Coral Colonies
       const coralColors = [0xf43f5e, 0xf59e0b, 0xa855f7, 0x06b6d4, 0x10b981];
-      const branchGeo = new THREE.CylinderGeometry(0.06, 0.14, 0.9, 6);
+      const branchGeo = new THREE.CylinderGeometry(0.06, 0.14, 0.9, isVeryLowTier ? 4 : 6);
       branchGeo.translate(0, 0.45, 0);
-      const tipGeo = new THREE.SphereGeometry(0.11, 6, 6);
+      const tipGeo = new THREE.SphereGeometry(0.11, isVeryLowTier ? 4 : 6, isVeryLowTier ? 4 : 6);
       tipGeo.translate(0, 0.9, 0);
       const singleStemGeo = mergeGeometries([branchGeo, tipGeo], false) || branchGeo;
 
       const coralBuckets: THREE.BufferGeometry[][] = coralColors.map(() => []);
-      for (let c = 0; c < tank.coralCount; c++) {
+      const effectiveCoralCount = isVeryLowTier
+        ? Math.min(3, tank.coralCount)
+        : tank.coralCount;
+      for (let c = 0; c < effectiveCoralCount; c++) {
         const bucketIdx = c % coralColors.length;
         const cz = (((c * 43) % 100) / 100 - 0.5) * (D * 0.74);
         const cSlice = getTankBoundsAtZ(tank, cz, isFrameless, aspect);
         const cx = (((c * 67) % 100) / 100 - 0.5) * (cSlice.halfW * 1.72);
 
-        for (let b = 0; b < 4; b++) {
+        const branchesPerColony = isVeryLowTier ? 2 : 4;
+        for (let b = 0; b < branchesPerColony; b++) {
           const g = singleStemGeo.clone();
           const s = 0.65 + (b % 3) * 0.25;
           g.scale(s, s, s);
@@ -1422,20 +1469,30 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         const mergedCoral = mergeGeometries(coralBuckets[idx], false);
         if (!mergedCoral) continue;
         const colHex = coralColors[idx];
-        const coralMat = new THREE.MeshLambertMaterial({
-          color: colHex,
-          emissive: colHex,
-          emissiveIntensity: 0.26,
-        });
+        const coralMat = isVeryLowTier
+          ? new THREE.MeshBasicMaterial({ color: colHex })
+          : new THREE.MeshLambertMaterial({
+              color: colHex,
+              emissive: colHex,
+              emissiveIntensity: 0.26,
+            });
         habitatGroup.add(new THREE.Mesh(mergedCoral, coralMat));
       }
 
       // F. Swaying Botanical Kelp Blades (`InstancedMesh`, Distributed inside Frustum)
-      kelpCountCurrent = tank.kelpCount;
-      const kelpGeo = new THREE.CylinderGeometry(0.03, 0.08, 2.6, 6, 3);
+      kelpCountCurrent = isVeryLowTier ? Math.min(6, tank.kelpCount) : tank.kelpCount;
+      const kelpGeo = new THREE.CylinderGeometry(
+        0.03,
+        0.08,
+        2.6,
+        isVeryLowTier ? 4 : 6,
+        isVeryLowTier ? 1 : 3
+      );
       kelpGeo.scale(1.8, 1.0, 0.45);
       kelpGeo.translate(0, 1.3, 0);
-      const kelpMat = new THREE.MeshLambertMaterial({ color: 0x10b981 });
+      const kelpMat = isVeryLowTier
+        ? new THREE.MeshBasicMaterial({ color: 0x10b981 })
+        : new THREE.MeshLambertMaterial({ color: 0x10b981 });
       kelpInstancedMesh = new THREE.InstancedMesh(kelpGeo, kelpMat, kelpCountCurrent);
       kelpInstancedMesh.frustumCulled = false;
 
@@ -1468,8 +1525,8 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     buildTankEnvironment(builtTankTier, builtFramelessMode);
 
     // 5. Rising Oxygen Bubble Stream (`InstancedMesh` Pool — Zero Allocation)
-    const BUBBLE_COUNT = qualityTier === 'low' ? 18 : 42;
-    const bubbleGeo = new THREE.SphereGeometry(0.065, 8, 8);
+    const BUBBLE_COUNT = isVeryLowTier ? 8 : qualityTier === 'low' ? 18 : 42;
+    const bubbleGeo = new THREE.SphereGeometry(0.065, isVeryLowTier ? 5 : 8, isVeryLowTier ? 5 : 8);
     const bubbleMat = new THREE.MeshBasicMaterial({
       color: 0xe0f2fe,
       transparent: true,
@@ -1493,12 +1550,14 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
     // 6. Food Pellet `InstancedMesh` Pool
     const MAX_PELLETS = 64;
-    const pelletGeo = new THREE.SphereGeometry(0.11, 8, 8);
-    const pelletMat = new THREE.MeshLambertMaterial({
-      color: 0xf59e0b,
-      emissive: 0xd97706,
-      emissiveIntensity: 0.45,
-    });
+    const pelletGeo = new THREE.SphereGeometry(0.11, isVeryLowTier ? 5 : 8, isVeryLowTier ? 5 : 8);
+    const pelletMat = isVeryLowTier
+      ? new THREE.MeshBasicMaterial({ color: 0xf59e0b })
+      : new THREE.MeshLambertMaterial({
+          color: 0xf59e0b,
+          emissive: 0xd97706,
+          emissiveIntensity: 0.45,
+        });
     const pelletInstanced = new THREE.InstancedMesh(pelletGeo, pelletMat, MAX_PELLETS);
     pelletInstanced.frustumCulled = false;
     scene.add(pelletInstanced);
@@ -1522,9 +1581,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     const fishContainer = new THREE.Group();
     scene.add(fishContainer);
 
-    if (!isSoftwareGl) {
-      renderer.compile(scene, camera);
-    }
+    renderer.compile(scene, camera);
 
     const handleResize = () => {
       if (!container) return;
@@ -1536,40 +1593,36 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     };
     window.addEventListener('resize', handleResize);
 
-    // 9. Paced Render & Simulation Loop
+    // 9. Native 60Hz+ Render & Simulation Loop (No artificial 80ms sleep!)
     let frameId = 0;
     let isUnmounted = false;
     let lastTimeMs = performance.now();
     let elapsedTotal = 0;
     let lastReportedPolyQuality: FishPolygonQuality | null = null;
     let lastReportedFishCount = -1;
-
-    function afterDraw(cb: () => void) {
-      const gl = renderer.getContext() as WebGL2RenderingContext;
-      if (!gl || typeof gl.fenceSync !== 'function') {
-        frameId = window.setTimeout(cb, 80);
-        return;
-      }
-      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      gl.flush();
-      const poll = () => {
-        if (isUnmounted) return;
-        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-        if (state === gl.UNSIGNALED) {
-          frameId = window.setTimeout(poll, 5);
-        } else {
-          if (sync) gl.deleteSync(sync);
-          frameId = window.setTimeout(cb, 80);
-        }
-      };
-      frameId = window.setTimeout(poll, 5);
-    }
+    let lastSyncedPelletCount = -1;
+    let fpsFrameCount = 0;
+    let lastFpsReportMs = performance.now();
 
     function tick() {
       if (isUnmounted) return;
       const nowMs = performance.now();
       const rawDt = Math.min(0.05, Math.max(0.001, (nowMs - lastTimeMs) / 1000));
       lastTimeMs = nowMs;
+
+      // Measure & report real-time FPS every ~500ms when listener is provided
+      fpsFrameCount++;
+      if (nowMs - lastFpsReportMs >= 500) {
+        const measuredFps = Math.max(
+          1,
+          Math.min(240, Math.round((fpsFrameCount * 1000) / (nowMs - lastFpsReportMs)))
+        );
+        fpsFrameCount = 0;
+        lastFpsReportMs = nowMs;
+        if (onFpsUpdateRef.current) {
+          onFpsUpdateRef.current(measuredFps);
+        }
+      }
 
       if (!isPausedRef.current) {
         elapsedTotal += rawDt;
@@ -1624,23 +1677,28 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       }
 
       hemiLight.intensity = 1.05 * userLightIntensity;
-      sunKeyLight.intensity = 1.65 * userLightIntensity;
-      rimLight.intensity = 0.8 * userLightIntensity;
-      frontFillLight.intensity = 0.55 * userLightIntensity;
-      renderer.toneMappingExposure = 0.85 + 0.28 * Math.min(1.4, userLightIntensity);
+      if (!isVeryLowTier) {
+        sunKeyLight.intensity = 1.65 * userLightIntensity;
+        rimLight.intensity = 0.8 * userLightIntensity;
+        frontFillLight.intensity = 0.55 * userLightIntensity;
+        renderer.toneMappingExposure = 0.85 + 0.28 * Math.min(1.4, userLightIntensity);
+      }
 
       // Animate caustics & swaying kelp
-      causticMap.offset.x = (elapsedTotal * 0.03) % 1;
-      causticMap.offset.y = (elapsedTotal * 0.022) % 1;
+      const showCaustics = !isVeryLowTier && eco.graphicsSettings?.showCaustics !== false;
       if (causticOverlayPlane) {
-        causticOverlayPlane.visible = eco.graphicsSettings?.showCaustics !== false;
-        const cMat = causticOverlayPlane.material as THREE.MeshBasicMaterial;
-        if (cMat) {
-          cMat.opacity = 0.32 * tank.causticsIntensity * Math.min(1.3, userLightIntensity);
+        causticOverlayPlane.visible = showCaustics;
+        if (showCaustics) {
+          causticMap.offset.x = (elapsedTotal * 0.03) % 1;
+          causticMap.offset.y = (elapsedTotal * 0.022) % 1;
+          const cMat = causticOverlayPlane.material as THREE.MeshBasicMaterial;
+          if (cMat) {
+            cMat.opacity = 0.32 * tank.causticsIntensity * Math.min(1.3, userLightIntensity);
+          }
         }
       }
 
-      if (kelpInstancedMesh) {
+      if (kelpInstancedMesh && !isVeryLowTier) {
         for (let k = 0; k < kelpCountCurrent; k++) {
           const kb = kelpBasePositions[k];
           _vec3A.set(kb.x, kb.y, kb.z);
@@ -1655,7 +1713,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       }
 
       // Update rising oxygen bubbles inside frustum bounds
-      const showParticles = eco.graphicsSettings?.showParticles !== false;
+      const showParticles = !isVeryLowTier && eco.graphicsSettings?.showParticles !== false;
       bubbleInstanced.visible = showParticles;
       if (showParticles) {
         for (let i = 0; i < BUBBLE_COUNT; i++) {
@@ -1686,23 +1744,25 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         bubbleInstanced.instanceMatrix.needsUpdate = true;
       }
 
-      // Sync Food Pellets
+      // Sync Food Pellets (Skip GPU upload when 0 pellets are active)
       const pellets = pelletsRef.current;
-      for (let i = 0; i < MAX_PELLETS; i++) {
-        if (i < pellets.length) {
+      const pCount = Math.min(MAX_PELLETS, pellets.length);
+      pelletInstanced.visible = pCount > 0;
+      if (pCount > 0 || lastSyncedPelletCount !== 0) {
+        pelletInstanced.count = pCount;
+        for (let i = 0; i < pCount; i++) {
           const p = pellets[i];
           _vec3A.set(p.x, p.y, p.z);
           _quat.identity();
           _scaleVec.set(1, 1, 1);
           _mat4.compose(_vec3A, _quat, _scaleVec);
-        } else {
-          _vec3A.set(0, -999, 0);
-          _scaleVec.set(0, 0, 0);
-          _mat4.compose(_vec3A, _quat, _scaleVec);
+          pelletInstanced.setMatrixAt(i, _mat4);
         }
-        pelletInstanced.setMatrixAt(i, _mat4);
+        if (pCount > 0) {
+          pelletInstanced.instanceMatrix.needsUpdate = true;
+        }
+        lastSyncedPelletCount = pCount;
       }
-      pelletInstanced.instanceMatrix.needsUpdate = true;
 
       cursorGroup.visible = false;
 
@@ -1715,10 +1775,13 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         activeIds.add(fish.lineage.fishId);
 
         let rig = fishRigs.get(fish.lineage.fishId);
-        // Rebuild rig if newly spawned, polygon quality changed, OR admin replaced the fish's species!
+        const targetMatTier: EnvironmentQualityTier = qualityTier;
+        // Rebuild rig if newly spawned, polygon quality changed, material tier changed, OR admin replaced the fish's species!
         if (
           rig &&
-          (rig.polygonQuality !== targetPolyQuality || rig.speciesId !== fish.lineage.speciesId)
+          (rig.polygonQuality !== targetPolyQuality ||
+            rig.materialTier !== targetMatTier ||
+            rig.speciesId !== fish.lineage.speciesId)
         ) {
           fishContainer.remove(rig.group);
           fishContainer.remove(rig.shadowDisc);
@@ -1741,7 +1804,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
             sp.accentColorHex,
             sp.bodyStyle,
             targetPolyQuality,
-            isSoftwareGl ? 'low' : qualityTier
+            targetMatTier
           );
           _color.set('#ffffff');
           _color.offsetHSL(fish.genetics.primaryHueShift / 360, 0, 0);
@@ -1776,8 +1839,10 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
             rig.finMat.map = deadFinMap;
             rig.finMat.color.setHex(0x94a3b8);
-            rig.finMat.emissive.setHex(0x334155);
-            rig.finMat.emissiveIntensity = 0.0;
+            if ('emissive' in rig.finMat) {
+              rig.finMat.emissive.setHex(0x334155);
+              rig.finMat.emissiveIntensity = 0.0;
+            }
             rig.finMat.needsUpdate = true;
             rig.isDeadVisualApplied = true;
           }
@@ -1808,7 +1873,9 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
           rig.finMat.map = rig.liveFinMap;
           rig.finMat.color.copy(rig.liveAccentColor);
-          rig.finMat.emissive.copy(rig.liveAccentColor);
+          if ('emissive' in rig.finMat) {
+            rig.finMat.emissive.copy(rig.liveAccentColor);
+          }
           rig.finMat.needsUpdate = true;
           rig.isDeadVisualApplied = false;
         }
@@ -1840,9 +1907,11 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         rig.pectoralRightGroup.rotation.y = -scull * 0.36;
         rig.pectoralRightGroup.rotation.z = -feather * 0.18;
 
-        rig.finMat.emissiveIntensity =
-          0.24 +
-          Math.sin(elapsedTotal * 3 + i) * 0.16 * fish.genetics.luminancePulseGene;
+        if ('emissiveIntensity' in rig.finMat) {
+          rig.finMat.emissiveIntensity =
+            0.24 +
+            Math.sin(elapsedTotal * 3 + i) * 0.16 * fish.genetics.luminancePulseGene;
+        }
 
         rig.selectionRing.visible = selectedFishIdRef.current === fish.lineage.fishId;
 
@@ -1853,15 +1922,17 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       }
 
       // Dispose rigs of removed fishes
-      for (const [id, rig] of fishRigs.entries()) {
-        if (!activeIds.has(id)) {
-          fishContainer.remove(rig.group);
-          fishContainer.remove(rig.shadowDisc);
-          rig.bodyGeo.dispose();
-          rig.staticFinsGeo.dispose();
-          rig.bodyMat.dispose();
-          rig.finMat.dispose();
-          fishRigs.delete(id);
+      if (fishRigs.size !== activeIds.size) {
+        for (const [id, rig] of fishRigs.entries()) {
+          if (!activeIds.has(id)) {
+            fishContainer.remove(rig.group);
+            fishContainer.remove(rig.shadowDisc);
+            rig.bodyGeo.dispose();
+            rig.staticFinsGeo.dispose();
+            rig.bodyMat.dispose();
+            rig.finMat.dispose();
+            fishRigs.delete(id);
+          }
         }
       }
 
@@ -1883,10 +1954,6 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       const centerSlice = getTankBoundsAtZ(tank, 0, isFramelessNow, camera.aspect);
 
       if (isFramelessNow) {
-        // Locked to the exact apex of the 3D perspective-frustum aquarium so:
-        // - Front fishes (z > 0) are close and crisp without ever hiding off the front-left/right sides
-        // - Back fishes (z < 0) span the full wide rear frustum
-        // - You see 100% of the tank's contents edge-to-edge without seeing outside the tank
         const swayAngle = Math.sin(elapsedTotal * 0.05) * 0.032 + orb.yaw * 0.2;
         const baseDist = centerSlice.camZ * orb.zoom;
         _vec3CamTarget.set(
@@ -1918,12 +1985,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       camera.lookAt(_vec3LookTarget);
 
       renderer.render(scene, camera);
-
-      if (isSoftwareGl) {
-        afterDraw(tick);
-      } else {
-        frameId = requestAnimationFrame(tick);
-      }
+      frameId = requestAnimationFrame(tick);
     }
 
     tick();
@@ -1931,7 +1993,6 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     return () => {
       isUnmounted = true;
       cancelAnimationFrame(frameId);
-      clearTimeout(frameId);
       window.removeEventListener('resize', handleResize);
       sandMap.dispose();
       sandBump.dispose();

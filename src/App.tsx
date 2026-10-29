@@ -32,6 +32,7 @@ import {
   setForceOfflineOverride,
 } from './engine/storage';
 import {
+  EnvironmentQualityTier,
   FishBrainInstance,
   FishPolygonQuality,
   FoodPellet,
@@ -153,6 +154,7 @@ export default function App() {
     trianglesPerFish: number;
     totalFishTriangles: number;
   }>({ trianglesPerFish: 2950, totalFishTriangles: 5900 });
+  const [fps, setFps] = useState<number>(60);
 
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -338,8 +340,26 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [settingsOpen, settingsTab, helpModalTopic, screenState, getVisibleFocusableButtons]);
 
+  // Unified TV Remote / Gamepad / Keyboard deduplication gate:
+  // Prevents a single physical press on TV Remote or Gamepad from firing 2-3 times
+  // when keydown, MyPC SDK onInput, MyPC gamepad.on('button'), and navigator.getGamepads() all fire for the same press.
+  const lastControllerActionMsRef = useRef<Record<string, number>>({});
+  const canTriggerControllerAction = useCallback(
+    (category: 'nav' | 'confirm' | 'cancel' | 'menu' | 'tab', cooldownMs: number): boolean => {
+      const now = performance.now();
+      const prev = lastControllerActionMsRef.current[category] || 0;
+      if (now - prev < cooldownMs) {
+        return false;
+      }
+      lastControllerActionMsRef.current[category] = now;
+      return true;
+    },
+    []
+  );
+
   const moveControllerFocus = useCallback(
     (delta: number) => {
+      if (!canTriggerControllerAction('nav', 210)) return;
       const buttons = getVisibleFocusableButtons();
       if (buttons.length === 0) return;
       const nextIdx =
@@ -353,10 +373,11 @@ export default function App() {
         target.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       }
     },
-    [getVisibleFocusableButtons]
+    [canTriggerControllerAction, getVisibleFocusableButtons]
   );
 
   const activateFocusedControllerButton = useCallback((): boolean => {
+    if (!canTriggerControllerAction('confirm', 320)) return true;
     const buttons = getVisibleFocusableButtons();
     if (buttons.length === 0) return false;
     const idx = Math.min(buttons.length - 1, Math.max(0, focusedBtnIndexRef.current));
@@ -366,14 +387,18 @@ export default function App() {
       return true;
     }
     return false;
-  }, [getVisibleFocusableButtons]);
+  }, [canTriggerControllerAction, getVisibleFocusableButtons]);
 
-  const cycleSettingsTab = useCallback((dir: 1 | -1) => {
-    const curIdx = MODAL_TABS_ORDER.indexOf(settingsTabRef.current);
-    const nextIdx =
-      (curIdx + dir + MODAL_TABS_ORDER.length) % MODAL_TABS_ORDER.length;
-    setSettingsTab(MODAL_TABS_ORDER[nextIdx]);
-  }, []);
+  const cycleSettingsTab = useCallback(
+    (dir: 1 | -1) => {
+      if (!canTriggerControllerAction('tab', 260)) return;
+      const curIdx = MODAL_TABS_ORDER.indexOf(settingsTabRef.current);
+      const nextIdx =
+        (curIdx + dir + MODAL_TABS_ORDER.length) % MODAL_TABS_ORDER.length;
+      setSettingsTab(MODAL_TABS_ORDER[nextIdx]);
+    },
+    [canTriggerControllerAction]
+  );
 
   // ============================================================================
   // DYNAMIC 24/7 FISH KEEPER HAND-OFF & REAL-TIME ADMIN OVERRIDE SYNC
@@ -778,6 +803,42 @@ export default function App() {
   // Update 3D Fish Polygon Quality or Graphics settings
   const handleUpdatePolygonQuality = (polyQuality: FishPolygonQuality) => {
     const eco = ecosystemRef.current;
+    const prev = eco.graphicsSettings || {
+      fishPolygonQuality: 'high',
+      environmentQuality: 'high',
+      showCaustics: true,
+      showParticles: true,
+      antiAliasing: true,
+      framelessTvMode: true,
+      showFps: false,
+    };
+    eco.graphicsSettings = {
+      ...prev,
+      fishPolygonQuality: polyQuality,
+      ...(polyQuality === 'very_low'
+        ? {
+            environmentQuality: 'very_low',
+            showCaustics: false,
+            showParticles: false,
+            antiAliasing: false,
+          }
+        : {}),
+    };
+    saveEcosystemState(eco);
+    setEcosystem({ ...eco });
+    const spec = getPolygonSpecForQuality(polyQuality);
+    showToast(
+      polyQuality === 'very_low'
+        ? `Very Low Quality Activated (${spec.label}, Unlit Fast Shaders)`
+        : `3D Fish Mesh Quality set to ${spec.label}`
+    );
+  };
+
+  // Toggle Show FPS on Top Right
+  const handleToggleShowFps = useCallback(() => {
+    const eco = ecosystemRef.current;
+    const currentlyShown = eco.graphicsSettings?.showFps === true;
+    const nextShown = !currentlyShown;
     eco.graphicsSettings = {
       ...(eco.graphicsSettings || {
         fishPolygonQuality: 'high',
@@ -786,14 +847,19 @@ export default function App() {
         showParticles: true,
         antiAliasing: true,
         framelessTvMode: true,
+        lightIntensity: 0.95,
+        backgroundBrightness: 0.22,
       }),
-      fishPolygonQuality: polyQuality,
+      showFps: nextShown,
     };
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
-    const spec = getPolygonSpecForQuality(polyQuality);
-    showToast(`3D Fish Mesh Quality set to ${spec.label}`);
-  };
+    showToast(
+      nextShown
+        ? 'FPS Counter enabled on Top Right.'
+        : 'FPS Counter hidden.'
+    );
+  }, [showToast]);
 
   // Toggle Full-Screen TV Mode (Frameless Aquarium vs Framed Tank)
   const handleToggleFramelessTvMode = useCallback(() => {
@@ -878,6 +944,37 @@ export default function App() {
     }
   }, [showToast]);
 
+  const toggleOwnerMenuFromController = useCallback(
+    (label: string) => {
+      if (!canTriggerControllerAction('menu', 420)) return;
+      setLastControllerInputLabel(label);
+      if (screenStateRef.current === 'title') {
+        handleStartAquarium();
+        setSettingsOpen(true);
+      } else {
+        if (screenStateRef.current === 'paused') {
+          ecosystemRef.current.paused = false;
+          setScreenState('playing');
+        }
+        setSettingsOpen((prev) => !prev);
+      }
+    },
+    [canTriggerControllerAction, handleStartAquarium]
+  );
+
+  const cancelModalFromController = useCallback((): boolean => {
+    if (!canTriggerControllerAction('cancel', 320)) return true;
+    if (helpModalRef.current) {
+      setHelpModalTopic(null);
+      return true;
+    }
+    if (settingsOpenRef.current) {
+      setSettingsOpen(false);
+      return true;
+    }
+    return false;
+  }, [canTriggerControllerAction]);
+
   // ============================================================================
   // TV REMOTE & KEYBOARD CONTROLLER LISTENER ("Play/Pause", "+", "Select", "Start")
   // ============================================================================
@@ -911,34 +1008,23 @@ export default function App() {
 
       if (isTvPlayPause || isPlusSelectStartMenu) {
         e.preventDefault();
-        setLastControllerInputLabel(
+        e.stopPropagation();
+        if (e.repeat) return;
+        toggleOwnerMenuFromController(
           isTvPlayPause
             ? 'TV Remote [Play/Pause] pressed → Toggled Owner Menu'
             : 'Controller [+ / Select / Start] pressed → Toggled Owner Menu'
         );
-        if (screenStateRef.current === 'title') {
-          handleStartAquarium();
-          setSettingsOpen(true);
-        } else {
-          if (screenStateRef.current === 'paused') {
-            ecosystemRef.current.paused = false;
-            setScreenState('playing');
-          }
-          setSettingsOpen((prev) => !prev);
-        }
         return;
       }
 
       // 2. Back / Cancel / Escape / Tizen Return (10009)
       if (key === 'Escape' || key === 'Backspace' || key === 'BrowserBack' || keyCode === 10009) {
-        if (helpModalRef.current) {
+        if (helpModalRef.current || settingsOpenRef.current) {
           e.preventDefault();
-          setHelpModalTopic(null);
-          return;
-        }
-        if (settingsOpenRef.current) {
-          e.preventDefault();
-          setSettingsOpen(false);
+          e.stopPropagation();
+          if (e.repeat) return;
+          cancelModalFromController();
           return;
         }
       }
@@ -946,18 +1032,22 @@ export default function App() {
       // 3. Spatial D-Pad / Arrow navigation across top bar buttons (in playing mode) or modal buttons
       if (key === 'ArrowDown' || key === 'ArrowRight') {
         e.preventDefault();
+        e.stopPropagation();
         moveControllerFocus(1);
         setLastControllerInputLabel('Arrow [Right/Down] → Focused Next Button');
         return;
       }
       if (key === 'ArrowUp' || key === 'ArrowLeft') {
         e.preventDefault();
+        e.stopPropagation();
         moveControllerFocus(-1);
         setLastControllerInputLabel('Arrow [Left/Up] → Focused Previous Button');
         return;
       }
       if (key === 'Enter' || key === ' ') {
         e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat) return;
         if (!activateFocusedControllerButton() && screenStateRef.current === 'playing') {
           handleSprinkleFoodOnTop();
         }
@@ -966,25 +1056,30 @@ export default function App() {
       if (helpModalRef.current || settingsOpenRef.current) {
         if (key === '[' || key === 'PageUp') {
           e.preventDefault();
+          e.stopPropagation();
+          if (e.repeat) return;
           cycleSettingsTab(-1);
           return;
         }
         if (key === ']' || key === 'PageDown') {
           e.preventDefault();
+          e.stopPropagation();
+          if (e.repeat) return;
           cycleSettingsTab(1);
           return;
         }
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [
     activateFocusedControllerButton,
+    cancelModalFromController,
     cycleSettingsTab,
     handleSprinkleFoodOnTop,
-    handleStartAquarium,
     moveControllerFocus,
+    toggleOwnerMenuFromController,
   ]);
 
   // Initialize MyPC SDK Lifecycle, Gamepad Listeners & Firestore Brain Sync
@@ -1062,8 +1157,8 @@ export default function App() {
       },
       onStart: () => {},
       onPause: () => {
-        // On TV Remote Play/Pause or SDK pause, open the Owner Menu so the user can inspect or shop with their remote
-        setSettingsOpen(true);
+        // Deduplicated with keydown / onInput so pressing TV Remote Play/Pause once never double-toggles
+        toggleOwnerMenuFromController('TV Remote [Pause] → Toggled Owner Menu');
       },
       onResume: () => {
         ecosystemRef.current.paused = false;
@@ -1113,13 +1208,9 @@ export default function App() {
             action === 'start' ||
             action === 'run')
         ) {
-          setLastControllerInputLabel(`Controller [${action.toUpperCase()}] → Toggled Owner Menu`);
-          if (screenStateRef.current === 'title') {
-            handleStartAquarium();
-            setSettingsOpen(true);
-          } else {
-            setSettingsOpen((v) => !v);
-          }
+          toggleOwnerMenuFromController(
+            `Controller [${action.toUpperCase()}] → Toggled Owner Menu`
+          );
           return;
         }
 
@@ -1142,8 +1233,7 @@ export default function App() {
           return;
         }
         if (!repeat && action === 'cancel') {
-          if (helpModalRef.current) setHelpModalTopic(null);
-          else if (settingsOpenRef.current) setSettingsOpen(false);
+          cancelModalFromController();
           return;
         }
       },
@@ -1168,13 +1258,9 @@ export default function App() {
             btnName === 'y' ||
             btnName === 'x'
           ) {
-            setLastControllerInputLabel(`Gamepad [${name || `Btn ${index}`}] → Toggled Owner Menu`);
-            if (screenStateRef.current === 'title') {
-              handleStartAquarium();
-              setSettingsOpen(true);
-            } else {
-              setSettingsOpen((v) => !v);
-            }
+            toggleOwnerMenuFromController(
+              `Gamepad [${name || `Btn ${index}`}] → Toggled Owner Menu`
+            );
             return;
           }
 
@@ -1186,8 +1272,7 @@ export default function App() {
             } else if (btnName === 'a' || index === 0) {
               activateFocusedControllerButton();
             } else if (btnName === 'b' || index === 1) {
-              if (helpModalRef.current) setHelpModalTopic(null);
-              else setSettingsOpen(false);
+              cancelModalFromController();
             } else if (index === 12 || index === 14) {
               moveControllerFocus(-1);
             } else if (index === 13 || index === 15) {
@@ -1211,8 +1296,7 @@ export default function App() {
             if (btnName === 'a' || index === 0) {
               if (!activateFocusedControllerButton()) handleSprinkleFoodOnTop();
             } else if (btnName === 'b' || index === 1) {
-              setHelpModalTopic(null);
-              setSettingsOpen(false);
+              cancelModalFromController();
             } else if (index === 12 || index === 14) {
               moveControllerFocus(-1);
             } else if (index === 13 || index === 15) {
@@ -1224,12 +1308,15 @@ export default function App() {
     }
   }, [
     activateFocusedControllerButton,
+    applyCloudRecordToEcosystem,
+    cancelModalFromController,
     cycleSettingsTab,
     handleSprinkleFoodOnTop,
     handleStartAquarium,
     moveControllerFocus,
     mypc,
     showToast,
+    toggleOwnerMenuFromController,
   ]);
 
   // 60Hz Simulation & Native HTML5 Gamepad Polling Callback
@@ -1245,26 +1332,17 @@ export default function App() {
             const isDown = Boolean(pad.buttons[b]?.pressed);
             const wasDown = Boolean(prev[b]);
             if (isDown && !wasDown) {
-              // Rising edge button press
+              // Rising edge button press (deduplicated via canTriggerControllerAction)
               if (b === 8 || b === 9) {
-                // Select (-) or Start (+) opens/closes Owner Menu
-                setLastControllerInputLabel(
+                toggleOwnerMenuFromController(
                   b === 9
                     ? 'Gamepad [Start / +] → Toggled Owner Menu'
                     : 'Gamepad [Select / -] → Toggled Owner Menu'
                 );
-                if (screenStateRef.current === 'title') {
-                  handleStartAquarium();
-                  setSettingsOpen(true);
-                } else {
-                  setSettingsOpen((v) => !v);
-                }
               } else if (helpModalRef.current || settingsOpenRef.current) {
                 if (b === 0) activateFocusedControllerButton();
-                else if (b === 1) {
-                  if (helpModalRef.current) setHelpModalTopic(null);
-                  else setSettingsOpen(false);
-                } else if (b === 4) cycleSettingsTab(-1);
+                else if (b === 1) cancelModalFromController();
+                else if (b === 4) cycleSettingsTab(-1);
                 else if (b === 5) cycleSettingsTab(1);
                 else if (b === 12 || b === 14) moveControllerFocus(-1);
                 else if (b === 13 || b === 15) moveControllerFocus(1);
@@ -1278,7 +1356,9 @@ export default function App() {
                   if (!activateFocusedControllerButton()) handleSprinkleFoodOnTop();
                 } else if (b === 12 || b === 14) moveControllerFocus(-1);
                 else if (b === 13 || b === 15) moveControllerFocus(1);
-                else if (b === 2 || b === 3) setSettingsOpen((v) => !v);
+                else if (b === 2 || b === 3) {
+                  toggleOwnerMenuFromController('Gamepad [X / Y] → Toggled Owner Menu');
+                }
               }
             }
             prev[b] = isDown;
@@ -1373,7 +1453,7 @@ export default function App() {
       });
 
       const nowMs = performance.now();
-      if (nowMs - lastHudSyncMsRef.current > 1000) {
+      if (nowMs - lastHudSyncMsRef.current > 2000) {
         lastHudSyncMsRef.current = nowMs;
         setEcosystem({ ...eco });
       }
@@ -1394,14 +1474,23 @@ export default function App() {
     [
       activateFocusedControllerButton,
       applyCloudRecordToEcosystem,
+      cancelModalFromController,
       cycleSettingsTab,
       handleSprinkleFoodOnTop,
       handleStartAquarium,
       moveControllerFocus,
       mypc,
       showToast,
+      toggleOwnerMenuFromController,
     ]
   );
+
+  const handleFpsUpdate = useCallback((nextFps: number) => {
+    if (!ecosystemRef.current.graphicsSettings?.showFps && !settingsOpenRef.current) {
+      return;
+    }
+    setFps((prev) => (prev === nextFps ? prev : nextFps));
+  }, []);
 
   const lang = mypcInfo.lang || 'en';
   const t = I18N[lang] || I18N.en;
@@ -1422,9 +1511,10 @@ export default function App() {
   const ownerXp = Math.round(ecosystem.ownerXp || 0);
   const currentPolyQuality: FishPolygonQuality =
     ecosystem.graphicsSettings?.fishPolygonQuality || 'high';
-  const currentEnvQuality =
+  const currentEnvQuality: EnvironmentQualityTier =
     ecosystem.graphicsSettings?.environmentQuality || mypcInfo.quality?.tier || 'high';
   const isFramelessTvMode = ecosystem.graphicsSettings?.framelessTvMode !== false;
+  const isShowFpsEnabled = ecosystem.graphicsSettings?.showFps === true;
   const currentLightIntensity = ecosystem.graphicsSettings?.lightIntensity ?? 0.95;
   const currentBgBrightness = ecosystem.graphicsSettings?.backgroundBrightness ?? 0.22;
 
@@ -1453,7 +1543,29 @@ export default function App() {
         isPaused={screenState === 'paused' || ecosystem.paused}
         onTickSimulation={handleTickSimulation}
         onPolygonStatsUpdate={setPolyStats}
+        onFpsUpdate={handleFpsUpdate}
       />
+
+      {/* Top-Right FPS Overlay when enabled from Settings (visible even when modals or title screen are open) */}
+      {isShowFpsEnabled && screenState !== 'playing' && (
+        <div
+          data-testid="fps-counter-overlay"
+          className="fixed top-4 right-5 z-50 pointer-events-none px-3 py-1.5 rounded-lg bg-[#06101e]/90 border border-emerald-400/60 text-xs font-mono font-bold tabular-nums shadow-lg flex items-center gap-2"
+        >
+          <span
+            className={`w-2 h-2 rounded-full ${
+              fps >= 45 ? 'bg-emerald-400' : fps >= 25 ? 'bg-amber-400' : 'bg-rose-400'
+            }`}
+          />
+          <span
+            className={
+              fps >= 45 ? 'text-emerald-300' : fps >= 25 ? 'text-amber-300' : 'text-rose-300'
+            }
+          >
+            {fps} FPS
+          </span>
+        </div>
+      )}
 
       {/* STATE 1: TITLE SCREEN OVERLAY */}
       {screenState === 'title' && (
@@ -1672,6 +1784,30 @@ export default function App() {
                   )}
                 </svg>
               </button>
+
+              {isShowFpsEnabled && (
+                <div
+                  data-testid="fps-counter-top-right"
+                  className="px-3 py-2 rounded-lg bg-[#06101e]/95 border border-emerald-400/60 text-xs font-mono font-bold tabular-nums shadow-lg flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      fps >= 45 ? 'bg-emerald-400' : fps >= 25 ? 'bg-amber-400' : 'bg-rose-400'
+                    }`}
+                  />
+                  <span
+                    className={
+                      fps >= 45
+                        ? 'text-emerald-300'
+                        : fps >= 25
+                        ? 'text-amber-300'
+                        : 'text-rose-300'
+                    }
+                  >
+                    {fps} FPS
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -2231,14 +2367,205 @@ export default function App() {
                 </div>
               )}
 
-              {/* TAB 3: 3D POLYGON & GRAPHICS SETTINGS */}
+              {/* TAB 3: 3D POLYGON & GRAPHICS SETTINGS (Graphics Quality First!) */}
               {settingsTab === 'graphics_polygons' && (
                 <div className="space-y-5">
-                  {/* Full-Screen Frameless TV Aquarium Mode Toggle (Default ON) */}
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/40 flex flex-wrap items-center justify-between gap-4">
+                  {/* 1. FIRST IN TAB: 3D Fish Polygon Quality (Mesh Smoothness) & Top-Right FPS Counter Toggle */}
+                  <div className="p-4 rounded-xl bg-slate-900/95 border border-cyan-500/50 space-y-3 shadow-lg">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-bold text-white flex items-center gap-2">
+                          <span>1. 3D Graphics &amp; Fish Polygon Quality</span>
+                          <button
+                            type="button"
+                            data-tv-focusable="true"
+                            onClick={() => setHelpModalTopic(HELP_TOPICS.fish_polygons)}
+                            className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                          >
+                            ?
+                          </button>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-0.5">
+                          Current Active Mesh:{' '}
+                          <span className="font-mono text-cyan-300">
+                            {polyStats.trianglesPerFish.toLocaleString()} triangles per fish (
+                            {polyStats.totalFishTriangles.toLocaleString()} total fish triangles)
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Show FPS on Top Right Toggle right in the top Graphics Quality header */}
+                      <div className="flex items-center gap-2.5">
+                        <span className="px-2.5 py-1 rounded-lg bg-slate-950 border border-emerald-500/40 text-xs font-mono font-bold text-emerald-300 tabular-nums">
+                          Live: {fps} FPS
+                        </span>
+                        <button
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={handleToggleShowFps}
+                          className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                            isShowFpsEnabled
+                              ? 'bg-emerald-400 text-slate-950 hover:bg-emerald-300'
+                              : 'bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700'
+                          }`}
+                        >
+                          {isShowFpsEnabled ? 'Show FPS: ON (Top Right)' : 'Show FPS: OFF'}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-1">
+                      {(
+                        [
+                          ['very_low', 'Very Low (Max FPS)', '~140 Tris / Fish'],
+                          ['low', 'Low (TV Saver)', '~420 Tris / Fish'],
+                          ['medium', 'Medium (Balanced)', '~1,380 Tris / Fish'],
+                          ['high', 'High (Sculpted 3D)', '~2,950 Tris / Fish'],
+                          ['ultra', 'Ultra (Cinema 3D)', '~6,800 Tris / Fish'],
+                        ] as Array<[FishPolygonQuality, string, string]>
+                      ).map(([qId, label, sub]) => (
+                        <button
+                          key={qId}
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={() => handleUpdatePolygonQuality(qId)}
+                          className={`p-3 rounded-xl border text-left transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                            currentPolyQuality === qId
+                              ? 'bg-cyan-500/20 border-cyan-400 text-white'
+                              : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:border-slate-600'
+                          }`}
+                        >
+                          <div className="text-xs font-bold">{label}</div>
+                          <div className="text-[11px] font-mono text-cyan-400 mt-1">{sub}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 2. SECOND IN TAB: Environment Lighting, Shader Quality & Water Effects */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-bold text-white">
+                          2. Environment Shader Quality, Shadows &amp; Water Effects
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          Configure shader quality (Very Low unlit fast mode up to High PBR shadows),
+                          caustic light shimmer, and oxygen bubbles.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => setHelpModalTopic(HELP_TOPICS.lighting_quality)}
+                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                      >
+                        ?
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3 pt-1">
+                      {(['very_low', 'low', 'mid', 'high'] as const).map((tier) => (
+                        <button
+                          key={tier}
+                          type="button"
+                          data-tv-focusable="true"
+                          onClick={() => {
+                            const eco = ecosystemRef.current;
+                            const prev = eco.graphicsSettings || {
+                              fishPolygonQuality: 'high',
+                              environmentQuality: 'high',
+                              showCaustics: true,
+                              showParticles: true,
+                              antiAliasing: true,
+                            };
+                            eco.graphicsSettings = {
+                              ...prev,
+                              environmentQuality: tier,
+                              ...(tier === 'very_low'
+                                ? {
+                                    fishPolygonQuality: 'very_low',
+                                    showCaustics: false,
+                                    showParticles: false,
+                                    antiAliasing: false,
+                                  }
+                                : {}),
+                            };
+                            saveEcosystemState(eco);
+                            setEcosystem({ ...eco });
+                            showToast(
+                              tier === 'very_low'
+                                ? 'Very Low Graphics Quality enabled (Unlit shaders, 0.55x resolution, ~140 tris/fish).'
+                                : `Lighting & Environment Quality set to ${tier.toUpperCase()}`
+                            );
+                          }}
+                          className={`px-4 py-2 rounded-lg text-xs font-bold border focus:ring-4 focus:ring-white focus:outline-none ${
+                            currentEnvQuality === tier
+                              ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                              : 'bg-slate-950 text-slate-300 border-slate-800'
+                          }`}
+                        >
+                          Lighting: {tier === 'very_low' ? 'VERY LOW (MAX FPS)' : tier.toUpperCase()}
+                        </button>
+                      ))}
+
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => {
+                          const eco = ecosystemRef.current;
+                          const nextVal = eco.graphicsSettings?.showCaustics === false;
+                          eco.graphicsSettings = {
+                            ...(eco.graphicsSettings || {
+                              fishPolygonQuality: 'high',
+                              environmentQuality: 'high',
+                              showCaustics: true,
+                              showParticles: true,
+                              antiAliasing: true,
+                            }),
+                            showCaustics: nextVal,
+                          };
+                          saveEcosystemState(eco);
+                          setEcosystem({ ...eco });
+                        }}
+                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                      >
+                        Caustic Shimmer:{' '}
+                        {ecosystem.graphicsSettings?.showCaustics !== false ? 'ON' : 'OFF'}
+                      </button>
+
+                      <button
+                        type="button"
+                        data-tv-focusable="true"
+                        onClick={() => {
+                          const eco = ecosystemRef.current;
+                          const nextVal = eco.graphicsSettings?.showParticles === false;
+                          eco.graphicsSettings = {
+                            ...(eco.graphicsSettings || {
+                              fishPolygonQuality: 'high',
+                              environmentQuality: 'high',
+                              showCaustics: true,
+                              showParticles: true,
+                              antiAliasing: true,
+                            }),
+                            showParticles: nextVal,
+                          };
+                          saveEcosystemState(eco);
+                          setEcosystem({ ...eco });
+                        }}
+                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
+                      >
+                        Oxygen Bubbles:{' '}
+                        {ecosystem.graphicsSettings?.showParticles !== false ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* 3. THIRD IN TAB: Full-Screen Frameless TV Aquarium Mode Toggle (Default ON) */}
+                  <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/40 flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <div className="text-sm font-bold text-white flex items-center gap-2">
-                        <span>Full-Screen TV Aquarium Mode (No Tank Frames — Default)</span>
+                        <span>3. Full-Screen TV Aquarium Mode</span>
                         <button
                           type="button"
                           data-tv-focusable="true"
@@ -2249,32 +2576,29 @@ export default function App() {
                         </button>
                       </div>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        Removes tank metal frames and borders so your entire TV screen becomes a
-                        living edge-to-edge aquarium. Arrow keys control focus on the top buttons.
+                        Removes tank borders so your screen becomes an edge-to-edge aquarium.
                       </p>
                     </div>
                     <button
                       type="button"
                       data-tv-focusable="true"
                       onClick={handleToggleFramelessTvMode}
-                      className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
+                      className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
                         isFramelessTvMode
                           ? 'bg-emerald-400 text-slate-950 hover:bg-emerald-300'
                           : 'bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700'
                       }`}
                     >
-                      {isFramelessTvMode
-                        ? 'Full-Screen TV Mode: ON (Frameless)'
-                        : 'Full-Screen TV Mode: OFF (Show Tank Frame)'}
+                      {isFramelessTvMode ? 'Full-Screen TV: ON' : 'Full-Screen TV: OFF'}
                     </button>
                   </div>
 
-                  {/* Customizable Aquarium Background Blue & Overhead Lighting Tuner */}
+                  {/* 4. FOURTH IN TAB: Customizable Aquarium Background Blue & Overhead Lighting Tuner */}
                   <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/30 space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <div className="text-sm font-bold text-white">
-                          Aquarium Background Blue &amp; Lighting Intensity
+                          4. Aquarium Background Blue &amp; Lighting Intensity
                         </div>
                         <p className="text-xs text-slate-400">
                           Customize how dark or bright the blue water at the back of the tank looks,
@@ -2430,161 +2754,6 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                    </div>
-                  </div>
-
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-sm font-bold text-white">
-                          3D Fish Polygon Quality (Mesh Smoothness)
-                        </div>
-                        <div className="text-xs text-slate-400">
-                          Current Active Mesh:{' '}
-                          <span className="font-mono text-cyan-300">
-                            {polyStats.trianglesPerFish.toLocaleString()} triangles per fish (
-                            {polyStats.totalFishTriangles.toLocaleString()} total fish triangles)
-                          </span>
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        data-tv-focusable="true"
-                        onClick={() => setHelpModalTopic(HELP_TOPICS.fish_polygons)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
-                      >
-                        ?
-                      </button>
-                    </div>
-
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
-                      {(
-                        [
-                          ['low', 'Low (TV Saver)', '~520 Tris / Fish'],
-                          ['medium', 'Medium (Balanced)', '~1,640 Tris / Fish'],
-                          ['high', 'High (Sculpted 3D)', '~3,850 Tris / Fish'],
-                          ['ultra', 'Ultra (Cinema 3D)', '~8,200 Tris / Fish'],
-                        ] as Array<[FishPolygonQuality, string, string]>
-                      ).map(([qId, label, sub]) => (
-                        <button
-                          key={qId}
-                          type="button"
-                          data-tv-focusable="true"
-                          onClick={() => handleUpdatePolygonQuality(qId)}
-                          className={`p-3 rounded-xl border text-left transition-colors focus:ring-4 focus:ring-white focus:outline-none ${
-                            currentPolyQuality === qId
-                              ? 'bg-cyan-500/20 border-cyan-400 text-white'
-                              : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:border-slate-600'
-                          }`}
-                        >
-                          <div className="text-xs font-bold">{label}</div>
-                          <div className="text-[11px] font-mono text-cyan-400 mt-1">{sub}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Environment Lighting & Effects */}
-                  <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-sm font-bold text-white">
-                          Aquarium Lighting, Shadows &amp; Water Effects
-                        </div>
-                        <div className="text-xs text-slate-400">
-                          Configure underwater shadows, caustic light shimmer, and oxygen bubbles.
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        data-tv-focusable="true"
-                        onClick={() => setHelpModalTopic(HELP_TOPICS.lighting_quality)}
-                        className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold hover:bg-cyan-500/30 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
-                      >
-                        ?
-                      </button>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-3 pt-1">
-                      {(['low', 'mid', 'high'] as const).map((tier) => (
-                        <button
-                          key={tier}
-                          type="button"
-                          data-tv-focusable="true"
-                          onClick={() => {
-                            const eco = ecosystemRef.current;
-                            eco.graphicsSettings = {
-                              ...(eco.graphicsSettings || {
-                                fishPolygonQuality: 'high',
-                                environmentQuality: 'high',
-                                showCaustics: true,
-                                showParticles: true,
-                                antiAliasing: true,
-                              }),
-                              environmentQuality: tier,
-                            };
-                            saveEcosystemState(eco);
-                            setEcosystem({ ...eco });
-                          }}
-                          className={`px-4 py-2 rounded-lg text-xs font-bold border focus:ring-4 focus:ring-white focus:outline-none ${
-                            currentEnvQuality === tier
-                              ? 'bg-cyan-400 text-slate-950 border-cyan-300'
-                              : 'bg-slate-950 text-slate-300 border-slate-800'
-                          }`}
-                        >
-                          Lighting: {tier.toUpperCase()}
-                        </button>
-                      ))}
-
-                      <button
-                        type="button"
-                        data-tv-focusable="true"
-                        onClick={() => {
-                          const eco = ecosystemRef.current;
-                          const nextVal = eco.graphicsSettings?.showCaustics === false;
-                          eco.graphicsSettings = {
-                            ...(eco.graphicsSettings || {
-                              fishPolygonQuality: 'high',
-                              environmentQuality: 'high',
-                              showCaustics: true,
-                              showParticles: true,
-                              antiAliasing: true,
-                            }),
-                            showCaustics: nextVal,
-                          };
-                          saveEcosystemState(eco);
-                          setEcosystem({ ...eco });
-                        }}
-                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
-                      >
-                        Caustic Shimmer:{' '}
-                        {ecosystem.graphicsSettings?.showCaustics !== false ? 'ON' : 'OFF'}
-                      </button>
-
-                      <button
-                        type="button"
-                        data-tv-focusable="true"
-                        onClick={() => {
-                          const eco = ecosystemRef.current;
-                          const nextVal = eco.graphicsSettings?.showParticles === false;
-                          eco.graphicsSettings = {
-                            ...(eco.graphicsSettings || {
-                              fishPolygonQuality: 'high',
-                              environmentQuality: 'high',
-                              showCaustics: true,
-                              showParticles: true,
-                              antiAliasing: true,
-                            }),
-                            showParticles: nextVal,
-                          };
-                          saveEcosystemState(eco);
-                          setEcosystem({ ...eco });
-                        }}
-                        className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-950 border border-slate-800 text-slate-200 focus:ring-4 focus:ring-cyan-300 focus:outline-none"
-                      >
-                        Oxygen Bubbles:{' '}
-                        {ecosystem.graphicsSettings?.showParticles !== false ? 'ON' : 'OFF'}
-                      </button>
                     </div>
                   </div>
 
