@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -9,6 +9,7 @@ import {
   FishPolygonQuality,
   FoodPellet,
   SavedEcosystemState,
+  SpeciesConfig,
   ThreatEntity,
 } from '../engine/types';
 
@@ -2401,3 +2402,593 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
     />
   );
 };
+
+export interface Fish3DModelCatalogEntry {
+  id: SpeciesConfig['bodyStyle'];
+  index: number;
+  name: string;
+  shortName: string;
+  anatomySummary: string;
+  finProfile: string;
+  specialFeature: string;
+  defaultColors: {
+    primary: string;
+    secondary: string;
+    accent: string;
+  };
+  exampleSpecies: string;
+}
+
+export const FISH_3D_MODELS_CATALOG: Fish3DModelCatalogEntry[] = [
+  {
+    id: 'fusiform_reef',
+    index: 1,
+    name: 'Streamlined Reef / Tetra',
+    shortName: 'Reef Tetra',
+    anatomySummary: 'Hydrodynamic fusiform body with balanced dorsal arch and forked caudal fin.',
+    finProfile: 'Classic forked tail, swept dorsal & translucent pectoral scullers',
+    specialFeature: 'Iridescent lateral neon stripe & countershaded scales',
+    defaultColors: { primary: '#0ea5e9', secondary: '#0369a1', accent: '#38bdf8' },
+    exampleSpecies: 'Neon Tetra, Harlequin Rasbora, Zebra Danio',
+  },
+  {
+    id: 'angel_disc',
+    index: 2,
+    name: 'Tall Angelfish / Discus',
+    shortName: 'Angel / Discus',
+    anatomySummary: 'Laterally compressed, ultra-tall diamond/disc silhouette with sweeping vertical fins.',
+    finProfile: 'High-sail dorsal (0.62u), deep swept anal fin & elongated pelvic filaments',
+    specialFeature: 'Graceful vertical posture & tall dorsal crown',
+    defaultColors: { primary: '#f59e0b', secondary: '#78350f', accent: '#fde047' },
+    exampleSpecies: 'Pterophyllum Altum Angelfish, Royal Discus',
+  },
+  {
+    id: 'biolum_Latern',
+    index: 3,
+    name: 'Deep-Sea Lantern / Eel',
+    shortName: 'Abyssal Lantern',
+    anatomySummary: 'Muscular mid-water abyssal hunter with broad gill plates and glowing dorsal lure.',
+    finProfile: 'Tapered abyssal tail with high-pulsing bioluminescent fin membranes',
+    specialFeature: 'Bioluminescent dorsal esca lure & glowing lateral organs',
+    defaultColors: { primary: '#6366f1', secondary: '#1e1b4b', accent: '#22d3ee' },
+    exampleSpecies: 'Abyssal Lanternfish, Black Ghost Knifefish, Bichir',
+  },
+  {
+    id: 'mandarin_dragonet',
+    index: 4,
+    name: 'Ornate Fan-Fin Dragonet',
+    shortName: 'Dragonet',
+    anatomySummary: 'Reef bottom-glider with wide flared gill covers and oversized fan pectoral wings.',
+    finProfile: 'Convex rounded veil tail & broad 0.46u hovering pectoral fans',
+    specialFeature: 'Psychedelic reef patterning & figure-8 hovering pectoral scull',
+    defaultColors: { primary: '#10b981', secondary: '#064e3b', accent: '#f97316' },
+    exampleSpecies: 'Mandarin Dragonet, Electric Blue Ram, Killifish',
+  },
+  {
+    id: 'betta_veil',
+    index: 5,
+    name: 'Flowing Veil-Tail Betta',
+    shortName: 'Veil Betta',
+    anatomySummary: 'Slender fighter torso carrying massive, billowing silk-like veil fins.',
+    finProfile: 'Ultra-long 0.92u convex veil caudal tail, 0.54u dorsal & 0.52u anal curtain',
+    specialFeature: 'High-frequency 14-ray fin corrugation wave during swimming',
+    defaultColors: { primary: '#ec4899', secondary: '#831843', accent: '#f43f5e' },
+    exampleSpecies: 'Siamese Fighting Betta, Fancy Guppy, Celestial Danio',
+  },
+  {
+    id: 'shark_torpedo',
+    index: 6,
+    name: 'Sleek Torpedo Shark / Bala',
+    shortName: 'Torpedo Shark',
+    anatomySummary: 'Elongated 1.56u apex cruiser with conical snout and low-drag fuselage.',
+    finProfile: 'Deep crescent fork tail (0.56 indent), tall triangular shark dorsal & swept pectorals',
+    specialFeature: 'Predatory forward pitch & high-thrust tail peduncle',
+    defaultColors: { primary: '#64748b', secondary: '#0f172a', accent: '#ef4444' },
+    exampleSpecies: 'Red-Tail Black Shark, Bala Shark, Rainbow Shark',
+  },
+  {
+    id: 'puffer_round',
+    index: 7,
+    name: 'Round Pea / Box Puffer',
+    shortName: 'Round Puffer',
+    anatomySummary: 'Globular inflated body (0.82u width) with blunt snout and wide-set cheeks.',
+    finProfile: 'Compact rear-set dorsal/analstabilizers & rapid-sculling mini pectoral fans',
+    specialFeature: 'Oversized wide-set stereoscopic eyes & round inflated hull',
+    defaultColors: { primary: '#eab308', secondary: '#713f12', accent: '#fef08a' },
+    exampleSpecies: 'Dwarf Pea Puffer, Porcupine Puffer, Yellow Boxfish',
+  },
+  {
+    id: 'tang_surgeon',
+    index: 8,
+    name: 'Oval Reef Surgeonfish / Tang',
+    shortName: 'Surgeon Tang',
+    anatomySummary: 'Streamlined oval reef grazer with narrow 0.18u flanks and continuous dorsal ridge.',
+    finProfile: 'Long-root 0.72u dorsal ridge, lunate crescent caudal tail & agile pectorals',
+    specialFeature: 'High-contrast reef coloration & razor-thin surgeon profile',
+    defaultColors: { primary: '#2563eb', secondary: '#172554', accent: '#facc15' },
+    exampleSpecies: 'Regal Blue Tang, Yellow Tang, Powder Blue Tang, Moorish Idol',
+  },
+  {
+    id: 'koi_dragon',
+    index: 9,
+    name: 'Heavy Barbels Dragon Koi',
+    shortName: 'Dragon Koi',
+    anatomySummary: 'Long 1.48u muscular royal body with broad dorsal shoulders and sensory barbels.',
+    finProfile: 'Broad 0.72u flowing caudal fan, long dorsal crest & sweeping pectoral oars',
+    specialFeature: '3D sculpted snout whiskers (barbels) & heavy dragon scales',
+    defaultColors: { primary: '#f97316', secondary: '#7c2d12', accent: '#fde047' },
+    exampleSpecies: 'Kohaku Nishikigoi Koi, Golden Asian Arowana, Flowerhorn',
+  },
+  {
+    id: 'lionfish_fan',
+    index: 10,
+    name: 'Spiny Fan-Crest Lionfish',
+    shortName: 'Fan Lionfish',
+    anatomySummary: 'Armored reef ambush predator with flared gill plates and venomous fin plumes.',
+    finProfile: '7-comb spiny dorsal crest, 18-ray corrugated 0.74u giant pectoral wings',
+    specialFeature: 'Comb-toothed dorsal spines & dramatic flared pectoral fan wings',
+    defaultColors: { primary: '#dc2626', secondary: '#450a0a', accent: '#fca5a5' },
+    exampleSpecies: 'Red Volitans Lionfish, Flame Hawkfish, Mandarin Gobies',
+  },
+];
+
+export interface FishModelPreview3DProps {
+  bodyStyle: SpeciesConfig['bodyStyle'];
+  primaryColorHex: string;
+  secondaryColorHex: string;
+  accentColorHex: string;
+  polygonQuality?: FishPolygonQuality;
+  speciesName?: string;
+  aggressiveness?: number;
+  heightClass?: string;
+  compact?: boolean;
+  onSelectPolygonQuality?: (q: FishPolygonQuality) => void;
+}
+
+export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
+  bodyStyle,
+  primaryColorHex,
+  secondaryColorHex,
+  accentColorHex,
+  polygonQuality = 'high',
+  speciesName,
+  aggressiveness = 0,
+  heightClass = 'h-72',
+  compact = false,
+  onSelectPolygonQuality,
+}) => {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const [cameraMode, setCameraMode] = useState<'turntable' | 'side' | 'quarter' | 'front' | 'top'>(
+    'turntable'
+  );
+  const [animMode, setAnimMode] = useState<
+    'swim' | 'attack_lunge' | 'flee_dart' | 'slowed_down' | 'counter_attack'
+  >('swim');
+  const [wireframe, setWireframe] = useState<boolean>(false);
+  const [localPolyQuality, setLocalPolyQuality] = useState<FishPolygonQuality>(polygonQuality);
+  const [triangleCount, setTriangleCount] = useState<number>(0);
+
+  useEffect(() => {
+    setLocalPolyQuality(polygonQuality);
+  }, [polygonQuality]);
+
+  const cameraModeRef = useRef(cameraMode);
+  cameraModeRef.current = cameraMode;
+
+  const animModeRef = useRef(animMode);
+  animModeRef.current = animMode;
+
+  const wireframeRef = useRef(wireframe);
+  wireframeRef.current = wireframe;
+
+  const dragOrbitRef = useRef({
+    isDragging: false,
+    lastX: 0,
+    lastY: 0,
+    yawOffset: 0.55,
+    pitchOffset: 0.14,
+    zoom: 1.0,
+  });
+
+  useEffect(() => {
+    const container = mountRef.current;
+    if (!container) return;
+
+    const isSoftwareGl = (() => {
+      const gl = document.createElement('canvas').getContext('webgl2');
+      if (!gl) return true;
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+      const gpu = String(gl.getParameter(param));
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    })();
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !isSoftwareGl,
+      powerPreference: 'high-performance',
+    });
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+
+    const w = Math.max(120, container.clientWidth || 360);
+    const h = Math.max(120, container.clientHeight || 260);
+    renderer.setSize(w, h);
+    container.innerHTML = '';
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x040d1a);
+
+    const camera = new THREE.PerspectiveCamera(40, w / h, 0.1, 50);
+    camera.position.set(2.1, 0.5, 2.1);
+    camera.lookAt(0, 0, 0);
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    const envTex = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environment = envTex;
+    pmremGenerator.dispose();
+
+    const hemiLight = new THREE.HemisphereLight(0xbae6fd, 0x082f49, 1.35);
+    hemiLight.position.set(0, 10, 0);
+    scene.add(hemiLight);
+
+    const keyLight = new THREE.DirectionalLight(0xfffbeb, 2.1);
+    keyLight.position.set(4, 6, 5);
+    scene.add(keyLight);
+
+    const rimLight = new THREE.DirectionalLight(0x22d3ee, 1.25);
+    rimLight.position.set(-5, 3, -4);
+    scene.add(rimLight);
+
+    const fillLight = new THREE.DirectionalLight(0x38bdf8, 0.75);
+    fillLight.position.set(-3, -2, 5);
+    scene.add(fillLight);
+
+    // Subtle holographic studio pedestal grid ring beneath the fish
+    const studioRingGeo = new THREE.RingGeometry(0.68, 0.73, 48);
+    studioRingGeo.rotateX(-Math.PI / 2);
+    const studioRingMat = new THREE.MeshBasicMaterial({
+      color: 0x06b6d4,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.4,
+    });
+    const studioRing = new THREE.Mesh(studioRingGeo, studioRingMat);
+    studioRing.position.set(0, -0.68, 0);
+    scene.add(studioRing);
+
+    const innerDiscGeo = new THREE.CircleGeometry(0.68, 36);
+    innerDiscGeo.rotateX(-Math.PI / 2);
+    const innerDiscMat = new THREE.MeshBasicMaterial({
+      color: 0x083344,
+      transparent: true,
+      opacity: 0.25,
+    });
+    const innerDisc = new THREE.Mesh(innerDiscGeo, innerDiscMat);
+    innerDisc.position.set(0, -0.685, 0);
+    scene.add(innerDisc);
+
+    const rig = createSculpted3DFishRig(
+      `preview_${bodyStyle}`,
+      primaryColorHex,
+      secondaryColorHex,
+      accentColorHex,
+      bodyStyle,
+      localPolyQuality,
+      'high'
+    );
+    scene.add(rig.group);
+    setTriangleCount(rig.triangleCount);
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (!container) return;
+      const nw = Math.max(100, container.clientWidth);
+      const nh = Math.max(100, container.clientHeight);
+      camera.aspect = nw / nh;
+      camera.updateProjectionMatrix();
+      renderer.setSize(nw, nh);
+    });
+    resizeObserver.observe(container);
+
+    const ClockCtor = (THREE as unknown as { Timer?: new () => { update: () => void; getDelta: () => number } }).Timer;
+    const timer = ClockCtor ? new ClockCtor() : null;
+    let lastTimeMs = performance.now();
+    let elapsed = 0;
+    let tailPhase = 0;
+    let frameId = 0;
+    let unmounted = false;
+
+    const tick = () => {
+      if (unmounted) return;
+      let dt = 0.016;
+      if (timer) {
+        timer.update();
+        dt = Math.min(0.05, timer.getDelta());
+      } else {
+        const now = performance.now();
+        dt = Math.min(0.05, (now - lastTimeMs) / 1000);
+        lastTimeMs = now;
+      }
+      elapsed += dt;
+
+      // Apply wireframe state
+      const wf = wireframeRef.current;
+      if (rig.bodyMat.wireframe !== wf) {
+        rig.bodyMat.wireframe = wf;
+        rig.finMat.wireframe = wf;
+      }
+
+      // Compute animation parameters based on animMode
+      const mode = animModeRef.current;
+      let speedFreq = 6.5;
+      let swimAmp = 0.095;
+      let lungeZ = 0;
+      let lungePitch = 0;
+      let lungeRoll = 0;
+
+      if (mode === 'attack_lunge') {
+        speedFreq = 14.5;
+        swimAmp = 0.145;
+        const cycle = (elapsed * 1.8) % 1.0;
+        if (cycle < 0.35) {
+          // Wind-up & rapid forward strike lunge
+          const strikeT = Math.sin((cycle / 0.35) * Math.PI);
+          lungeZ = strikeT * 0.42;
+          lungePitch = -strikeT * 0.14;
+          studioRingMat.color.setHex(0xf43f5e);
+        } else {
+          lungeZ = Math.sin(elapsed * 2) * 0.04;
+          studioRingMat.color.setHex(0xfb7185);
+        }
+      } else if (mode === 'counter_attack') {
+        speedFreq = 16.0;
+        swimAmp = 0.16;
+        const cycle = (elapsed * 2.2) % 1.0;
+        const snap = Math.sin(cycle * Math.PI * 2);
+        lungeZ = Math.max(-0.15, snap * 0.38);
+        lungeRoll = Math.sin(elapsed * 12) * 0.16;
+        studioRingMat.color.setHex(0xe11d48);
+      } else if (mode === 'flee_dart') {
+        speedFreq = 15.5;
+        swimAmp = 0.15;
+        lungeZ = Math.sin(elapsed * 5.0) * 0.28;
+        lungeRoll = Math.sin(elapsed * 7.5) * 0.12;
+        studioRingMat.color.setHex(0x38bdf8);
+      } else if (mode === 'slowed_down') {
+        speedFreq = 2.4;
+        swimAmp = 0.042;
+        lungePitch = 0.08;
+        lungeRoll = Math.sin(elapsed * 1.5) * 0.08;
+        studioRingMat.color.setHex(0xf59e0b);
+      } else {
+        studioRingMat.color.setHex(0x06b6d4);
+      }
+
+      tailPhase += dt * speedFreq;
+      rig.spineUniforms.uTailPhase.value = tailPhase;
+      rig.spineUniforms.uSwimAmp.value = swimAmp;
+
+      // Caudal & Pectoral fin articulation
+      rig.tailPeduncleGroup.rotation.y = Math.sin(tailPhase) * ( swimAmp * 4.8 );
+      rig.tailBladeMesh.rotation.y = Math.sin(tailPhase - 0.65) * ( swimAmp * 3.1 );
+
+      const scull = Math.cos(tailPhase * 0.85);
+      const feather = Math.sin(tailPhase * 0.85);
+      rig.pectoralLeftGroup.rotation.y = scull * 0.38;
+      rig.pectoralLeftGroup.rotation.z = feather * 0.2;
+      rig.pectoralRightGroup.rotation.y = -scull * 0.38;
+      rig.pectoralRightGroup.rotation.z = -feather * 0.2;
+
+      rig.group.position.set(0, Math.sin(elapsed * 1.8) * 0.04, lungeZ);
+      rig.group.rotation.set(lungePitch, 0, lungeRoll, 'YXZ');
+
+      // Camera positioning
+      const cMode = cameraModeRef.current;
+      const orb = dragOrbitRef.current;
+      const dist = 2.55 * orb.zoom;
+      let targetYaw = orb.yawOffset;
+      let targetPitch = orb.pitchOffset;
+
+      if (!orb.isDragging) {
+        if (cMode === 'turntable') {
+          orb.yawOffset += dt * 0.55;
+          targetYaw = orb.yawOffset;
+        } else if (cMode === 'side') {
+          targetYaw = Math.PI * 0.5;
+          targetPitch = 0.06;
+        } else if (cMode === 'quarter') {
+          targetYaw = Math.PI * 0.32;
+          targetPitch = 0.18;
+        } else if (cMode === 'front') {
+          targetYaw = 0.0;
+          targetPitch = 0.08;
+        } else if (cMode === 'top') {
+          targetYaw = Math.PI * 0.5;
+          targetPitch = 1.25;
+        }
+      }
+
+      const cosP = Math.cos(targetPitch);
+      camera.position.set(
+        Math.sin(targetYaw) * cosP * dist,
+        Math.sin(targetPitch) * dist,
+        Math.cos(targetYaw) * cosP * dist
+      );
+      camera.lookAt(0, 0.02, 0);
+
+      renderer.render(scene, camera);
+      frameId = requestAnimationFrame(tick);
+    };
+
+    tick();
+
+    return () => {
+      unmounted = true;
+      cancelAnimationFrame(frameId);
+      resizeObserver.disconnect();
+      envTex.dispose();
+      studioRingGeo.dispose();
+      studioRingMat.dispose();
+      innerDiscGeo.dispose();
+      innerDiscMat.dispose();
+      rig.bodyMat.dispose();
+      rig.finMat.dispose();
+      renderer.dispose();
+    };
+  }, [bodyStyle, primaryColorHex, secondaryColorHex, accentColorHex, localPolyQuality]);
+
+  const catalogMeta =
+    FISH_3D_MODELS_CATALOG.find((m) => m.id === bodyStyle) || FISH_3D_MODELS_CATALOG[0];
+
+  return (
+    <div className="rounded-2xl bg-[#061020] border border-cyan-500/40 overflow-hidden flex flex-col">
+      {/* Top Bar: Model Name, Triangle Count & Camera Presets */}
+      <div className="px-3.5 py-2 bg-[#040a15] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="px-2 py-0.5 rounded bg-cyan-500/20 border border-cyan-400/50 text-[10px] font-mono font-extrabold text-cyan-300 uppercase">
+            3D MODEL #{catalogMeta.index}
+          </span>
+          <span className="text-xs font-bold text-white">
+            {speciesName ? `${speciesName} (${catalogMeta.shortName})` : catalogMeta.name}
+          </span>
+          <span className="text-[11px] font-mono text-emerald-300">
+            {triangleCount.toLocaleString()} Tris
+          </span>
+          {aggressiveness > 0 && (
+            <span className="px-1.5 py-0.5 rounded bg-rose-950 border border-rose-500/50 text-[10px] font-mono font-bold text-rose-300">
+              AGG {(aggressiveness * 100).toFixed(0)}%
+            </span>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1">
+          {(
+            [
+              ['turntable', '360° Spin'],
+              ['side', 'Side'],
+              ['quarter', '3/4'],
+              ['front', 'Front'],
+              ['top', 'Top'],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setCameraMode(id)}
+              className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold transition-colors ${
+                cameraMode === id
+                  ? 'bg-cyan-400 text-slate-950'
+                  : 'bg-slate-900 text-slate-300 hover:text-white border border-slate-800'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => setWireframe((w) => !w)}
+            className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold transition-colors ${
+              wireframe
+                ? 'bg-amber-400 text-slate-950'
+                : 'bg-slate-900 text-slate-300 hover:text-white border border-slate-800'
+            }`}
+          >
+            Wire
+          </button>
+        </div>
+      </div>
+
+      {/* Interactive 3D Viewport Canvas */}
+      <div
+        ref={mountRef}
+        onPointerDown={(e) => {
+          dragOrbitRef.current.isDragging = true;
+          dragOrbitRef.current.lastX = e.clientX;
+          dragOrbitRef.current.lastY = e.clientY;
+        }}
+        onPointerMove={(e) => {
+          if (!dragOrbitRef.current.isDragging) return;
+          const dx = e.clientX - dragOrbitRef.current.lastX;
+          const dy = e.clientY - dragOrbitRef.current.lastY;
+          dragOrbitRef.current.lastX = e.clientX;
+          dragOrbitRef.current.lastY = e.clientY;
+          dragOrbitRef.current.yawOffset -= dx * 0.01;
+          dragOrbitRef.current.pitchOffset = Math.max(
+            -1.1,
+            Math.min(1.25, dragOrbitRef.current.pitchOffset + dy * 0.01)
+          );
+        }}
+        onPointerUp={() => {
+          dragOrbitRef.current.isDragging = false;
+        }}
+        onPointerLeave={() => {
+          dragOrbitRef.current.isDragging = false;
+        }}
+        onWheel={(e) => {
+          e.preventDefault();
+          dragOrbitRef.current.zoom = Math.max(
+            0.55,
+            Math.min(1.85, dragOrbitRef.current.zoom + (e.deltaY > 0 ? 0.08 : -0.08))
+          );
+        }}
+        className={`relative w-full ${heightClass} cursor-grab active:cursor-grabbing select-none`}
+      />
+
+      {/* Bottom Controls: Animation / Reaction Tester & Polygon Tier Selector */}
+      {!compact && (
+        <div className="px-3.5 py-2.5 bg-[#040a15] border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-1">
+            <span className="text-slate-400 font-mono mr-1">Test Motion:</span>
+            {(
+              [
+                ['swim', 'Normal Swim', 'bg-cyan-400 text-slate-950'],
+                ['attack_lunge', 'Attack Lunge', 'bg-rose-500 text-white'],
+                ['flee_dart', 'React: Flee Dart', 'bg-sky-400 text-slate-950'],
+                ['slowed_down', 'React: Slowed', 'bg-amber-400 text-slate-950'],
+                ['counter_attack', 'React: Counter-Attack', 'bg-fuchsia-500 text-white'],
+              ] as const
+            ).map(([mId, mLabel, activeCls]) => (
+              <button
+                key={mId}
+                type="button"
+                onClick={() => setAnimMode(mId)}
+                className={`px-2 py-1 rounded font-mono font-bold transition-colors ${
+                  animMode === mId
+                    ? activeCls
+                    : 'bg-slate-900 text-slate-300 hover:text-white border border-slate-800'
+                }`}
+              >
+                {mLabel}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-1">
+            <span className="text-slate-400 font-mono">Mesh LOD:</span>
+            {(['very_low', 'low', 'medium', 'high', 'ultra'] as const).map((q) => (
+              <button
+                key={q}
+                type="button"
+                onClick={() => {
+                  setLocalPolyQuality(q);
+                  onSelectPolygonQuality?.(q);
+                }}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase font-bold ${
+                  localPolyQuality === q
+                    ? 'bg-emerald-400 text-slate-950'
+                    : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+                }`}
+              >
+                {q === 'very_low' ? 'V.Low' : q}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+

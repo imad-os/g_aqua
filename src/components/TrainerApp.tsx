@@ -67,14 +67,19 @@ import {
   SavedEcosystemState,
   SpeciesConfig,
 } from '../engine/types';
-import { AquariumCanvas3D } from './AquariumCanvas3D';
+import {
+  AquariumCanvas3D,
+  FISH_3D_MODELS_CATALOG,
+  FishModelPreview3D,
+} from './AquariumCanvas3D';
 
 export type TrainerTabId =
   | 'train_models'
   | 'offline_service'
   | 'species_editor'
   | 'brain_lab'
-  | 'evolution_lab';
+  | 'evolution_lab'
+  | 'models_3d';
 
 interface TrainerHelpItem {
   title: string;
@@ -261,6 +266,12 @@ export const TrainerApp: React.FC = () => {
     'Foraging & Surface Reflex A/B Trial'
   );
   const [jsonExportText, setJsonExportText] = useState<string>('');
+
+  // Tab 6: 3D Models Catalog Studio State
+  const [selectedCatalogModelId, setSelectedCatalogModelId] = useState<SpeciesConfig['bodyStyle']>(
+    () => ecosystem.speciesList[0]?.bodyStyle || 'fusiform_reef'
+  );
+  const [catalogColorMode, setCatalogColorMode] = useState<'default' | 'species'>('default');
 
   const selectedSpecies =
     ecosystem.speciesList.find((s) => s.id === selectedSpeciesId) ||
@@ -1958,7 +1969,7 @@ export const TrainerApp: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500 text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">
-                  TRAINER HUD v1.7.5
+                  TRAINER HUD v1.7.9
                 </span>
                 <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">
                   ADMIN AUTH GATE
@@ -2146,7 +2157,7 @@ export const TrainerApp: React.FC = () => {
       <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
-            TRAINER HUD v1.7.8
+            TRAINER HUD v1.7.9
           </span>
           <span className="text-sm font-extrabold uppercase tracking-wider text-white">
             ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
@@ -2267,6 +2278,21 @@ export const TrainerApp: React.FC = () => {
             }`}
           >
             05 // EVOLUTION
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setSelectedCatalogModelId(selectedSpecies.bodyStyle);
+              setActiveTab('models_3d');
+            }}
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
+              activeTab === 'models_3d'
+                ? 'bg-fuchsia-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-fuchsia-500 hover:text-white'
+            }`}
+          >
+            06 // 3D MODELS (10)
           </button>
         </div>
 
@@ -2614,10 +2640,21 @@ export const TrainerApp: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Right Column: Saved Versions for Selected Fish Type */}
+                {/* Right Column: Live 3D Species Preview + Last 5 Saved Versions */}
                 <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 flex flex-col justify-between space-y-4">
                   <div className="space-y-3">
-                    <div className="flex items-center justify-between">
+                    <FishModelPreview3D
+                      bodyStyle={selectedSpecies.bodyStyle}
+                      primaryColorHex={selectedSpecies.primaryColorHex}
+                      secondaryColorHex={selectedSpecies.secondaryColorHex}
+                      accentColorHex={selectedSpecies.accentColorHex}
+                      speciesName={selectedSpecies.name}
+                      aggressiveness={selectedSpecies.baseBrainConfig.aggressiveness ?? 0}
+                      heightClass="h-40"
+                      compact={true}
+                    />
+
+                    <div className="flex items-center justify-between pt-1">
                       <div>
                         <h3 className="text-sm font-bold text-white">
                           Last 5 Versions ({selectedSpecies.name}) — Newest First
@@ -3848,248 +3885,322 @@ export const TrainerApp: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">Species Name</label>
-                    <input
-                      type="text"
-                      value={selectedSpecies.name}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.name = e.target.value;
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-                    />
-                  </div>
+                {/* Split Layout: Left 7 Cols = Biological & 3D Model Controls, Right 5 Cols = Live Interactive 3D Preview */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                  <div className="lg:col-span-7 space-y-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">Species Name</label>
+                        <input
+                          type="text"
+                          value={selectedSpecies.name}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.name = e.target.value;
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+                        />
+                      </div>
 
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">Scientific Name</label>
-                    <input
-                      type="text"
-                      value={selectedSpecies.scientificName}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.scientificName = e.target.value;
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white italic"
-                    />
-                  </div>
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">Scientific Name</label>
+                        <input
+                          type="text"
+                          value={selectedSpecies.scientificName}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.scientificName = e.target.value;
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white italic"
+                        />
+                      </div>
 
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Lifespan (Sim Hours)
-                    </label>
-                    <input
-                      type="number"
-                      min={4}
-                      max={500}
-                      step={1}
-                      value={selectedSpecies.lifespan.lifespanSimHours}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          const hrs = Math.max(4, Number(e.target.value) || 24);
-                          s.lifespan.lifespanSimHours = hrs;
-                          s.lifespan.maxReproductiveAgeHours = Number((hrs * 0.85).toFixed(1));
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-cyan-300"
-                    />
-                  </div>
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Lifespan (Sim Hours)
+                        </label>
+                        <input
+                          type="number"
+                          min={4}
+                          max={500}
+                          step={1}
+                          value={selectedSpecies.lifespan.lifespanSimHours}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              const hrs = Math.max(4, Number(e.target.value) || 24);
+                              s.lifespan.lifespanSimHours = hrs;
+                              s.lifespan.maxReproductiveAgeHours = Number((hrs * 0.85).toFixed(1));
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-cyan-300"
+                        />
+                      </div>
 
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Sexual Maturity Age (Hours)
-                    </label>
-                    <input
-                      type="number"
-                      min={0.5}
-                      max={100}
-                      step={0.5}
-                      value={selectedSpecies.lifespan.sexualMaturityAgeHours}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.lifespan.sexualMaturityAgeHours = Math.max(
-                            0.5,
-                            Number(e.target.value) || 4
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Sexual Maturity Age (Hours)
+                        </label>
+                        <input
+                          type="number"
+                          min={0.5}
+                          max={100}
+                          step={0.5}
+                          value={selectedSpecies.lifespan.sexualMaturityAgeHours}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.lifespan.sexualMaturityAgeHours = Math.max(
+                                0.5,
+                                Number(e.target.value) || 4
+                              );
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Reproduction Interval (Hours)
+                        </label>
+                        <input
+                          type="number"
+                          min={0.5}
+                          max={100}
+                          step={0.5}
+                          value={selectedSpecies.lifespan.reproductionIntervalHours}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.lifespan.reproductionIntervalHours = Math.max(
+                                0.5,
+                                Number(e.target.value) || 3
+                              );
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Metabolism Burn (Energy / Hour)
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          step={0.5}
+                          value={selectedSpecies.lifespan.metabolismEnergyPerHour}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.lifespan.metabolismEnergyPerHour = Math.max(
+                                1,
+                                Number(e.target.value) || 6.5
+                              );
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Required Owner Level (Unlock)
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          step={1}
+                          value={selectedSpecies.requiredOwnerLevel || 1}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.requiredOwnerLevel = Math.max(1, Number(e.target.value) || 1);
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-amber-300"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Shop Price (Bio-Credits)
+                        </label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={2000}
+                          step={5}
+                          value={selectedSpecies.shopPriceCredits || 45}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.shopPriceCredits = Math.max(10, Number(e.target.value) || 45);
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-amber-300"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Aggressiveness (0 = Peaceful)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={Number(
+                            (selectedSpecies.baseBrainConfig.aggressiveness ?? 0).toFixed(2)
+                          )}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              const val = Math.max(0, Math.min(1, Number(e.target.value) || 0));
+                              s.baseBrainConfig.aggressiveness = val < 0.02 ? 0 : val;
+                            })
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-rose-300"
+                        />
+                      </div>
+
+                      <div className="sm:col-span-2 lg:col-span-3">
+                        <label className="text-xs text-cyan-300 font-bold block mb-1">
+                          3D Body Silhouette (10 Models — Changes Preview Instantly on the Right →)
+                        </label>
+                        <select
+                          aria-label="3D Body Silhouette (10 Models)"
+                          value={selectedSpecies.bodyStyle}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.bodyStyle = e.target.value as SpeciesConfig['bodyStyle'];
+                            })
+                          }
+                          className="w-full bg-slate-900 border-2 border-cyan-500/60 rounded-lg px-3 py-2 text-xs font-bold text-white"
+                        >
+                          <option value="fusiform_reef">1. Streamlined Reef / Tetra (fusiform_reef)</option>
+                          <option value="angel_disc">2. Tall Angelfish / Discus (angel_disc)</option>
+                          <option value="biolum_Latern">3. Deep-Sea Lantern / Eel (biolum_Latern)</option>
+                          <option value="mandarin_dragonet">4. Ornate Fan-Fin Dragonet (mandarin_dragonet)</option>
+                          <option value="betta_veil">5. Flowing Veil-Tail Betta (betta_veil)</option>
+                          <option value="shark_torpedo">6. Sleek Torpedo Shark / Bala (shark_torpedo)</option>
+                          <option value="puffer_round">7. Round Pea / Box Puffer (puffer_round)</option>
+                          <option value="tang_surgeon">8. Oval Reef Surgeonfish / Tang (tang_surgeon)</option>
+                          <option value="koi_dragon">9. Heavy Barbels Dragon Koi (koi_dragon)</option>
+                          <option value="lionfish_fan">10. Spiny Fan-Crest Lionfish (lionfish_fan)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Primary Body Color
+                        </label>
+                        <input
+                          type="color"
+                          value={selectedSpecies.primaryColorHex}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.primaryColorHex = e.target.value;
+                            })
+                          }
+                          className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Secondary Color
+                        </label>
+                        <input
+                          type="color"
+                          value={selectedSpecies.secondaryColorHex}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.secondaryColorHex = e.target.value;
+                            })
+                          }
+                          className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs text-slate-400 block mb-1">
+                          Fin Accent Color
+                        </label>
+                        <input
+                          type="color"
+                          value={selectedSpecies.accentColorHex}
+                          onChange={(e) =>
+                            handleUpdateSelectedSpeciesField((s) => {
+                              s.accentColorHex = e.target.value;
+                            })
+                          }
+                          className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Quick 10-Button 3D Silhouette Switcher Bar */}
+                    <div className="p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-mono font-bold uppercase text-cyan-300">
+                          Quick-Switch 3D Model (Click Any to Preview on {selectedSpecies.name})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedCatalogModelId(selectedSpecies.bodyStyle);
+                            setActiveTab('models_3d');
+                          }}
+                          className="text-[11px] font-mono font-bold text-fuchsia-300 hover:text-fuchsia-200 underline"
+                        >
+                          Open Full 3D Models Catalog →
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+                        {FISH_3D_MODELS_CATALOG.map((m) => {
+                          const isCurrent = selectedSpecies.bodyStyle === m.id;
+                          return (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() =>
+                                handleUpdateSelectedSpeciesField((s) => {
+                                  s.bodyStyle = m.id;
+                                })
+                              }
+                              className={`px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold text-left truncate border transition-colors ${
+                                isCurrent
+                                  ? 'bg-cyan-400 text-slate-950 border-white shadow'
+                                  : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-cyan-500/60 hover:text-white'
+                              }`}
+                              title={m.name}
+                            >
+                              #{m.index} {m.shortName}
+                            </button>
                           );
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Reproduction Interval (Hours)
-                    </label>
-                    <input
-                      type="number"
-                      min={0.5}
-                      max={100}
-                      step={0.5}
-                      value={selectedSpecies.lifespan.reproductionIntervalHours}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.lifespan.reproductionIntervalHours = Math.max(
-                            0.5,
-                            Number(e.target.value) || 3
-                          );
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Metabolism Burn (Energy / Hour)
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={30}
-                      step={0.5}
-                      value={selectedSpecies.lifespan.metabolismEnergyPerHour}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.lifespan.metabolismEnergyPerHour = Math.max(
-                            1,
-                            Number(e.target.value) || 6.5
-                          );
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Required Owner Level (Shop Unlock)
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={30}
-                      step={1}
-                      value={selectedSpecies.requiredOwnerLevel || 1}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.requiredOwnerLevel = Math.max(1, Number(e.target.value) || 1);
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-amber-300"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Shop Price (Bio-Credits)
-                    </label>
-                    <input
-                      type="number"
-                      min={10}
-                      max={2000}
-                      step={5}
-                      value={selectedSpecies.shopPriceCredits || 45}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.shopPriceCredits = Math.max(10, Number(e.target.value) || 45);
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-amber-300"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      3D Body Silhouette (10 Models)
-                    </label>
-                    <select
-                      value={selectedSpecies.bodyStyle}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.bodyStyle = e.target.value as SpeciesConfig['bodyStyle'];
-                        })
-                      }
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-                    >
-                      <option value="fusiform_reef">1. Streamlined Reef / Tetra (fusiform_reef)</option>
-                      <option value="angel_disc">2. Tall Angelfish / Discus (angel_disc)</option>
-                      <option value="biolum_Latern">3. Deep-Sea Lantern / Eel (biolum_Latern)</option>
-                      <option value="mandarin_dragonet">4. Ornate Fan-Fin Dragonet (mandarin_dragonet)</option>
-                      <option value="betta_veil">5. Flowing Veil-Tail Betta (betta_veil)</option>
-                      <option value="shark_torpedo">6. Sleek Torpedo Shark / Bala (shark_torpedo)</option>
-                      <option value="puffer_round">7. Round Pea / Box Puffer (puffer_round)</option>
-                      <option value="tang_surgeon">8. Oval Reef Surgeonfish / Tang (tang_surgeon)</option>
-                      <option value="koi_dragon">9. Heavy Barbels Dragon Koi (koi_dragon)</option>
-                      <option value="lionfish_fan">10. Spiny Fan-Crest Lionfish (lionfish_fan)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      Aggressiveness (0 = Peaceful, &gt;0 = Attack Frequency)
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        value={Number((selectedSpecies.baseBrainConfig.aggressiveness ?? 0).toFixed(2))}
-                        onChange={(e) =>
-                          handleUpdateSelectedSpeciesField((s) => {
-                            const val = Math.max(0, Math.min(1, Number(e.target.value) || 0));
-                            s.baseBrainConfig.aggressiveness = val < 0.02 ? 0 : val;
-                          })
-                        }
-                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-rose-300"
-                      />
+                        })}
+                      </div>
                     </div>
                   </div>
 
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">Primary Body Color</label>
-                    <input
-                      type="color"
-                      value={selectedSpecies.primaryColorHex}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.primaryColorHex = e.target.value;
-                        })
-                      }
-                      className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
+                  {/* Right 5 Columns: Live Interactive 3D Fish Model Preview */}
+                  <div className="lg:col-span-5 space-y-2">
+                    <FishModelPreview3D
+                      bodyStyle={selectedSpecies.bodyStyle}
+                      primaryColorHex={selectedSpecies.primaryColorHex}
+                      secondaryColorHex={selectedSpecies.secondaryColorHex}
+                      accentColorHex={selectedSpecies.accentColorHex}
+                      speciesName={selectedSpecies.name}
+                      aggressiveness={selectedSpecies.baseBrainConfig.aggressiveness ?? 0}
+                      heightClass="h-64"
                     />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">Secondary Color</label>
-                    <input
-                      type="color"
-                      value={selectedSpecies.secondaryColorHex}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.secondaryColorHex = e.target.value;
-                        })
-                      }
-                      className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">Fin Accent Color</label>
-                    <input
-                      type="color"
-                      value={selectedSpecies.accentColorHex}
-                      onChange={(e) =>
-                        handleUpdateSelectedSpeciesField((s) => {
-                          s.accentColorHex = e.target.value;
-                        })
-                      }
-                      className="w-full h-9 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 cursor-pointer"
-                    />
+                    <div className="px-3 py-2 rounded-xl bg-slate-900/80 border border-slate-800 text-[11px] text-slate-300 flex items-center justify-between gap-2">
+                      <span>
+                        Drag in 3D view to rotate · Scroll to zoom · Test Attack Lunge &amp; Reactions
+                        above
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -4651,6 +4762,292 @@ export const TrainerApp: React.FC = () => {
               </div>
             </div>
           )}
+
+          {/* =====================================================================
+              TAB 6: 3D FISH MODELS CATALOG & INTERACTIVE TURNTABLE STUDIO
+             ===================================================================== */}
+          {activeTab === 'models_3d' && (() => {
+            const activeCatalogModel =
+              FISH_3D_MODELS_CATALOG.find((m) => m.id === selectedCatalogModelId) ||
+              FISH_3D_MODELS_CATALOG[0];
+
+            const previewPrimary =
+              catalogColorMode === 'species'
+                ? selectedSpecies.primaryColorHex
+                : activeCatalogModel.defaultColors.primary;
+            const previewSecondary =
+              catalogColorMode === 'species'
+                ? selectedSpecies.secondaryColorHex
+                : activeCatalogModel.defaultColors.secondary;
+            const previewAccent =
+              catalogColorMode === 'species'
+                ? selectedSpecies.accentColorHex
+                : activeCatalogModel.defaultColors.accent;
+
+            const matchingActiveSpecies = ecosystem.speciesList.filter(
+              (s) => s.bodyStyle === activeCatalogModel.id
+            );
+
+            return (
+              <div className="space-y-6">
+                {/* Top Studio Card: Large Interactive 3D Viewport + Anatomy & Apply Panel */}
+                <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 space-y-5">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <span className="text-[11px] font-mono font-extrabold uppercase tracking-widest text-fuchsia-300">
+                        PROCEDURAL 3D SILHOUETTE STUDIO · 10 ANATOMICAL RIGS
+                      </span>
+                      <h2 className="text-lg font-extrabold text-white mt-0.5">
+                        #{activeCatalogModel.index}. {activeCatalogModel.name} (
+                        <code className="text-cyan-300 text-sm">{activeCatalogModel.id}</code>)
+                      </h2>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="flex items-center rounded-xl bg-slate-950 p-1 border border-slate-800 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setCatalogColorMode('default')}
+                          className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                            catalogColorMode === 'default'
+                              ? 'bg-fuchsia-400 text-slate-950'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          Model Signature Colors
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCatalogColorMode('species')}
+                          className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                            catalogColorMode === 'species'
+                              ? 'bg-cyan-400 text-slate-950'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          Use {selectedSpecies.name} Colors
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          handleUpdateSelectedSpeciesField((s) => {
+                            s.bodyStyle = activeCatalogModel.id;
+                            if (catalogColorMode === 'default') {
+                              s.primaryColorHex = activeCatalogModel.defaultColors.primary;
+                              s.secondaryColorHex = activeCatalogModel.defaultColors.secondary;
+                              s.accentColorHex = activeCatalogModel.defaultColors.accent;
+                            }
+                          });
+                          await handleSaveSpeciesPropertiesToFirestore();
+                          setStatusBanner(
+                            `Applied 3D Model #${activeCatalogModel.index} (${activeCatalogModel.name}) to ${selectedSpecies.name} and saved to Firestore!`
+                          );
+                        }}
+                        className="px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold shadow-lg transition-colors"
+                      >
+                        Apply Model to {selectedSpecies.name} &amp; Save
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                    {/* Left 7 Columns: Large Interactive 3D Fish Viewport */}
+                    <div className="lg:col-span-7">
+                      <FishModelPreview3D
+                        bodyStyle={activeCatalogModel.id}
+                        primaryColorHex={previewPrimary}
+                        secondaryColorHex={previewSecondary}
+                        accentColorHex={previewAccent}
+                        aggressiveness={selectedSpecies.baseBrainConfig.aggressiveness ?? 0}
+                        heightClass="h-80"
+                      />
+                    </div>
+
+                    {/* Right 5 Columns: Anatomical Breakdown & Assign to Any Species */}
+                    <div className="lg:col-span-5 space-y-4">
+                      <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3 text-xs">
+                        <div>
+                          <div className="text-[10px] font-mono uppercase text-cyan-300 font-bold">
+                            3D Hull &amp; Body Lofting
+                          </div>
+                          <p className="text-slate-200 mt-0.5 leading-relaxed">
+                            {activeCatalogModel.anatomySummary}
+                          </p>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-800">
+                          <div className="text-[10px] font-mono uppercase text-emerald-300 font-bold">
+                            Articulated Fin Geometry
+                          </div>
+                          <p className="text-slate-200 mt-0.5 leading-relaxed">
+                            {activeCatalogModel.finProfile}
+                          </p>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-800">
+                          <div className="text-[10px] font-mono uppercase text-amber-300 font-bold">
+                            Signature Anatomical Feature
+                          </div>
+                          <p className="text-slate-200 mt-0.5 leading-relaxed">
+                            {activeCatalogModel.specialFeature}
+                          </p>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-800">
+                          <div className="text-[10px] font-mono uppercase text-fuchsia-300 font-bold">
+                            Real-World Aquarium Examples
+                          </div>
+                          <p className="text-slate-300 mt-0.5">{activeCatalogModel.exampleSpecies}</p>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
+                          <span className="text-slate-400">Signature Palette:</span>
+                          <div className="flex items-center gap-2 font-mono text-[11px]">
+                            <span className="flex items-center gap-1">
+                              <span
+                                className="w-3.5 h-3.5 rounded-full border border-white/30"
+                                style={{ backgroundColor: activeCatalogModel.defaultColors.primary }}
+                              />
+                              {activeCatalogModel.defaultColors.primary}
+                            </span>
+                            <span className="flex items-center gap-1">
+                              <span
+                                className="w-3.5 h-3.5 rounded-full border border-white/30"
+                                style={{
+                                  backgroundColor: activeCatalogModel.defaultColors.secondary,
+                                }}
+                              />
+                              {activeCatalogModel.defaultColors.secondary}
+                            </span>
+                            <span className="flex items-center gap-1">
+                              <span
+                                className="w-3.5 h-3.5 rounded-full border border-white/30"
+                                style={{ backgroundColor: activeCatalogModel.defaultColors.accent }}
+                              />
+                              {activeCatalogModel.defaultColors.accent}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5">
+                        <label className="text-xs font-bold text-white block">
+                          Target Species to Receive This 3D Model:
+                        </label>
+                        <select
+                          aria-label="Target Species for 3D Model"
+                          value={selectedSpecies.id}
+                          onChange={(e) => setSelectedSpeciesId(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs font-bold text-cyan-300"
+                        >
+                          {ecosystem.speciesList.map((sp) => (
+                            <option key={sp.id} value={sp.id}>
+                              {sp.name} (Currently: {sp.bodyStyle})
+                            </option>
+                          ))}
+                        </select>
+                        <div className="text-[11px] text-slate-400">
+                          Active species currently using <code className="text-cyan-300">{activeCatalogModel.id}</code>:{' '}
+                          <strong className="text-white">
+                            {matchingActiveSpecies.length > 0
+                              ? matchingActiveSpecies.map((s) => s.name).join(', ')
+                              : 'None yet'}
+                          </strong>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Bottom Grid: All 10 Procedural 3D Fish Models Catalog */}
+                <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-base font-bold text-white">
+                        All 10 Procedural 3D Fish Models Catalog
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Click any 3D model card below to load it into the interactive 3D Turntable
+                        Studio above.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
+                    {FISH_3D_MODELS_CATALOG.map((m) => {
+                      const isSelectedModel = selectedCatalogModelId === m.id;
+                      const isUsedBySelectedSpecies = selectedSpecies.bodyStyle === m.id;
+                      return (
+                        <div
+                          key={m.id}
+                          onClick={() => setSelectedCatalogModelId(m.id)}
+                          className={`p-4 rounded-xl border transition-all cursor-pointer flex flex-col justify-between gap-3 ${
+                            isSelectedModel
+                              ? 'bg-fuchsia-950/50 border-2 border-fuchsia-400 ring-2 ring-fuchsia-400/25 shadow-lg'
+                              : 'bg-slate-900/90 border-slate-800 hover:border-cyan-500/60'
+                          }`}
+                        >
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span className="px-2 py-0.5 rounded bg-slate-800 text-[10px] font-mono font-extrabold text-cyan-300">
+                                MODEL #{m.index}
+                              </span>
+                              <div className="flex items-center gap-1">
+                                <span
+                                  className="w-3 h-3 rounded-full border border-white/30"
+                                  style={{ backgroundColor: m.defaultColors.primary }}
+                                />
+                                <span
+                                  className="w-3 h-3 rounded-full border border-white/30"
+                                  style={{ backgroundColor: m.defaultColors.accent }}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="text-xs font-extrabold text-white">{m.name}</div>
+                            <div className="text-[10px] font-mono text-cyan-300">{m.id}</div>
+                            <p className="text-[11px] text-slate-400 line-clamp-2">
+                              {m.anatomySummary}
+                            </p>
+                          </div>
+
+                          <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                            {isUsedBySelectedSpecies && (
+                              <div className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-[10px] font-mono font-bold text-center">
+                                Active on {selectedSpecies.name}
+                              </div>
+                            )}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedCatalogModelId(m.id);
+                                handleUpdateSelectedSpeciesField((s) => {
+                                  s.bodyStyle = m.id;
+                                });
+                                setStatusBanner(
+                                  `Previewing & assigned Model #${m.index} (${m.shortName}) to ${selectedSpecies.name}. Click "Save Properties" to persist to Firestore.`
+                                );
+                              }}
+                              className={`w-full py-1.5 rounded-lg text-[11px] font-mono font-bold transition-colors ${
+                                isSelectedModel
+                                  ? 'bg-fuchsia-400 text-slate-950 hover:bg-fuchsia-300'
+                                  : 'bg-slate-800 text-cyan-300 hover:bg-cyan-400 hover:text-slate-950'
+                              }`}
+                            >
+                              {isSelectedModel ? 'Previewing in 3D Studio' : 'Preview & Use Model'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       </main>
 
