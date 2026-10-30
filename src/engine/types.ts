@@ -56,6 +56,8 @@ export interface BrainConfig {
   attentionModuleEnabled: boolean;
   evasionModuleEnabled: boolean;
   schoolingModuleEnabled: boolean;
+  /** Aggressiveness behavior (0 = peaceful/disabled, >0 = periodic attack lunge frequency & intensity 0.01..1.0) */
+  aggressiveness?: number;
 }
 
 export interface BrainValidationMetrics {
@@ -84,6 +86,18 @@ export interface SpeciesLifespanConfig {
   speciesTimeMultiplier: number; // 1.0 default
 }
 
+export type FishBodyStyle =
+  | 'fusiform_reef'
+  | 'angel_disc'
+  | 'biolum_Latern'
+  | 'mandarin_dragonet'
+  | 'betta_veil'
+  | 'shark_torpedo'
+  | 'puffer_round'
+  | 'tang_surgeon'
+  | 'koi_dragon'
+  | 'lionfish_fan';
+
 export interface SpeciesConfig {
   id: string;
   name: string;
@@ -92,7 +106,7 @@ export interface SpeciesConfig {
   category?: 'freshwater' | 'marine' | 'cichlid' | 'specialty';
   requiredOwnerLevel?: number;
   shopPriceCredits?: number;
-  bodyStyle: 'fusiform_reef' | 'angel_disc' | 'biolum_Latern' | 'mandarin_dragonet';
+  bodyStyle: FishBodyStyle;
   primaryColorHex: string;
   secondaryColorHex: string;
   accentColorHex: string;
@@ -175,6 +189,7 @@ export interface FishGeneticsData {
   threatDetectionGene: number;
   foragingDriveGene: number;
   socialSchoolingGene: number;
+  aggressivenessGene?: number; // 0 (peaceful) .. 1.0 (highly aggressive, only active if > 0)
 }
 
 // 3. Individual Brain Parameters Category
@@ -186,6 +201,7 @@ export interface FishBrainInstance {
     activation: ActivationType;
     recurrentMemoryEnabled: boolean;
     attentionModuleEnabled: boolean;
+    aggressiveness?: number;
   };
   inheritedWeights: number[][];
   inheritedBiases: number[][];
@@ -228,6 +244,14 @@ export interface FishBiologicalState {
   gestationHoursRemaining: number;
   gravidPartnerId: string | null;
   independenceHoursRemaining: number;
+  attackCooldownHours?: number;
+  lastAttackTargetId?: string | null;
+  attackReactionKind?: 'slowed_down' | 'flee_dart' | 'counter_attack' | null;
+  attackReactionHoursRemaining?: number;
+  attackReactionDirX?: number;
+  attackReactionDirY?: number;
+  attackReactionDirZ?: number;
+  attackReactionAttackerId?: string | null;
   // Spatial kinematics
   x: number;
   y: number;
@@ -251,6 +275,8 @@ export interface FishBiologicalState {
     offspringProduced: number;
     lifetimeReward: number;
     decisionsMade: number;
+    attacksPerformed?: number;
+    counterAttacksPerformed?: number;
   };
   episodicMemory: EpisodicMemoryEntry[];
   personality: FishPersonality;

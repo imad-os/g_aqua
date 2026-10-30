@@ -18,6 +18,7 @@ export interface FamousAquariumFishTemplate {
   metabolismEnergyPerHour: number;
   requiredOwnerLevel: number;
   shopPriceCredits: number;
+  aggressiveness?: number;
   description: string;
 }
 
@@ -47,7 +48,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Fancy Delta Guppy',
     scientificName: 'Poecilia reticulata',
     category: 'freshwater',
-    bodyStyle: 'fusiform_reef',
+    bodyStyle: 'betta_veil',
     primaryColorHex: '#f59e0b',
     secondaryColorHex: '#3b82f6',
     accentColorHex: '#fbbf24',
@@ -66,7 +67,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Siamese Fighting Fish (Betta)',
     scientificName: 'Betta splendens',
     category: 'freshwater',
-    bodyStyle: 'mandarin_dragonet',
+    bodyStyle: 'betta_veil',
     primaryColorHex: '#e11d48',
     secondaryColorHex: '#4f46e5',
     accentColorHex: '#f43f5e',
@@ -77,6 +78,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 6.2,
     requiredOwnerLevel: 1,
     shopPriceCredits: 55,
+    aggressiveness: 0.45,
     description: 'Majestic labyrinth fish with dramatic flowing fins and bold surface-patrolling intelligence.',
   },
   {
@@ -142,7 +144,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Regal Blue Surgeonfish (Blue Tang)',
     scientificName: 'Paracanthurus hepatus',
     category: 'marine',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'tang_surgeon',
     primaryColorHex: '#2563eb',
     secondaryColorHex: '#0f172a',
     accentColorHex: '#facc15',
@@ -256,7 +258,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Red Tiger Oscar',
     scientificName: 'Astronotus ocellatus',
     category: 'cichlid',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'koi_dragon',
     primaryColorHex: '#1e293b',
     secondaryColorHex: '#ea580c',
     accentColorHex: '#f97316',
@@ -267,6 +269,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 8.2,
     requiredOwnerLevel: 4,
     shopPriceCredits: 130,
+    aggressiveness: 0.35,
     description: 'Highly perceptive South American cichlid famous for recognizing its owner at feeding time.',
   },
   {
@@ -541,7 +544,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Imperial Kohaku Koi',
     scientificName: 'Cyprinus rubrofuscus',
     category: 'specialty',
-    bodyStyle: 'fusiform_reef',
+    bodyStyle: 'koi_dragon',
     primaryColorHex: '#ffffff',
     secondaryColorHex: '#dc2626',
     accentColorHex: '#f59e0b',
@@ -571,6 +574,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 7.1,
     requiredOwnerLevel: 3,
     shopPriceCredits: 95,
+    aggressiveness: 0.2,
     description: 'Lake Malawi mbuna cichlid with canary-yellow coloration and a jet-black dorsal edge.',
   },
   {
@@ -598,7 +602,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Super Red Asian Arowana',
     scientificName: 'Scleropages formosus',
     category: 'specialty',
-    bodyStyle: 'biolum_Latern',
+    bodyStyle: 'koi_dragon',
     primaryColorHex: '#dc2626',
     secondaryColorHex: '#f59e0b',
     accentColorHex: '#fef08a',
@@ -609,6 +613,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 7.8,
     requiredOwnerLevel: 7,
     shopPriceCredits: 280,
+    aggressiveness: 0.4,
     description: 'Legendary Dragon Fish with metallic crimson-gold armor scales and surface-gliding majesty.',
   },
   {
@@ -617,7 +622,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Golden Base Flowerhorn',
     scientificName: 'Cichlasoma hybrid',
     category: 'cichlid',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'koi_dragon',
     primaryColorHex: '#e11d48',
     secondaryColorHex: '#06b6d4',
     accentColorHex: '#fde047',
@@ -628,6 +633,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 7.9,
     requiredOwnerLevel: 6,
     shopPriceCredits: 220,
+    aggressiveness: 0.5,
     description: 'Showpiece hybrid cichlid covered in iridescent pearl spangles with bold interactive personality.',
   },
   {
@@ -712,7 +718,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Denison Barb (Roseline Shark)',
     scientificName: 'Sahyadria denisonii',
     category: 'freshwater',
-    bodyStyle: 'fusiform_reef',
+    bodyStyle: 'shark_torpedo',
     primaryColorHex: '#cbd5e1',
     secondaryColorHex: '#ef4444',
     accentColorHex: '#facc15',
@@ -731,7 +737,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Blue Lyretail Killifish',
     scientificName: 'Fundulopanchax gardneri',
     category: 'specialty',
-    bodyStyle: 'mandarin_dragonet',
+    bodyStyle: 'betta_veil',
     primaryColorHex: '#06b6d4',
     secondaryColorHex: '#e11d48',
     accentColorHex: '#facc15',
@@ -750,7 +756,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Dwarf Malabar Pea Puffer',
     scientificName: 'Carinotetraodon travancoricus',
     category: 'specialty',
-    bodyStyle: 'mandarin_dragonet',
+    bodyStyle: 'puffer_round',
     primaryColorHex: '#eab308',
     secondaryColorHex: '#1e293b',
     accentColorHex: '#84cc16',
@@ -761,6 +767,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 6.2,
     requiredOwnerLevel: 4,
     shopPriceCredits: 110,
+    aggressiveness: 0.3,
     description: 'Pint-sized freshwater puffer with helicopter-like pectoral fins and high curiosity.',
   },
   {
@@ -769,7 +776,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Hawaiian Yellow Tang',
     scientificName: 'Zebrasoma flavescens',
     category: 'marine',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'tang_surgeon',
     primaryColorHex: '#facc15',
     secondaryColorHex: '#eab308',
     accentColorHex: '#fef08a',
@@ -883,7 +890,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Copperband Butterflyfish',
     scientificName: 'Chelmon rostratus',
     category: 'marine',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'tang_surgeon',
     primaryColorHex: '#f8fafc',
     secondaryColorHex: '#d97706',
     accentColorHex: '#0f172a',
@@ -902,7 +909,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Moorish Idol',
     scientificName: 'Zanclus cornutus',
     category: 'marine',
-    bodyStyle: 'angel_disc',
+    bodyStyle: 'tang_surgeon',
     primaryColorHex: '#fef08a',
     secondaryColorHex: '#0f172a',
     accentColorHex: '#ffffff',
@@ -921,7 +928,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     name: 'Red Volitan Lionfish',
     scientificName: 'Pterois volitans',
     category: 'marine',
-    bodyStyle: 'mandarin_dragonet',
+    bodyStyle: 'lionfish_fan',
     primaryColorHex: '#991b1b',
     secondaryColorHex: '#fef2f2',
     accentColorHex: '#f97316',
@@ -932,6 +939,7 @@ export const FAMOUS_AQUARIUM_FISHES_50: FamousAquariumFishTemplate[] = [
     metabolismEnergyPerHour: 6.7,
     requiredOwnerLevel: 6,
     shopPriceCredits: 230,
+    aggressiveness: 0.45,
     description: 'Regal plumed reef glider with dramatic zebra-striped pectoral fans and calm hovering poise.',
   },
   {
@@ -1006,6 +1014,9 @@ export function createSpeciesConfigFromFamousFish(
       recoverySpeedPerHour: 9.5,
       speciesTimeMultiplier: 1.0,
     },
-    baseBrainConfig: { ...DEFAULT_BRAIN_CONFIG },
+    baseBrainConfig: {
+      ...DEFAULT_BRAIN_CONFIG,
+      aggressiveness: template.aggressiveness ?? 0,
+    },
   };
 }

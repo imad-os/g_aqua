@@ -177,6 +177,7 @@ export function createBaseBrainInstance(
       activation: config.activation,
       recurrentMemoryEnabled: config.recurrentMemoryEnabled,
       attentionModuleEnabled: config.attentionModuleEnabled,
+      aggressiveness: Number(Math.max(0, Math.min(1, config.aggressiveness ?? 0)).toFixed(3)),
     },
     inheritedWeights,
     inheritedBiases,
@@ -201,6 +202,7 @@ export function deepCloneBrain(brain: FishBrainInstance): FishBrainInstance {
       activation: brain.architecture.activation,
       recurrentMemoryEnabled: brain.architecture.recurrentMemoryEnabled,
       attentionModuleEnabled: brain.architecture.attentionModuleEnabled,
+      aggressiveness: brain.architecture.aggressiveness ?? 0,
     },
     inheritedWeights: brain.inheritedWeights.map((layer) => [...layer]),
     inheritedBiases: brain.inheritedBiases.map((layer) => [...layer]),
@@ -319,6 +321,24 @@ export function inheritOffspringBrain(
     const shift = (rng() - 0.48) * 0.35;
     child.attentionGates[idx] = Math.max(0.2, Math.min(2.0, child.attentionGates[idx] + shift));
     mutationsApplied.push(`SensoryAttention[ch${idx}]${shift >= 0 ? '+' : ''}${shift.toFixed(2)}`);
+  }
+
+  // Evolve aggressiveness property ONLY for brains that have aggressiveness > 0
+  const motherAgg = motherBrain.architecture.aggressiveness ?? brainConfig.aggressiveness ?? 0;
+  const fatherAgg = fatherBrain?.architecture.aggressiveness ?? 0;
+  if (motherAgg > 0 || (brainConfig.aggressiveness ?? 0) > 0) {
+    let nextAgg = motherAgg > 0 ? motherAgg : brainConfig.aggressiveness || 0.1;
+    if (fatherAgg > 0 && rng() < evoConfig.fatherTraitInheritanceProb) {
+      nextAgg = nextAgg * 0.55 + fatherAgg * 0.45;
+    }
+    if (rng() < Math.max(0.25, effectiveMutRate * 1.8)) {
+      const aggDelta = gaussianRandom(rng) * effectiveMutMag * 0.35;
+      nextAgg = Math.max(0.02, Math.min(1.0, nextAgg + aggDelta));
+      mutationsApplied.push(`Aggressiveness${aggDelta >= 0 ? '+' : ''}${aggDelta.toFixed(2)}`);
+    }
+    child.architecture.aggressiveness = Number(nextAgg.toFixed(3));
+  } else {
+    child.architecture.aggressiveness = 0;
   }
 
   if (weightsMutatedCount > 0) {

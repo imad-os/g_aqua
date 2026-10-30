@@ -53,6 +53,7 @@ export function createInitialGenetics(rng: () => number = Math.random): FishGene
     threatDetectionGene: Number((0.95 + (rng() - 0.5) * 0.2).toFixed(3)),
     foragingDriveGene: Number((1.0 + (rng() - 0.5) * 0.25).toFixed(3)),
     socialSchoolingGene: Number((0.6 + rng() * 0.5).toFixed(3)),
+    aggressivenessGene: 0,
   };
 }
 
@@ -147,6 +148,16 @@ export function inheritGenetics(
       1.5,
       'Schooling'
     ),
+    aggressivenessGene:
+      (motherDNA.aggressivenessGene ?? 0) > 0 || (fatherDNA?.aggressivenessGene ?? 0) > 0
+        ? inheritScalar(
+            motherDNA.aggressivenessGene || fatherDNA?.aggressivenessGene || 0.1,
+            fatherDNA?.aggressivenessGene,
+            0.02,
+            1.0,
+            'Aggressiveness'
+          )
+        : 0,
   };
 
   return { genetics, traitMutations: muts };
@@ -292,7 +303,12 @@ export function spawnFoundingFish(
       cumulativeMutationDrift: Number(driftAmount.toFixed(3)),
       tankId: tank.id,
     },
-    genetics: createInitialGenetics(rng),
+    genetics: {
+      ...createInitialGenetics(rng),
+      aggressivenessGene: Number(
+        Math.max(0, Math.min(1, species.baseBrainConfig.aggressiveness ?? 0)).toFixed(3)
+      ),
+    },
     brain,
     state: {
       ageSimHours: initialAge,
@@ -308,6 +324,8 @@ export function spawnFoundingFish(
       gestationHoursRemaining: 0,
       gravidPartnerId: null,
       independenceHoursRemaining: 0,
+      attackCooldownHours: Number((0.25 + rng() * 0.4).toFixed(2)),
+      lastAttackTargetId: null,
       x: (rng() - 0.5) * sliceBounds.halfW * 1.6,
       y: sliceBounds.centerY + (rng() - 0.5) * sliceBounds.halfH * 1.3,
       z: spawnZ,
@@ -328,6 +346,7 @@ export function spawnFoundingFish(
         offspringProduced: 0,
         lifetimeReward: 0,
         decisionsMade: 0,
+        attacksPerformed: 0,
       },
       episodicMemory: [],
       personality: {
@@ -424,6 +443,8 @@ export function reproduceOffspringFish(
       gravidPartnerId: null,
       independenceHoursRemaining:
         species.lifespan.eggIncubationHours + species.lifespan.offspringIndependenceHours,
+      attackCooldownHours: Number((0.35 + rng() * 0.45).toFixed(2)),
+      lastAttackTargetId: null,
       x: mother.state.x + (rng() - 0.5) * 0.8,
       y: mother.state.y + (rng() - 0.5) * 0.5,
       z: mother.state.z + (rng() - 0.5) * 0.8,
@@ -444,6 +465,7 @@ export function reproduceOffspringFish(
         offspringProduced: 0,
         lifetimeReward: 0,
         decisionsMade: 0,
+        attacksPerformed: 0,
       },
       episodicMemory: inheritedMemories,
       personality: {
@@ -863,6 +885,213 @@ export function stepEcosystemSimulation(
       fish.state.metrics.threatsEvaded++;
     }
 
+    // 4b. Active Reaction State (if this fish was recently attacked: slowed down, small run away, or counter-attack)
+    if ((fish.state.attackReactionHoursRemaining ?? 0) > 0) {
+      const reactionDecay = Math.max(fishSimHoursDelta, realDtSeconds / 160);
+      fish.state.attackReactionHoursRemaining = Math.max(
+        0,
+        (fish.state.attackReactionHoursRemaining ?? 0) - reactionDecay
+      );
+      const rKind = fish.state.attackReactionKind;
+      const rDx = fish.state.attackReactionDirX ?? 0;
+      const rDy = fish.state.attackReactionDirY ?? 0;
+      const rDz = fish.state.attackReactionDirZ ?? 0;
+
+      if (rKind === 'slowed_down') {
+        // Visibly slowed down after taking a hit
+        targetVx *= 0.35;
+        targetVy *= 0.35;
+        targetVz *= 0.35;
+      } else if (rKind === 'flee_dart') {
+        // Very small, quick run-away dart away from the attacker
+        const dartSpeed = maxSpeed * 1.32;
+        targetVx = targetVx * 0.25 + rDx * dartSpeed * 0.75;
+        targetVy = targetVy * 0.4 + rDy * dartSpeed * 0.4;
+        targetVz = targetVz * 0.25 + rDz * dartSpeed * 0.75;
+      } else if (rKind === 'counter_attack') {
+        // Aggressive retaliation lunge back toward the attacker
+        const counterSpeed = maxSpeed * 1.4;
+        targetVx = targetVx * 0.2 + rDx * counterSpeed * 0.8;
+        targetVy = targetVy * 0.3 + rDy * counterSpeed * 0.7;
+        targetVz = targetVz * 0.2 + rDz * counterSpeed * 0.8;
+      }
+
+      if ((fish.state.attackReactionHoursRemaining ?? 0) <= 0) {
+        fish.state.attackReactionKind = null;
+        fish.state.attackReactionAttackerId = null;
+      }
+    }
+
+    // 4c. Aggressiveness Behavior: Simple periodic attack lunge ONLY for brains having aggressiveness > 0
+    const aggLevel = Math.max(
+      fish.brain.architecture.aggressiveness ?? 0,
+      brainCfg.aggressiveness ?? 0,
+      fish.genetics.aggressivenessGene ?? 0
+    );
+    let attackRewardThisTick = 0;
+
+    if (aggLevel > 0 && fish.state.lifeStage !== 'egg') {
+      fish.state.attackCooldownHours = Math.max(
+        0,
+        (fish.state.attackCooldownHours ?? 0) - fishSimHoursDelta
+      );
+      if ((fish.state.attackCooldownHours ?? 0) <= 0) {
+        const attackSenseRange = (4.5 + aggLevel * 5.0) * fish.genetics.sensorRangeGene;
+        const attackSenseSq = attackSenseRange * attackSenseRange;
+        let nearestPrey: FishEntity | null = null;
+        let nearestPreyDistSq = Infinity;
+
+        for (let oIdx = 0; oIdx < ecosystem.fishes.length; oIdx++) {
+          if (oIdx === idx) continue;
+          const other = ecosystem.fishes[oIdx];
+          if (
+            !other.lineage.alive ||
+            other.lineage.tankId !== fish.lineage.tankId ||
+            other.state.lifeStage === 'egg'
+          ) {
+            continue;
+          }
+          const dx = other.state.x - fish.state.x;
+          const dy = other.state.y - fish.state.y;
+          const dz = other.state.z - fish.state.z;
+          const dSq = dx * dx + dy * dy + dz * dz;
+          if (dSq < nearestPreyDistSq && dSq <= attackSenseSq) {
+            nearestPreyDistSq = dSq;
+            nearestPrey = other;
+          }
+        }
+
+        if (nearestPrey) {
+          const dist = Math.max(0.05, Math.sqrt(nearestPreyDistSq));
+          const dirX = (nearestPrey.state.x - fish.state.x) / dist;
+          const dirY = (nearestPrey.state.y - fish.state.y) / dist;
+          const dirZ = (nearestPrey.state.z - fish.state.z) / dist;
+          const lungeSpeed = maxSpeed * (1.28 + aggLevel * 0.55);
+          const lungeBlend = Math.min(0.88, 0.45 + aggLevel * 0.45);
+
+          targetVx = targetVx * (1 - lungeBlend) + dirX * lungeSpeed * lungeBlend;
+          targetVy = targetVy * (1 - lungeBlend) + dirY * lungeSpeed * lungeBlend;
+          targetVz = targetVz * (1 - lungeBlend) + dirZ * lungeSpeed * lungeBlend;
+
+          if (dist < 1.65) {
+            // Simple attack strike: drain small energy/add stress on target
+            const energyHit = 3.5 + aggLevel * 5.5;
+            nearestPrey.state.energy = Math.max(6, nearestPrey.state.energy - energyHit);
+            nearestPrey.state.hunger = Math.min(100, 100 - nearestPrey.state.energy);
+            nearestPrey.state.stress = Math.min(100, nearestPrey.state.stress + 10 + aggLevel * 8);
+
+            // Determine Attacked Fish's Reaction:
+            // 1) Counter-Attack if target is also aggressive (aggressiveness > 0) and has higher/more frequent aggressiveness (or passes roll)
+            // 2) Very small run-away dart ('flee_dart')
+            // 3) Slowed down in shock ('slowed_down')
+            const preySpecies =
+              ecosystem.speciesList.find((s) => s.id === nearestPrey.lineage.speciesId) ||
+              DEFAULT_SPECIES_LIST[0];
+            const preyAggLevel = Math.max(
+              nearestPrey.brain.architecture.aggressiveness ?? 0,
+              preySpecies.baseBrainConfig.aggressiveness ?? 0,
+              nearestPrey.genetics.aggressivenessGene ?? 0
+            );
+
+            const canCounterAttack =
+              preyAggLevel > 0 &&
+              (preyAggLevel >= aggLevel || Math.random() < preyAggLevel * 0.95);
+
+            if (canCounterAttack) {
+              // Counter-Attack Reaction: Target lunges back at the attacker!
+              nearestPrey.state.attackReactionKind = 'counter_attack';
+              nearestPrey.state.attackReactionHoursRemaining = 0.032;
+              nearestPrey.state.attackReactionDirX = -dirX;
+              nearestPrey.state.attackReactionDirY = -dirY;
+              nearestPrey.state.attackReactionDirZ = -dirZ;
+              nearestPrey.state.attackReactionAttackerId = fish.lineage.fishId;
+
+              const counterForce = 1.6 + preyAggLevel * 1.5;
+              nearestPrey.state.vx = -dirX * counterForce;
+              nearestPrey.state.vy = -dirY * 0.6;
+              nearestPrey.state.vz = -dirZ * counterForce;
+
+              // Apply counter-attack hit back onto the original attacker
+              const counterDamage = 2.8 + preyAggLevel * 5.0;
+              fish.state.energy = Math.max(6, fish.state.energy - counterDamage);
+              fish.state.hunger = Math.min(100, 100 - fish.state.energy);
+              fish.state.stress = Math.min(100, fish.state.stress + 8 + preyAggLevel * 8);
+              fish.state.vx -= dirX * (1.7 + preyAggLevel * 1.3);
+              fish.state.vy -= dirY * 0.5;
+              fish.state.vz -= dirZ * (1.7 + preyAggLevel * 1.3);
+
+              // If the defender is MORE aggressive than the attacker, the attacker gets slowed down or darts back!
+              if (preyAggLevel > aggLevel) {
+                fish.state.attackReactionKind = 'flee_dart';
+                fish.state.attackReactionHoursRemaining = 0.024;
+                fish.state.attackReactionDirX = -dirX;
+                fish.state.attackReactionDirY = -dirY * 0.3;
+                fish.state.attackReactionDirZ = -dirZ;
+              }
+
+              nearestPrey.state.metrics.attacksPerformed =
+                (nearestPrey.state.metrics.attacksPerformed || 0) + 1;
+              nearestPrey.state.metrics.counterAttacksPerformed =
+                (nearestPrey.state.metrics.counterAttacksPerformed || 0) + 1;
+              nearestPrey.state.lastAttackTargetId = fish.lineage.fishId;
+              // More aggressive defender resets its attack cooldown much faster
+              nearestPrey.state.attackCooldownHours = Number(
+                Math.max(0.12, (1.1 - preyAggLevel * 0.85) * 0.75).toFixed(3)
+              );
+            } else if (Math.random() < 0.55) {
+              // Reaction: Very small run-away dart away from the attacker
+              nearestPrey.state.attackReactionKind = 'flee_dart';
+              nearestPrey.state.attackReactionHoursRemaining = 0.025;
+              nearestPrey.state.attackReactionDirX = dirX;
+              nearestPrey.state.attackReactionDirY = dirY * 0.35;
+              nearestPrey.state.attackReactionDirZ = dirZ;
+              nearestPrey.state.attackReactionAttackerId = fish.lineage.fishId;
+
+              nearestPrey.state.vx += dirX * 1.45;
+              nearestPrey.state.vy += dirY * 0.45;
+              nearestPrey.state.vz += dirZ * 1.45;
+              nearestPrey.state.metrics.threatsEvaded++;
+            } else {
+              // Reaction: Slowed down in shock after the hit
+              nearestPrey.state.attackReactionKind = 'slowed_down';
+              nearestPrey.state.attackReactionHoursRemaining = 0.042;
+              nearestPrey.state.attackReactionDirX = dirX;
+              nearestPrey.state.attackReactionDirY = dirY * 0.2;
+              nearestPrey.state.attackReactionDirZ = dirZ;
+              nearestPrey.state.attackReactionAttackerId = fish.lineage.fishId;
+
+              nearestPrey.state.vx = nearestPrey.state.vx * 0.32 + dirX * 0.45;
+              nearestPrey.state.vy = nearestPrey.state.vy * 0.32 + dirY * 0.18;
+              nearestPrey.state.vz = nearestPrey.state.vz * 0.32 + dirZ * 0.45;
+            }
+
+            nearestPrey.state.episodicMemory.unshift({
+              simHour: Number(ecosystem.simHoursTotal.toFixed(2)),
+              kind: 'hurt_hazard',
+              x: Number(fish.state.x.toFixed(2)),
+              y: Number(fish.state.y.toFixed(2)),
+              z: Number(fish.state.z.toFixed(2)),
+              valence: -0.8,
+              strength: 1.0,
+            });
+            if (nearestPrey.state.episodicMemory.length > brainCfg.memoryCapacity) {
+              nearestPrey.state.episodicMemory.pop();
+            }
+
+            fish.state.energy = Math.min(fish.state.maxEnergy, fish.state.energy + 2.5);
+            fish.state.hunger = Math.max(0, 100 - fish.state.energy);
+            fish.state.metrics.attacksPerformed = (fish.state.metrics.attacksPerformed || 0) + 1;
+            fish.state.lastAttackTargetId = nearestPrey.lineage.fishId;
+            // Cooldown scales inversely with aggressiveness so higher aggressiveness attacks more frequently
+            fish.state.attackCooldownHours = Number(
+              Math.max(0.16, (1.45 - aggLevel * 1.15) * (0.85 + Math.random() * 0.3)).toFixed(3)
+            );
+            attackRewardThisTick = 0.25 * aggLevel;
+          }
+        }
+      }
+    }
+
     // Soft curved frustum boundary steering inside aquarium walls (smaller in front, wider in back)
     const sliceHalfW = fishSliceBounds.halfW;
     const sliceHalfH = fishSliceBounds.halfH;
@@ -958,9 +1187,10 @@ export function stepEcosystemSimulation(
     }
 
     // Apply lifetime learning on reward signal
-    if (stepReward !== 0) {
-      fish.state.metrics.lifetimeReward += stepReward;
-      applyFishLifetimeLearning(fish.brain, stepReward, brainCfg);
+    const combinedReward = stepReward + attackRewardThisTick;
+    if (combinedReward !== 0) {
+      fish.state.metrics.lifetimeReward += combinedReward;
+      applyFishLifetimeLearning(fish.brain, combinedReward, brainCfg);
     }
 
     // 6. Gravid Gestation & Reproduction Check
@@ -1209,6 +1439,10 @@ export function runAcceleratedHeadlessTraining(
           activation: currentBase.brainConfig.activation,
           recurrentMemoryEnabled: currentBase.brainConfig.recurrentMemoryEnabled,
           attentionModuleEnabled: currentBase.brainConfig.attentionModuleEnabled,
+          aggressiveness:
+            currentBase.brainConfig.aggressiveness ??
+            species.baseBrainConfig.aggressiveness ??
+            0,
         },
         inheritedWeights: currentBase.weights.map((w) => [...w]),
         inheritedBiases: currentBase.biases.map((b) => [...b]),
@@ -1334,15 +1568,45 @@ export function runAcceleratedHeadlessTraining(
     currentBase && currentBase.speciesId === species.id
       ? currentBase.benchmark.overallComposite
       : 0;
-  const promoted = bestScore.overallComposite >= baselineScore + promotionThresholdDelta;
+
+  // If this brain has aggressiveness > 0, sync the evolved aggressiveness value back to the species baseBrainConfig
+  if ((species.baseBrainConfig.aggressiveness ?? 0) > 0 || (bestBrain.architecture.aggressiveness ?? 0) > 0) {
+    const evolvedAgg = Number(
+      Math.max(
+        0.02,
+        Math.min(
+          1.0,
+          bestBrain.architecture.aggressiveness ?? species.baseBrainConfig.aggressiveness ?? 0.25
+        )
+      ).toFixed(3)
+    );
+    bestBrain.architecture.aggressiveness = evolvedAgg;
+    species.baseBrainConfig.aggressiveness = evolvedAgg;
+  } else {
+    bestBrain.architecture.aggressiveness = 0;
+    species.baseBrainConfig.aggressiveness = 0;
+  }
+
+  // Every completed trained model is automatically set as the active/default base model for its species
+  const promoted = true;
 
   const existingSpeciesModels = ecosystem.modelRegistry.filter((m) => m.speciesId === species.id);
   const finalGenLabel =
     options?.totalGenerationsTrained ||
     (existingSpeciesModels[0]?.generationTrained || 0) + generationsToRun;
 
-  const nextVerSeq = existingSpeciesModels.length + 1;
+  const maxExistingVerSeq = existingSpeciesModels.reduce((maxSeq, m) => {
+    const match = m.versionId.match(/^v1\.(\d+)/);
+    return match ? Math.max(maxSeq, parseInt(match[1], 10) || 0) : maxSeq;
+  }, existingSpeciesModels.length);
+  const nextVerSeq = maxExistingVerSeq + 1;
   const newVersionId = `v1.${nextVerSeq}-G${finalGenLabel}`;
+
+  const deltaScore = Number((bestScore.overallComposite - baselineScore).toFixed(1));
+  const aggNote =
+    (species.baseBrainConfig.aggressiveness ?? 0) > 0
+      ? ` · Aggressiveness ${(species.baseBrainConfig.aggressiveness! * 100).toFixed(0)}%`
+      : '';
 
   const candidateModel: ModelVersionRecord = {
     versionId: newVersionId,
@@ -1351,14 +1615,12 @@ export function runAcceleratedHeadlessTraining(
       currentBase && currentBase.speciesId === species.id ? currentBase.versionId : null,
     createdAtIso: new Date().toISOString(),
     generationTrained: finalGenLabel,
-    isPromotedBase: promoted,
-    notes: promoted
-      ? `Trained ${finalGenLabel}G (+${(bestScore.overallComposite - baselineScore).toFixed(1)} composite vs ${
-          currentBase?.versionId || 'baseline'
-        })`
-      : `Trained ${finalGenLabel}G (score ${bestScore.overallComposite}%)`,
+    isPromotedBase: true,
+    notes: `Trained ${finalGenLabel}G (${deltaScore >= 0 ? '+' : ''}${deltaScore} composite vs ${
+      currentBase?.versionId || 'baseline'
+    }${aggNote})`,
     brainConfig: { ...species.baseBrainConfig },
-    speciesConfig: { ...species },
+    speciesConfig: { ...species, activeBaseModelVersion: newVersionId },
     weights: bestBrain.inheritedWeights.map((w) => [...w]),
     biases: bestBrain.inheritedBiases.map((b) => [...b]),
     benchmark: bestScore,
@@ -1366,26 +1628,25 @@ export function runAcceleratedHeadlessTraining(
 
   const shouldCommit = options?.commitVersionToRegistry !== false;
   if (shouldCommit) {
-    if (promoted) {
-      ecosystem.modelRegistry.forEach((m) => {
-        if (m.speciesId === species.id) m.isPromotedBase = false;
-      });
-      species.activeBaseModelVersion = newVersionId;
-    }
+    ecosystem.modelRegistry.forEach((m) => {
+      if (m.speciesId === species.id) m.isPromotedBase = false;
+    });
+    species.activeBaseModelVersion = newVersionId;
+    candidateModel.speciesConfig = { ...species };
     ecosystem.modelRegistry.unshift(candidateModel);
 
-    // Strictly keep only the last 10 versions for this fish species
-    const sameSp = ecosystem.modelRegistry.filter((m) => m.speciesId === species.id);
-    if (sameSp.length > 10) {
-      const otherSp = ecosystem.modelRegistry.filter((m) => m.speciesId !== species.id);
-      const keptSameSp = sameSp.slice(0, 10);
-      // Ensure promoted model stays inside the 10 kept versions
-      const droppedPromoted = sameSp.slice(10).find((m) => m.isPromotedBase);
-      if (droppedPromoted) {
-        keptSameSp[keptSameSp.length - 1] = droppedPromoted;
-      }
-      ecosystem.modelRegistry = [...keptSameSp, ...otherSp];
-    }
+    // Strictly keep only the last 5 versions for this fish species (sorted latest first, oldest last)
+    const sameSp = ecosystem.modelRegistry
+      .filter((m) => m.speciesId === species.id)
+      .sort((a, b) => {
+        const tA = Date.parse(a.createdAtIso || '') || 0;
+        const tB = Date.parse(b.createdAtIso || '') || 0;
+        if (tB !== tA) return tB - tA;
+        return (b.generationTrained || 0) - (a.generationTrained || 0);
+      });
+    const otherSp = ecosystem.modelRegistry.filter((m) => m.speciesId !== species.id);
+    const keptSameSp = sameSp.slice(0, 5);
+    ecosystem.modelRegistry = [...keptSameSp, ...otherSp];
   }
 
   return {

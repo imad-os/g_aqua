@@ -30,6 +30,7 @@ import {
   serializeFishEntityToCloudBrainItem,
   signInWithGmailPopup,
   signOutAdminUser,
+  sortSpeciesModelVersionsNewestFirst,
   stepAndSyncCloudUserOfflineFishes,
   subscribeToAllUserBrainRecords,
   subscribeToFirebaseAuth,
@@ -317,13 +318,14 @@ export const TrainerApp: React.FC = () => {
           next.modelRegistry.push(cm);
         }
       }
-      // Enforce max 10 saved versions per species
+      // Enforce max 5 saved versions per species, sorted newest first
       for (const sp of next.speciesList) {
-        const sameSp = next.modelRegistry.filter((m) => m.speciesId === sp.id);
-        if (sameSp.length > MAX_VERSIONS_PER_SPECIES) {
-          const otherSp = next.modelRegistry.filter((m) => m.speciesId !== sp.id);
-          next.modelRegistry = [...sameSp.slice(0, MAX_VERSIONS_PER_SPECIES), ...otherSp];
-        }
+        const pruneRes = pruneSpeciesModelVersions(
+          next.modelRegistry,
+          sp.id,
+          MAX_VERSIONS_PER_SPECIES
+        );
+        next.modelRegistry = pruneRes.keptRegistry;
       }
       saveEcosystemState(next);
       ecosystemRef.current = next;
@@ -839,7 +841,7 @@ export const TrainerApp: React.FC = () => {
         await new Promise((r) => window.setTimeout(r, sleepMs));
       }
 
-      // Commit 1 final version for this species at the end of its run and save to Firestore
+      // Commit 1 final version for this species at the end of its run, set as default, prune to 5 versions, and save to Firestore
       if (totalGensCompleted > 0 && runningBrain) {
         const finalGenLabel = baseGenBeforeRun + totalGensCompleted;
         const finalCommit = runAcceleratedHeadlessTraining(
@@ -855,9 +857,25 @@ export const TrainerApp: React.FC = () => {
           }
         );
         const lastCandidate = finalCommit.candidateModel;
+
+        // Ensure the newly finished model is set as the active/default base model for this species
+        workingState.modelRegistry.forEach((m) => {
+          if (m.speciesId === sp.id) {
+            m.isPromotedBase = m.versionId === lastCandidate.versionId;
+          }
+        });
+        lastCandidate.isPromotedBase = true;
+        sp.activeBaseModelVersion = lastCandidate.versionId;
+        if ((lastCandidate.brainConfig.aggressiveness ?? 0) > 0) {
+          sp.baseBrainConfig.aggressiveness = lastCandidate.brainConfig.aggressiveness;
+        }
         lastCandidate.speciesConfig = { ...sp };
 
-        const pruneResult = pruneSpeciesModelVersions(workingState.modelRegistry, sp.id);
+        const pruneResult = pruneSpeciesModelVersions(
+          workingState.modelRegistry,
+          sp.id,
+          MAX_VERSIONS_PER_SPECIES
+        );
         workingState.modelRegistry = pruneResult.keptRegistry;
 
         await saveModelVersionToFirestore(adminUser?.email || profileName, lastCandidate);
@@ -867,7 +885,7 @@ export const TrainerApp: React.FC = () => {
         setEcosystem({ ...workingState });
 
         trainedResults.push(
-          `${sp.name} -> ${lastCandidate.versionId} (${lastCandidate.benchmark.overallComposite}% Composite)`
+          `${sp.name} -> ${lastCandidate.versionId} [DEFAULT] (${lastCandidate.benchmark.overallComposite}% Composite)`
         );
       }
     }
@@ -958,6 +976,13 @@ export const TrainerApp: React.FC = () => {
       activeModel.speciesConfig = { ...sp };
     }
 
+    const pruneRes = pruneSpeciesModelVersions(
+      next.modelRegistry,
+      sp.id,
+      MAX_VERSIONS_PER_SPECIES
+    );
+    next.modelRegistry = pruneRes.keptRegistry;
+
     saveEcosystemState(next);
     ecosystemRef.current = next;
     setEcosystem(next);
@@ -967,7 +992,9 @@ export const TrainerApp: React.FC = () => {
       ok
         ? `Saved "${sp.name}" properties (Lifespan: ${sp.lifespan.lifespanSimHours}h, Owner Lv.${
             sp.requiredOwnerLevel || 1
-          }, Price: ${sp.shopPriceCredits || 45} Cr) to Firestore "base_models/active__${sp.id}".`
+          }, Price: ${sp.shopPriceCredits || 45} Cr, Aggressiveness: ${(
+            (sp.baseBrainConfig.aggressiveness ?? 0) * 100
+          ).toFixed(0)}%) to Firestore "base_models/active__${sp.id}".`
         : `Saved "${sp.name}" properties locally (Firestore offline fallback).`
     );
   };
@@ -1005,6 +1032,13 @@ export const TrainerApp: React.FC = () => {
       };
       next.modelRegistry.unshift(model);
     }
+
+    const pruneRes = pruneSpeciesModelVersions(
+      next.modelRegistry,
+      sp.id,
+      MAX_VERSIONS_PER_SPECIES
+    );
+    next.modelRegistry = pruneRes.keptRegistry;
 
     saveEcosystemState(next);
     ecosystemRef.current = next;
@@ -2075,9 +2109,9 @@ export const TrainerApp: React.FC = () => {
     );
   }
 
-  const speciesModels = ecosystem.modelRegistry.filter(
-    (m) => m.speciesId === selectedSpecies.id
-  );
+  const speciesModels = sortSpeciesModelVersionsNewestFirst(
+    ecosystem.modelRegistry.filter((m) => m.speciesId === selectedSpecies.id)
+  ).slice(0, MAX_VERSIONS_PER_SPECIES);
   const currentTank = TANK_TIERS[ecosystem.activeTankTier] || TANK_TIERS[0];
   const ownerAutoFeederCount = ecosystem.autoFeederCountByTank[currentTank.id] || 0;
 
@@ -2112,7 +2146,7 @@ export const TrainerApp: React.FC = () => {
       <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
-            TRAINER HUD v1.7.5
+            TRAINER HUD v1.7.8
           </span>
           <span className="text-sm font-extrabold uppercase tracking-wider text-white">
             ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
@@ -2586,10 +2620,11 @@ export const TrainerApp: React.FC = () => {
                     <div className="flex items-center justify-between">
                       <div>
                         <h3 className="text-sm font-bold text-white">
-                          Saved Versions ({selectedSpecies.name})
+                          Last 5 Versions ({selectedSpecies.name}) — Newest First
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Stored in Firestore <code className="text-cyan-300">base_models</code>
+                          Max 5 kept in <code className="text-cyan-300">base_models</code> (older
+                          versions auto-deleted)
                         </p>
                       </div>
                       <button
@@ -2602,7 +2637,7 @@ export const TrainerApp: React.FC = () => {
                     </div>
 
                     <div className="space-y-2.5 max-h-[380px] overflow-y-auto lab-scroll pr-1">
-                      {speciesModels.map((m) => (
+                      {speciesModels.map((m, idx) => (
                         <div
                           key={m.versionId}
                           className={`p-3.5 rounded-xl border space-y-2 ${
@@ -2612,12 +2647,22 @@ export const TrainerApp: React.FC = () => {
                           }`}
                         >
                           <div className="flex items-center justify-between">
-                            <span className="text-xs font-mono font-bold text-white">
-                              {m.versionId}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-cyan-300">
+                                #{idx + 1}
+                              </span>
+                              <span className="text-xs font-mono font-bold text-white">
+                                {m.versionId}
+                              </span>
+                              {(m.brainConfig?.aggressiveness ?? 0) > 0 && (
+                                <span className="px-1.5 py-0.5 rounded bg-rose-950 border border-rose-500/50 text-[10px] font-mono text-rose-300">
+                                  AGG {((m.brainConfig.aggressiveness ?? 0) * 100).toFixed(0)}%
+                                </span>
+                              )}
+                            </div>
                             {m.isPromotedBase ? (
                               <span className="text-[10px] font-mono font-bold text-emerald-300 uppercase">
-                                Active in Game
+                                Default Active
                               </span>
                             ) : (
                               <button
@@ -2625,7 +2670,7 @@ export const TrainerApp: React.FC = () => {
                                 onClick={() => handleSetActiveBaseModel(m.versionId)}
                                 className="px-2.5 py-1 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 text-[11px] font-semibold"
                               >
-                                Use This Version
+                                Set as Default
                               </button>
                             )}
                           </div>
@@ -2691,6 +2736,8 @@ export const TrainerApp: React.FC = () => {
               mutationsCount: number;
               maxSpeedGene: number;
               bodyScaleGene: number;
+              aggressiveness: number;
+              attacksPerformed: number;
             }
 
             const localRemovedSet = new Set(ecosystem.removedFishIds || []);
@@ -2724,6 +2771,9 @@ export const TrainerApp: React.FC = () => {
                 mutationsCount: f.lineage.inheritedMutations.length,
                 maxSpeedGene: f.genetics.maxSpeedGene,
                 bodyScaleGene: f.genetics.bodyScaleGene,
+                aggressiveness:
+                  f.brain.architecture.aggressiveness ?? f.genetics.aggressivenessGene ?? 0,
+                attacksPerformed: f.state.metrics.attacksPerformed ?? 0,
               });
             }
 
@@ -2767,6 +2817,11 @@ export const TrainerApp: React.FC = () => {
                   mutationsCount: 0,
                   maxSpeedGene: 1.0,
                   bodyScaleGene: 1.0,
+                  aggressiveness:
+                    b.brain?.architecture?.aggressiveness ??
+                    sp.baseBrainConfig?.aggressiveness ??
+                    0,
+                  attacksPerformed: 0,
                 });
               }
             }
@@ -3706,13 +3761,24 @@ export const TrainerApp: React.FC = () => {
                             </div>
                             <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 col-span-2">
                               <div className="text-[10px] text-slate-400">
-                                Genetics &amp; Lineage ID
+                                Genetics, Aggressiveness &amp; Lineage ID
                               </div>
                               <div className="text-slate-200 mt-0.5 text-[11px]">
                                 ID: <code>{activeSelectedRow.fishId}</code> · Mutations:{' '}
                                 {activeSelectedRow.mutationsCount} · Speed:{' '}
                                 {activeSelectedRow.maxSpeedGene.toFixed(2)}x · Size:{' '}
-                                {activeSelectedRow.bodyScaleGene.toFixed(2)}x
+                                {activeSelectedRow.bodyScaleGene.toFixed(2)}x · Aggressiveness:{' '}
+                                <span
+                                  className={
+                                    activeSelectedRow.aggressiveness > 0
+                                      ? 'text-rose-300 font-bold'
+                                      : 'text-emerald-300'
+                                  }
+                                >
+                                  {activeSelectedRow.aggressiveness > 0
+                                    ? `${(activeSelectedRow.aggressiveness * 100).toFixed(0)}% (${activeSelectedRow.attacksPerformed} Attacks)`
+                                    : '0% (Peaceful)'}
+                                </span>
                               </div>
                             </div>
                           </div>
@@ -3937,7 +4003,9 @@ export const TrainerApp: React.FC = () => {
                   </div>
 
                   <div>
-                    <label className="text-xs text-slate-400 block mb-1">3D Body Silhouette</label>
+                    <label className="text-xs text-slate-400 block mb-1">
+                      3D Body Silhouette (10 Models)
+                    </label>
                     <select
                       value={selectedSpecies.bodyStyle}
                       onChange={(e) =>
@@ -3947,11 +4015,39 @@ export const TrainerApp: React.FC = () => {
                       }
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
                     >
-                      <option value="fusiform_reef">Streamlined Reef / Tetra</option>
-                      <option value="angel_disc">Tall Angelfish / Discus</option>
-                      <option value="biolum_Latern">Deep-Sea Lantern / Elongated</option>
-                      <option value="mandarin_dragonet">Ornate Fan-Fin Dragonet / Betta</option>
+                      <option value="fusiform_reef">1. Streamlined Reef / Tetra (fusiform_reef)</option>
+                      <option value="angel_disc">2. Tall Angelfish / Discus (angel_disc)</option>
+                      <option value="biolum_Latern">3. Deep-Sea Lantern / Eel (biolum_Latern)</option>
+                      <option value="mandarin_dragonet">4. Ornate Fan-Fin Dragonet (mandarin_dragonet)</option>
+                      <option value="betta_veil">5. Flowing Veil-Tail Betta (betta_veil)</option>
+                      <option value="shark_torpedo">6. Sleek Torpedo Shark / Bala (shark_torpedo)</option>
+                      <option value="puffer_round">7. Round Pea / Box Puffer (puffer_round)</option>
+                      <option value="tang_surgeon">8. Oval Reef Surgeonfish / Tang (tang_surgeon)</option>
+                      <option value="koi_dragon">9. Heavy Barbels Dragon Koi (koi_dragon)</option>
+                      <option value="lionfish_fan">10. Spiny Fan-Crest Lionfish (lionfish_fan)</option>
                     </select>
+                  </div>
+
+                  <div>
+                    <label className="text-xs text-slate-400 block mb-1">
+                      Aggressiveness (0 = Peaceful, &gt;0 = Attack Frequency)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={Number((selectedSpecies.baseBrainConfig.aggressiveness ?? 0).toFixed(2))}
+                        onChange={(e) =>
+                          handleUpdateSelectedSpeciesField((s) => {
+                            const val = Math.max(0, Math.min(1, Number(e.target.value) || 0));
+                            s.baseBrainConfig.aggressiveness = val < 0.02 ? 0 : val;
+                          })
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-rose-300"
+                      />
+                    </div>
                   </div>
 
                   <div>
@@ -4248,6 +4344,53 @@ export const TrainerApp: React.FC = () => {
                       }
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
                     />
+                  </div>
+
+                  <div className="sm:col-span-3 p-3.5 rounded-xl bg-rose-950/30 border border-rose-500/40 flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <div className="text-xs font-bold text-rose-200">
+                        Aggressiveness Behavior (Periodic Attack Lunge — Only Active When &gt; 0)
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        When set to <code>0</code>, this brain is 100% peaceful and never attacks.
+                        When set <code>&gt; 0</code>, the fish periodically lunges at nearby fishes
+                        and evolves attack frequency during training.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateSelectedSpeciesField((s) => {
+                            s.baseBrainConfig.aggressiveness =
+                              (s.baseBrainConfig.aggressiveness ?? 0) > 0 ? 0 : 0.35;
+                          })
+                        }
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold ${
+                          (selectedSpecies.baseBrainConfig.aggressiveness ?? 0) > 0
+                            ? 'bg-rose-500 text-white'
+                            : 'bg-slate-800 text-slate-300 border border-slate-700'
+                        }`}
+                      >
+                        {(selectedSpecies.baseBrainConfig.aggressiveness ?? 0) > 0
+                          ? `ENABLED (${((selectedSpecies.baseBrainConfig.aggressiveness ?? 0) * 100).toFixed(0)}%)`
+                          : 'DISABLED (0% Peaceful)'}
+                      </button>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={selectedSpecies.baseBrainConfig.aggressiveness ?? 0}
+                        onChange={(e) =>
+                          handleUpdateSelectedSpeciesField((s) => {
+                            const val = Math.max(0, Math.min(1, Number(e.target.value) || 0));
+                            s.baseBrainConfig.aggressiveness = val < 0.02 ? 0 : val;
+                          })
+                        }
+                        className="w-32 accent-rose-400 cursor-pointer"
+                      />
+                    </div>
                   </div>
                 </div>
 

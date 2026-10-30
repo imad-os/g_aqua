@@ -389,6 +389,12 @@ function getOrCreateCachedFishGeometrySet(
   const polySpec = getPolygonSpecForQuality(polygonQuality);
   const isVeryLowPoly = polygonQuality === 'very_low';
   const isAngel = bodyStyle === 'angel_disc';
+  const isTang = bodyStyle === 'tang_surgeon';
+  const isPuffer = bodyStyle === 'puffer_round';
+  const isShark = bodyStyle === 'shark_torpedo';
+  const isKoi = bodyStyle === 'koi_dragon';
+  const isLion = bodyStyle === 'lionfish_fan';
+  const isTallBody = isAngel || isTang;
 
   // 1. Body + Gills
   const coreBodyGeo = buildSculptedFishBodyGeometry(
@@ -398,18 +404,33 @@ function getOrCreateCachedFishGeometrySet(
   );
   let mergedBodyGeo: THREE.BufferGeometry = coreBodyGeo;
   if (!isVeryLowPoly) {
+    const gillX = isPuffer ? 0.31 : isTang ? 0.17 : 0.21;
     const gillLeftGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
     gillLeftGeo.scale(0.28, 1.35, 0.95);
     gillLeftGeo.rotateY(0.22);
-    gillLeftGeo.translate(0.21, -0.01, 0.31);
+    gillLeftGeo.translate(gillX, -0.01, 0.31);
 
     const gillRightGeo = new THREE.SphereGeometry(0.14, polySpec.eyeSegments, polySpec.eyeSegments);
     gillRightGeo.scale(0.28, 1.35, 0.95);
     gillRightGeo.rotateY(-0.22);
-    gillRightGeo.translate(-0.21, -0.01, 0.31);
+    gillRightGeo.translate(-gillX, -0.01, 0.31);
 
-    mergedBodyGeo =
-      mergeGeometries([coreBodyGeo, gillLeftGeo, gillRightGeo], false) || coreBodyGeo;
+    const bodyParts: THREE.BufferGeometry[] = [coreBodyGeo, gillLeftGeo, gillRightGeo];
+
+    // Koi / Dragonfish whiskers (barbels) on snout
+    if (isKoi) {
+      const whiskerL = new THREE.CylinderGeometry(0.008, 0.02, 0.24, 5);
+      whiskerL.rotateZ(0.45);
+      whiskerL.rotateX(0.35);
+      whiskerL.translate(0.11, -0.08, 0.62);
+      const whiskerR = new THREE.CylinderGeometry(0.008, 0.02, 0.24, 5);
+      whiskerR.rotateZ(-0.45);
+      whiskerR.rotateX(0.35);
+      whiskerR.translate(-0.11, -0.08, 0.62);
+      bodyParts.push(whiskerL, whiskerR);
+    }
+
+    mergedBodyGeo = mergeGeometries(bodyParts, false) || coreBodyGeo;
   }
 
   // 2. Static Fins
@@ -419,7 +440,18 @@ function getOrCreateCachedFishGeometrySet(
     polySpec.finSegmentsU,
     polySpec.finSegmentsV
   );
-  dorsalGeo.translate(0, isAngel ? 0.44 : 0.26, -0.04);
+  const dorsalY = isAngel
+    ? 0.44
+    : isTang
+    ? 0.39
+    : isPuffer
+    ? 0.34
+    : isShark
+    ? 0.23
+    : isLion
+    ? 0.29
+    : 0.26;
+  dorsalGeo.translate(0, dorsalY, isPuffer ? -0.22 : -0.04);
 
   const analGeo = build3DVolumetricFinGeometry(
     'anal',
@@ -427,7 +459,8 @@ function getOrCreateCachedFishGeometrySet(
     Math.max(2, Math.floor(polySpec.finSegmentsU * 0.75)),
     Math.max(2, Math.floor(polySpec.finSegmentsV * 0.75))
   );
-  analGeo.translate(0, isAngel ? -0.38 : -0.22, -0.22);
+  const analY = isAngel ? -0.38 : isTang ? -0.34 : isPuffer ? -0.3 : -0.22;
+  analGeo.translate(0, analY, -0.22);
 
   const finPartsToMerge: THREE.BufferGeometry[] = [dorsalGeo, analGeo];
   if (!isVeryLowPoly) {
@@ -435,14 +468,14 @@ function getOrCreateCachedFishGeometrySet(
     const pelvicSegV = Math.max(3, Math.floor(polySpec.finSegmentsV * 0.65));
     const pelvicLeftGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
     pelvicLeftGeo.rotateZ(0.32);
-    pelvicLeftGeo.translate(0.08, isAngel ? -0.36 : -0.23, 0.14);
+    pelvicLeftGeo.translate(0.08, isTallBody ? -0.36 : -0.23, 0.14);
 
     const pelvicRightGeo = build3DVolumetricFinGeometry('pelvic', bodyStyle, pelvicSegU, pelvicSegV);
     pelvicRightGeo.rotateZ(-0.32);
-    pelvicRightGeo.translate(-0.08, isAngel ? -0.36 : -0.23, 0.14);
+    pelvicRightGeo.translate(-0.08, isTallBody ? -0.36 : -0.23, 0.14);
 
     const lureGeo = new THREE.SphereGeometry(0.045, 6, 6);
-    lureGeo.translate(0, isAngel ? 0.48 : 0.28, 0.25);
+    lureGeo.translate(0, isTallBody ? 0.48 : 0.28, 0.25);
     finPartsToMerge.push(pelvicLeftGeo, pelvicRightGeo, lureGeo);
   }
   const staticFinsGeo = mergeGeometries(finPartsToMerge, false) || dorsalGeo;
@@ -474,29 +507,34 @@ function getOrCreateCachedFishGeometrySet(
     }
   }
 
-  // 5. Eyes
-  const irisL = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
+  // 5. Eyes (Adjusted for Puffer wide stereoscopic eyes vs Tang narrow flanks)
+  const eyeX = isPuffer ? 0.235 : isTang ? 0.135 : 0.165;
+  const pupilX = isPuffer ? 0.262 : isTang ? 0.16 : 0.19;
+  const catchX = isPuffer ? 0.278 : isTang ? 0.176 : 0.207;
+  const eyeRadius = isPuffer ? 0.084 : 0.068;
+
+  const irisL = new THREE.SphereGeometry(eyeRadius, polySpec.eyeSegments, polySpec.eyeSegments);
   irisL.scale(0.65, 1.0, 1.0);
   irisL.rotateY(0.24);
-  irisL.translate(0.165, 0.075, 0.44);
-  const irisR = new THREE.SphereGeometry(0.068, polySpec.eyeSegments, polySpec.eyeSegments);
+  irisL.translate(eyeX, 0.075, 0.44);
+  const irisR = new THREE.SphereGeometry(eyeRadius, polySpec.eyeSegments, polySpec.eyeSegments);
   irisR.scale(0.65, 1.0, 1.0);
   irisR.rotateY(-0.24);
-  irisR.translate(-0.165, 0.075, 0.44);
+  irisR.translate(-eyeX, 0.075, 0.44);
   const mergedIrisGeo = mergeGeometries([irisL, irisR], false) || irisL;
 
-  const pupilL = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
-  pupilL.translate(0.19, 0.075, 0.455);
-  const pupilR = new THREE.SphereGeometry(0.044, polySpec.eyeSegments, polySpec.eyeSegments);
-  pupilR.translate(-0.19, 0.075, 0.455);
+  const pupilL = new THREE.SphereGeometry(eyeRadius * 0.65, polySpec.eyeSegments, polySpec.eyeSegments);
+  pupilL.translate(pupilX, 0.075, 0.455);
+  const pupilR = new THREE.SphereGeometry(eyeRadius * 0.65, polySpec.eyeSegments, polySpec.eyeSegments);
+  pupilR.translate(-pupilX, 0.075, 0.455);
   const mergedPupilGeo = mergeGeometries([pupilL, pupilR], false) || pupilL;
 
   let mergedCatchGeo: THREE.BufferGeometry | null = null;
   if (!isVeryLowPoly) {
     const catchL = new THREE.SphereGeometry(0.018, 6, 6);
-    catchL.translate(0.207, 0.097, 0.468);
+    catchL.translate(catchX, 0.097, 0.468);
     const catchR = new THREE.SphereGeometry(0.018, 6, 6);
-    catchR.translate(-0.207, 0.097, 0.468);
+    catchR.translate(-catchX, 0.097, 0.468);
     mergedCatchGeo = mergeGeometries([catchL, catchR], false) || catchL;
   }
 
@@ -542,6 +580,7 @@ function getOrCreateCachedFishGeometrySet(
 /**
  * Builds a true 3D anatomically lofted fish body BufferGeometry (+Z is forward snout, -Z is tail peduncle,
  * +Y is dorsal ridge, -Y is ventral belly, +X / -X are left / right sculpted flanks and gill plates).
+ * Supports 10 distinct 3D fish silhouettes (`bodyStyle`).
  */
 function buildSculptedFishBodyGeometry(
   bodyStyle: string,
@@ -552,13 +591,59 @@ function buildSculptedFishBodyGeometry(
   const positions = new Float32Array(numVerts * 3);
   const uvs = new Float32Array(numVerts * 2);
 
-  const totalLength = 1.32;
-  const noseZ = 0.66;
-
   const isAngel = bodyStyle === 'angel_disc';
   const isLantern = bodyStyle === 'biolum_Latern';
-  const maxHalfHeight = isAngel ? 0.56 : isLantern ? 0.38 : 0.32;
-  const maxHalfWidth = isAngel ? 0.22 : isLantern ? 0.27 : 0.24;
+  const isBetta = bodyStyle === 'betta_veil';
+  const isShark = bodyStyle === 'shark_torpedo';
+  const isPuffer = bodyStyle === 'puffer_round';
+  const isTang = bodyStyle === 'tang_surgeon';
+  const isKoi = bodyStyle === 'koi_dragon';
+  const isLion = bodyStyle === 'lionfish_fan';
+
+  const totalLength = isShark
+    ? 1.56
+    : isKoi
+    ? 1.48
+    : isPuffer
+    ? 1.14
+    : isBetta
+    ? 1.24
+    : 1.32;
+  const noseZ = totalLength * 0.5;
+
+  const maxHalfHeight = isAngel
+    ? 0.56
+    : isTang
+    ? 0.49
+    : isPuffer
+    ? 0.44
+    : isLantern
+    ? 0.38
+    : isLion
+    ? 0.37
+    : isKoi
+    ? 0.36
+    : isShark
+    ? 0.27
+    : isBetta
+    ? 0.29
+    : 0.32;
+
+  const maxHalfWidth = isPuffer
+    ? 0.41
+    : isKoi
+    ? 0.31
+    : isLion
+    ? 0.29
+    : isLantern
+    ? 0.27
+    : isShark
+    ? 0.25
+    : isAngel
+    ? 0.21
+    : isTang
+    ? 0.18
+    : 0.24;
 
   let vIdx = 0;
   for (let i = 0; i <= lengthRings; i++) {
@@ -572,25 +657,28 @@ function buildSculptedFishBodyGeometry(
     if (u < 0.04) {
       const t = u / 0.04;
       const sphereCap = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
-      heightEnvelope = sphereCap * 0.22;
-      widthEnvelope = sphereCap * 0.24;
-      verticalCenterOffset = -0.02 * (1 - t);
+      heightEnvelope = sphereCap * (isPuffer ? 0.34 : isShark ? 0.16 : 0.22);
+      widthEnvelope = sphereCap * (isPuffer ? 0.36 : isShark ? 0.2 : 0.24);
+      verticalCenterOffset = isShark ? -0.03 * (1 - t) : -0.02 * (1 - t);
     } else if (u < 0.72) {
       const norm = (u - 0.04) / 0.68;
-      const arch = Math.sin(Math.pow(norm, 0.72) * Math.PI);
-      heightEnvelope = 0.22 + 0.78 * arch;
-      widthEnvelope = 0.24 + 0.76 * Math.sin(Math.pow(norm, 0.65) * Math.PI);
+      const archExp = isPuffer ? 0.58 : isShark ? 0.64 : 0.72;
+      const arch = Math.sin(Math.pow(norm, archExp) * Math.PI);
+      heightEnvelope = (isPuffer ? 0.32 : 0.22) + (isPuffer ? 0.68 : 0.78) * arch;
+      widthEnvelope =
+        (isPuffer ? 0.34 : 0.24) + (isPuffer ? 0.66 : 0.76) * Math.sin(Math.pow(norm, 0.65) * Math.PI);
 
       const gillDist = Math.abs(u - 0.27);
       if (gillDist < 0.06) {
         const gillFlare = Math.cos((gillDist / 0.06) * (Math.PI / 2));
-        widthEnvelope += 0.11 * gillFlare;
+        widthEnvelope += (isLion ? 0.16 : 0.11) * gillFlare;
       }
-      verticalCenterOffset = isAngel ? 0.04 * arch : 0.02 * arch;
+      verticalCenterOffset =
+        isAngel || isTang ? 0.04 * arch : isShark ? 0.03 * arch : isKoi ? 0.035 * arch : 0.02 * arch;
     } else {
       const tailNorm = (u - 0.72) / 0.28;
       const smoothStep = 1 - tailNorm * tailNorm * (3 - 2 * tailNorm);
-      heightEnvelope = 0.22 + 0.22 * smoothStep;
+      heightEnvelope = (isShark ? 0.16 : 0.22) + 0.22 * smoothStep;
       widthEnvelope = 0.16 + 0.18 * smoothStep;
       if (u > 0.92) {
         heightEnvelope += ((u - 0.92) / 0.08) * 0.08;
@@ -606,8 +694,11 @@ function buildSculptedFishBodyGeometry(
       const cosT = Math.cos(theta);
       const sinT = Math.sin(theta);
 
-      const dorsalSharpness =
-        cosT > 0 ? 1.0 - 0.12 * Math.pow(sinT, 2) : 1.0 + 0.08 * Math.pow(sinT, 2);
+      const dorsalSharpness = isPuffer
+        ? 1.0
+        : cosT > 0
+        ? 1.0 - 0.12 * Math.pow(sinT, 2)
+        : 1.0 + 0.08 * Math.pow(sinT, 2);
       let x = sinT * halfW * dorsalSharpness;
       const y = cosT * halfH + verticalCenterOffset;
 
@@ -665,50 +756,146 @@ function build3DVolumetricFinGeometry(
   const uvs = new Float32Array(sideVerts * 2 * 2);
 
   const isAngel = bodyStyle === 'angel_disc';
+  const isDragonet = bodyStyle === 'mandarin_dragonet';
+  const isBetta = bodyStyle === 'betta_veil';
+  const isShark = bodyStyle === 'shark_torpedo';
+  const isPuffer = bodyStyle === 'puffer_round';
+  const isTang = bodyStyle === 'tang_surgeon';
+  const isKoi = bodyStyle === 'koi_dragon';
+  const isLion = bodyStyle === 'lionfish_fan';
 
   function evalFinPoint(u: number, v: number, sideSign: 1 | -1): [number, number, number] {
     const centeredV = (v - 0.5) * 2;
-    const rayCorrugation = Math.sin(v * Math.PI * 10) * 0.014 * u;
+    const rayFreq = isLion ? 18 : isBetta ? 14 : 10;
+    const rayAmp = isLion ? 0.032 : isBetta ? 0.022 : 0.014;
+    const rayCorrugation = Math.sin(v * Math.PI * rayFreq) * rayAmp * u;
     const baseThickness = (1 - u * 0.78) * 0.028 + 0.006;
     const xThickness = sideSign * (baseThickness + rayCorrugation * sideSign);
 
     if (kind === 'caudal') {
-      const forkIndent = 1.0 - 0.36 * Math.exp(-centeredV * centeredV * 4.5);
-      const spanZ = -u * (isAngel ? 0.68 : 0.54) * forkIndent;
-      const spreadY = centeredV * (0.12 + u * (isAngel ? 0.62 : 0.46));
+      // Betta / Dragonet / Lionfish have rounded fan/veil tails; Shark / Tang have deep forked crescent tails
+      const forkDepth = isBetta || isDragonet || isLion || isPuffer
+        ? -0.18 // Rounded convex veil fan
+        : isShark
+        ? 0.56 // Deep shark crescent fork
+        : isTang
+        ? 0.44 // Lunate surgeonfish tail
+        : 0.36;
+      const forkIndent = 1.0 - forkDepth * Math.exp(-centeredV * centeredV * 4.5);
+      const tailLen = isBetta
+        ? 0.92
+        : isKoi
+        ? 0.72
+        : isAngel
+        ? 0.68
+        : isLion
+        ? 0.66
+        : isShark
+        ? 0.64
+        : isPuffer
+        ? 0.36
+        : 0.54;
+      const tailSpread = isBetta
+        ? 0.86
+        : isAngel
+        ? 0.62
+        : isLion
+        ? 0.58
+        : isKoi
+        ? 0.56
+        : isShark
+        ? 0.54
+        : isPuffer
+        ? 0.28
+        : 0.46;
+      const spanZ = -u * tailLen * forkIndent;
+      const spreadY =
+        centeredV * (0.12 + u * tailSpread) - (isBetta ? u * u * 0.14 : 0);
       const cupX = xThickness + Math.sin(u * Math.PI) * (centeredV * centeredV) * 0.04 * sideSign;
       return [cupX, spreadY, spanZ];
     }
 
     if (kind === 'dorsal') {
-      const zRoot = (0.5 - v) * 0.52;
-      const heightMax = isAngel ? 0.62 : 0.32;
-      const profileH = Math.sin(Math.pow(v, 0.7) * Math.PI) * heightMax;
+      const rootLen = isTang || isKoi || isBetta ? 0.72 : isPuffer ? 0.26 : 0.52;
+      const zRoot = (0.5 - v) * rootLen;
+      const heightMax = isAngel
+        ? 0.62
+        : isLion
+        ? 0.58
+        : isBetta
+        ? 0.54
+        : isShark
+        ? 0.52
+        : isTang
+        ? 0.42
+        : isKoi
+        ? 0.4
+        : isPuffer
+        ? 0.18
+        : 0.32;
+      const spineComb = isLion ? 0.68 + 0.32 * Math.abs(Math.sin(v * Math.PI * 7)) : 1.0;
+      const profileH =
+        Math.sin(Math.pow(v, isShark ? 0.45 : 0.7) * Math.PI) * heightMax * spineComb;
       const y = u * profileH;
-      const z = zRoot - u * (isAngel ? 0.34 : 0.22);
+      const sweepZ = isBetta ? 0.44 : isAngel ? 0.34 : isShark ? 0.28 : 0.22;
+      const z = zRoot - u * sweepZ;
       return [xThickness, y, z];
     }
 
     if (kind === 'anal') {
-      const zRoot = (0.5 - v) * 0.34;
-      const depthMax = isAngel ? 0.48 : 0.24;
+      const rootLen = isBetta || isTang ? 0.52 : isPuffer ? 0.22 : 0.34;
+      const zRoot = (0.5 - v) * rootLen;
+      const depthMax = isBetta
+        ? 0.52
+        : isAngel
+        ? 0.48
+        : isTang
+        ? 0.36
+        : isLion
+        ? 0.34
+        : isPuffer
+        ? 0.16
+        : 0.24;
       const profileD = Math.sin(Math.pow(v, 0.75) * Math.PI) * depthMax;
       const y = -u * profileD;
-      const z = zRoot - u * 0.2;
+      const z = zRoot - u * (isBetta ? 0.36 : 0.2);
       return [xThickness, y, z];
     }
 
     if (kind === 'pectoral') {
-      const length = 0.38;
-      const width = 0.22 * Math.sin(Math.pow(v, 0.65) * Math.PI);
+      const length = isLion
+        ? 0.74
+        : isBetta
+        ? 0.52
+        : isShark
+        ? 0.54
+        : isKoi
+        ? 0.48
+        : isDragonet
+        ? 0.46
+        : isPuffer
+        ? 0.28
+        : 0.38;
+      const widthBase = isLion ? 0.48 : isDragonet || isBetta ? 0.32 : isPuffer ? 0.26 : 0.22;
+      const width = widthBase * Math.sin(Math.pow(v, 0.65) * Math.PI);
       const z = -u * length * 0.65 + (v - 0.5) * width;
-      const y = (v - 0.35) * width * 0.85 - u * 0.06;
-      const camberX = Math.sin(u * Math.PI) * 0.045 + xThickness;
+      const y = (v - 0.35) * width * 0.85 - u * (isShark ? 0.14 : 0.06);
+      const camberX = Math.sin(u * Math.PI) * (isLion ? 0.08 : 0.045) + xThickness;
       return [camberX, y, z];
     }
 
     // pelvic fin
-    const length = isAngel ? 0.42 : 0.24;
+    const length = isAngel
+      ? 0.44
+      : isBetta
+      ? 0.48
+      : isLion
+      ? 0.38
+      : isKoi
+      ? 0.32
+      : isPuffer
+      ? 0.12
+      : 0.24;
     const z = -u * length * 0.5 + (v - 0.5) * 0.1;
     const y = -u * length;
     return [xThickness, y, z];
@@ -2082,8 +2269,19 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
         );
 
         // 1. GPU Vertex Shader S-wave biomechanical spine undulation (zero CPU vertex loop!)
+        const activeReaction =
+          (fish.state.attackReactionHoursRemaining ?? 0) > 0
+            ? fish.state.attackReactionKind
+            : null;
+        const reactionAmpMult =
+          activeReaction === 'slowed_down'
+            ? 0.45
+            : activeReaction === 'flee_dart' || activeReaction === 'counter_attack'
+            ? 1.48
+            : 1.0;
         rig.spineUniforms.uTailPhase.value = fish.state.tailPhase;
-        rig.spineUniforms.uSwimAmp.value = 0.085 * fish.genetics.finAspectGene;
+        rig.spineUniforms.uSwimAmp.value =
+          0.085 * fish.genetics.finAspectGene * reactionAmpMult;
 
         // 2. Articulated 2-stage caudal tail fan
         const wag = Math.sin(fish.state.tailPhase) * 0.44 * fish.genetics.finAspectGene;

@@ -94,15 +94,33 @@ export interface CloudUserBrainRecord {
 
 export type UserFishBrainItem = CloudUserFishBrainItem;
 
-export const MAX_VERSIONS_PER_SPECIES = 10;
+export const MAX_VERSIONS_PER_SPECIES = 5;
 
 // Track last Firestore write timestamp per username so background Keeper ticks only write every 4 minutes
 const _lastCloudUserFirestoreWriteMs = new Map<string, number>();
 export const FIRESTORE_CHECKPOINT_INTERVAL_MS = 240_000; // 4 minutes (3-5 min range)
 
 /**
- * Enforces that each fish species keeps at most the last 10 versions (`MAX_VERSIONS_PER_SPECIES`).
- * Always preserves the promoted base version within the 10 kept versions.
+ * Sorts model versions so the latest version is first and the oldest is last.
+ */
+export function sortSpeciesModelVersionsNewestFirst(
+  versions: ModelVersionRecord[]
+): ModelVersionRecord[] {
+  return [...versions].sort((a, b) => {
+    const tA = Date.parse(a.createdAtIso || '') || 0;
+    const tB = Date.parse(b.createdAtIso || '') || 0;
+    if (tB !== tA) return tB - tA;
+    const genA = a.generationTrained || 0;
+    const genB = b.generationTrained || 0;
+    if (genB !== genA) return genB - genA;
+    return b.versionId.localeCompare(a.versionId);
+  });
+}
+
+/**
+ * Enforces that each fish species keeps at most the last 5 versions (`MAX_VERSIONS_PER_SPECIES`),
+ * sorted with the latest version first and the oldest version last.
+ * Deletes any oldest versions beyond 5.
  */
 export function pruneSpeciesModelVersions(
   registry: ModelVersionRecord[],
@@ -120,30 +138,23 @@ export function pruneSpeciesModelVersions(
     }
   }
 
-  // Sort sameSpeciesModels newest first (by createdAtIso descending, keeping current order as tie-breaker)
-  sameSpeciesModels.sort((a, b) => {
-    const tA = Date.parse(a.createdAtIso || '') || 0;
-    const tB = Date.parse(b.createdAtIso || '') || 0;
-    return tB - tA;
-  });
+  // Sort sameSpeciesModels strictly newest first, oldest last
+  const sortedSame = sortSpeciesModelVersionsNewestFirst(sameSpeciesModels);
 
-  if (sameSpeciesModels.length <= maxPerSpecies) {
+  if (sortedSame.length <= maxPerSpecies) {
     return {
-      keptRegistry: [...sameSpeciesModels, ...otherSpeciesModels],
+      keptRegistry: [...sortedSame, ...otherSpeciesModels],
       prunedForSpecies: [],
     };
   }
 
-  const keptForSpecies = sameSpeciesModels.slice(0, maxPerSpecies);
-  const prunedForSpecies = sameSpeciesModels.slice(maxPerSpecies);
+  const keptForSpecies = sortedSame.slice(0, maxPerSpecies);
+  const prunedForSpecies = sortedSame.slice(maxPerSpecies);
 
-  // Ensure the promoted base model is never accidentally dropped
-  const promotedInPrunedIdx = prunedForSpecies.findIndex((m) => m.isPromotedBase);
-  if (promotedInPrunedIdx >= 0 && keptForSpecies.length > 0) {
-    const promoted = prunedForSpecies.splice(promotedInPrunedIdx, 1)[0];
-    const dropped = keptForSpecies.pop()!;
-    keptForSpecies.push(promoted);
-    prunedForSpecies.unshift(dropped);
+  // If the promoted base model fell into prunedForSpecies, promote the newest kept version instead
+  // so we strictly keep only the 5 newest versions and delete the oldest ones
+  if (!keptForSpecies.some((m) => m.isPromotedBase) && keptForSpecies.length > 0) {
+    keptForSpecies[0].isPromotedBase = true;
   }
 
   return {
@@ -245,7 +256,7 @@ export function toFirestoreSafeBrain(brain: any): FirestoreSafeBrain {
 
   return {
     architecture: brain?.architecture
-      ? { ...brain.architecture }
+      ? { ...brain.architecture, aggressiveness: brain.architecture.aggressiveness ?? 0 }
       : {
           inputCount: 10,
           hiddenLayers: [16, 12],
@@ -253,6 +264,7 @@ export function toFirestoreSafeBrain(brain: any): FirestoreSafeBrain {
           activation: 'tanh',
           recurrentMemoryEnabled: true,
           attentionModuleEnabled: true,
+          aggressiveness: 0,
         },
     layers,
     recurrentState: (Array.isArray(brain?.recurrentState) ? brain.recurrentState : []).map(round4),
@@ -269,14 +281,17 @@ export function fromFirestoreSafeBrain(raw: any): FishBrainInstance {
   const layers: Array<{ iw: number[]; ib: number[]; dw: number[]; db: number[] }> =
     raw?.layers || [];
   return {
-    architecture: raw?.architecture || {
-      inputCount: 10,
-      hiddenLayers: [16, 12],
-      outputCount: 4,
-      activation: 'tanh',
-      recurrentMemoryEnabled: true,
-      attentionModuleEnabled: true,
-    },
+    architecture: raw?.architecture
+      ? { ...raw.architecture, aggressiveness: raw.architecture.aggressiveness ?? 0 }
+      : {
+          inputCount: 10,
+          hiddenLayers: [16, 12],
+          outputCount: 4,
+          activation: 'tanh',
+          recurrentMemoryEnabled: true,
+          attentionModuleEnabled: true,
+          aggressiveness: 0,
+        },
     inheritedWeights: layers.map((l) => l.iw || []),
     inheritedBiases: layers.map((l) => l.ib || []),
     learnedDeltaWeights: layers.map((l) => l.dw || []),
@@ -605,7 +620,7 @@ export async function saveModelVersionToFirestore(
       await setDoc(doc(aiFirestore, 'base_models', activeDocId), payload, { merge: true });
     }
 
-    // Delete any overflow versions beyond the last 10 for this species from Firestore
+    // Delete any overflow versions beyond the last 5 for this species from Firestore
     if (prunedVersionsToDelete.length > 0) {
       await Promise.allSettled(
         prunedVersionsToDelete.map((oldVer) => {
@@ -623,7 +638,7 @@ export async function saveModelVersionToFirestore(
 
 /**
  * Loads all trained Base Brain Models from the Firestore `base_models` collection,
- * capped at the latest 10 versions per species.
+ * capped at the latest 5 versions per species (and deletes any older overflow versions).
  */
 export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord[]> {
   try {
@@ -651,11 +666,24 @@ export async function fetchBaseModelsFromFirestore(): Promise<ModelVersionRecord
       }
     });
 
-    // Enforce Max 10 Versions per Species across loaded models
+    // Enforce Max 5 Versions per Species across loaded models and delete any older overflow versions from Firestore
     const speciesIds = Array.from(new Set(models.map((m) => m.speciesId)));
+    const allPrunedOverflow: ModelVersionRecord[] = [];
     for (const spId of speciesIds) {
       const res = pruneSpeciesModelVersions(models, spId, MAX_VERSIONS_PER_SPECIES);
       models = res.keptRegistry;
+      if (res.prunedForSpecies.length > 0) {
+        allPrunedOverflow.push(...res.prunedForSpecies);
+      }
+    }
+
+    if (allPrunedOverflow.length > 0) {
+      Promise.allSettled(
+        allPrunedOverflow.map((oldVer) => {
+          const oldDocId = `${sanitizeKey(oldVer.speciesId)}__${sanitizeKey(oldVer.versionId)}`;
+          return deleteDoc(doc(aiFirestore, 'base_models', oldDocId));
+        })
+      ).catch(() => {});
     }
 
     if (models.length > 0 && typeof localStorage !== 'undefined') {
