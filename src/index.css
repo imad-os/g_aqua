@@ -43,3 +43,11 @@
 .lab-scroll::-webkit-scrollbar-thumb:hover {
   background: #334155;
 }
+
+/* Ultra-lightweight TV Remote / Gamepad Focus Outline (Zero box-shadow repaint on low-resource TVs) */
+[data-tv-focusable="true"]:focus {
+  outline: 3px solid #ffffff !important;
+  outline-offset: 1px;
+  box-shadow: none !important;
+}
+

@@ -1,79 +1,118 @@
-# Implementation Plan: 3D FPS Optimization, Authoritative Trainer Keeper Service & Firestore Quota Management
+# Console Game HUD Menu, Instant Cloud Update Sync & Fish Renaming
 
-## 1. Deep 3D FPS & Graphics Optimization (`src/components/AquariumCanvas3D.tsx`, `src/App.tsx`)
+A complete transformation of the in-game Owner Menu into a sleek, console-grade game HUD with vertical side tabs and glowing accents, continuous 12–15s real-time cloud update polling with audio feedback (birth chime for gifts/babies, low warning tone for death), MyPC return-button input decoupling so system exit works smoothly on TV, and in-game fish renaming with controller-friendly input.
 
-### Root Causes Identified
-1. **Main-Thread Serialization & React Re-render Stalls**: `App.tsx` called `saveEcosystemState(eco)` (synchronous `JSON.stringify` of all 50 species, neural network weights, and history) and `setEcosystem({ ...eco })` every `320ms` inside the `requestAnimationFrame` callback.
-2. **Per-Frame CPU Vertex Deformation & PCIe Uploads**: `deformFishSpineSWave()` looped over 520–2,700 vertices per fish on the CPU every frame and flagged `posAttr.needsUpdate = true`.
-3. **Heavy Dual `MeshPhysicalMaterial` + `DoubleSide` Shading**: Every fish used two `MeshPhysicalMaterial` instances with `clearcoat`, `bumpMap`, `transparent: true`, and `THREE.DoubleSide` (doubling fragment shader work) even in Low quality mode.
-4. **High Draw-Call Count**: Each fish spawned 12 separate child `THREE.Mesh` objects, and tank rocks/corals created dozens of unmerged meshes and duplicate materials.
+## User Review & Critical Decisions
 
-### Optimization Architecture
-- **GPU Vertex Shader Spine Undulation (`onBeforeCompile`)**:
-  - Inject custom vertex displacement into the fish body material shader driven by per-fish uniforms (`uTailPhase`, `uSwimAmp`).
-  - Eliminate the per-frame JavaScript `deformFishSpineSWave` loop and `posAttr.needsUpdate = true` buffer uploads completely.
-- **Merged Geometry & Draw-Call Reduction**:
-  - Merge static anatomical sub-meshes on each fish (gill operculum plates, dorsal fin, anal fin, pelvic fins, and eye spheres) so each fish requires only **3 draw calls** (sculpted body+eyes+gills mesh, articulated caudal tail mesh, and sculling pectoral wing mesh) instead of 12+.
-  - Batch static rock arch geometries and coral colony geometries in `buildTankEnvironment` into merged buffers per material, and freeze kelp matrix updates when in Low quality mode.
-- **Quality-Tiered Materials & Backface Culling (`FrontSide`)**:
-  - Switch closed 3D body and volumetric fin geometries to `THREE.FrontSide` to cut fragment shader invocations in half.
-  - Use fast `MeshLambertMaterial` on `low` quality, `MeshStandardMaterial` on `mid` quality, and `MeshPhysicalMaterial` on `high` quality.
-  - Skip `PMREMGenerator` environment map generation and shadow map passes when `qualityTier === 'low'`.
-- **Decoupled Storage & 1Hz HUD Sync (`src/App.tsx`)**:
-  - Remove `saveEcosystemState(eco)` from the 60FPS render callback; persist to `localStorage` on a 20-second background timer and immediately on user/admin actions or page unload.
-  - Throttle React HUD state synchronization to `1000ms` (1Hz) so React never interrupts WebGL frame pacing.
-- **Greyed-Out Dead Fishes in 3D & UI**:
-  - Generate a dedicated desaturated monochrome greyscale skin & fin texture pair (`getOrCreateDeadFishGreyscaleTextures()`) and apply neutral grey material properties (`color: #9ca3af`, `emissiveIntensity: 0`, `roughness: 0.85`, `uSwimAmp: 0`) whenever `!fish.lineage.alive`.
-  - Dead fishes immediately turn unmistakably grey in color in the 3D tank and float belly-up near the surface.
+> [!IMPORTANT]
+> The following decisions were confirmed through Phase 1 interactive questions and will guide the build:
+
+- **Confirmed Decision 1 (Menu Aesthetic)**: **Console Game HUD with glowing accents and side tabs**. Replaces the generic website-like modal with a full console game pause HUD featuring a left vertical tab bar (`[LB/RB]` switcher), dark ocean obsidian surfaces, vibrant cyan/gold neon glow focus states, and a bottom TV controller button legend.
+- **Confirmed Decision 2 (Fish Renaming)**: **Rename button on each fish card with TV text input**. Players can select any living fish, press "Rename", and type a custom name using on-screen keyboard or remote/gamepad input, which persists locally and syncs to Firestore.
+- **Confirmed Decision 3 (Cloud Update Audio)**: **Chime for birth or gifts, low warning tone for death**. When an admin in the Trainer kills/starves, reproduces, gives, or replaces a fish, the game plays an immediate distinct audio cue and presents a scannable toast notification.
+- **Confirmed Decision 4 (MyPC Input & Return Button Decoupling)**: Disables capture-phase key interception when the MyPC system menu or return dialog is active, preventing the game from stealing focus away from MyPC OS navigation.
 
 ---
 
-## 2. Trainer Keeper Service: Clickable Users, All Fishes, Live Kill Sync & Give/Replace Fish (`src/components/TrainerApp.tsx`, `src/engine/firebaseBrainer.ts`, `src/App.tsx`)
+## 1. Overview & Core Concept
 
-### Clickable Users List & All Fishes View
-- Expand `fetchAllUserBrainRecordsFromFirestore` and `subscribeToAllUserBrainRecords` to query up to 100 user records and merge with the local owner profile so **all users and all their fishes** are always visible.
-- Make the **Users List** in the Keeper tab interactive and clickable:
-  - Clicking a user selects that owner and displays all of their fishes (live offline in Keeper, live online in Owner Game, and dead/starved) with full details and actions.
-  - Include an **"All Users (Combined)"** view toggle so the admin can also view and filter every fish across all users at once.
-
-### Give Fish to User & Change/Replace Existing Fish
-- **Give Fish to User Modal / Panel**:
-  - Allow the admin to select any user, choose any species (from the active species list or the 50 Famous Aquarium Fishes catalog), and gift 1 or more fishes (initialized with that species' promoted Base Model brain) directly to the user's aquarium, bypassing the standard 3–6 player tank capacity limit.
-- **Change / Replace Fish Action**:
-  - In the Selected Fish Inspector and fish row actions, add a **"Change / Replace Fish Species"** selector and button that swaps the selected fish's species, 3D visual traits, lifespan config, and brain architecture/weights with the newly chosen species while preserving or resetting its vitals.
-
-### Authoritative Live Admin Kill / Action Sync (Even When Owner Has Game Open)
-- Add `adminOverrideId` and `adminOverrideAtMs` fields to `CloudUserBrainRecord` and `SavedEcosystemState`.
-- Whenever the admin executes **Starve (Kill)**, **Revive**, **Reproduce**, **Give Fish**, or **Change/Replace Fish** in the Trainer:
-  1. If the target user is the local profile, write the authoritative override to `localStorage` and Firestore immediately, and prevent the Trainer's background loop from overwriting it with stale local game state.
-  2. In `src/App.tsx`, subscribe to the active user's `mypc_user_brains/{username}` document via `onSnapshot` (in addition to `window.addEventListener('storage')`).
-  3. When `App.tsx` detects a newer `adminOverrideAtMs` (whether from Firestore or `localStorage`), it immediately merges the admin's changes into the live `ecosystemRef.current` and `setEcosystem` state **before** the next simulation tick.
-  4. Result: Even if the owner has the game open while the admin kills a fish, the fish immediately turns dead and greyed-out in the owner's live 3D aquarium and stays dead when the owner re-opens the game.
+- **What It Does**:
+  1. **Continuous 12–15s Real-Time Cloud Updates**: Periodically polls and listens to Firestore `mypc_user_brains` so any trainer action (starve/kill, baby birth, fish gift, or species replacement) takes effect in the user's game within seconds, accompanied by sound effects (triumphant birth chime for new/reproduced fish, deep warning chime for death).
+  2. **MyPC Menu Focus Protection**: Respects MyPC system pause/return events so players can use TV remote arrows to navigate the MyPC OS menu and exit the game without focus jumping into the 3D tank.
+  3. **Fish Renaming**: Allows owners to personalize each fish with a custom name that stays with their lineage across generations and cloud syncs.
+  4. **Console Game HUD Redesign**: Re-engineers the menu into a console-grade HUD with left-hand vertical tabs, glowing focus rings, sleek health/energy gauges, and snappy TV remote navigation that stays at 60 FPS.
+- **Target Audience**: TV players, game controller users, and desktop caretakers enjoying a living 3D aquarium game.
 
 ---
 
-## 3. Model Version Cap (Max 10 per Species) & Single Save at End of Training (`src/engine/simulation.ts`, `src/components/TrainerApp.tsx`, `src/engine/firebaseBrainer.ts`)
+## 2. User Experience & Visual Design
 
-- **Single Version Creation at End of Multi-Generation Training**:
-  - Update `runAcceleratedHeadlessTraining` to accept an option `commitVersionToRegistry?: boolean` (or separate the evolutionary step from final version creation).
-  - During a multi-generation run in `handleStartCpuThrottledTraining` (e.g., training a new fish `SSS` for `100G`), evolve the population and carry forward `bestBrain` across chunks in memory **without** pushing intermediate versions to `modelRegistry` or Firestore.
-  - Only when the training run finishes (at generation `100G` or when stopped) is **1 single new `ModelVersionRecord`** created, added to `modelRegistry`, and saved to Firestore once.
-- **Max 10 Versions per Fish Species**:
-  - Enforce a helper `pruneSpeciesModelVersions(registry, speciesId, maxVersions = 10)` in both local state and `saveModelVersionToFirestore`.
-  - Whenever a version is added for a species, keep at most the **10 most recent versions** for that species (always preserving the currently promoted active base version within the 10) and delete any older overflow version documents (`base_models/{speciesId}__{oldVersionId}`) from Firestore.
+### A. Console Game HUD Layout
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  ABYSSAL EVO · SANCTUARY OVERVIEW                   [Keeper] Lv.3 · 450 Cr · Day 12 · 60 FPS   [X]     │
+├─────────────────┬──────────────────────────────────────────────────────────────────────────────────────┤
+│  [LB]      [RB] │                                                                                      │
+│                 │  SELECTED FISH: NEON TETRA (AURELIA)                       Gen 2 · Adult · 14.2h     │
+│  [1] MY FISHES  │  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│      4/5 Live   │  │ Fullness / Energy       [████████████████████░░░░░░] 78%                       │  │
+│                 │  │ Comfort & Water Care    [██████████████████████████] 95%                       │  │
+│  [2] SHOP & TANK│  │ Genes: Speed 1.4x · Vision 2.2 · Brain: v1.0-base                              │  │
+│      6 Species  │  └────────────────────────────────────────────────────────────────────────────────┘  │
+│                 │                                                                                      │
+│  [3] LIGHTS & 3D│  ALL TANK RESIDENTS (4 ALIVE · 0 DEAD):                                              │
+│      Day / Bulbs│  ┌────────────────────────┐ ┌────────────────────────┐ ┌────────────────────────┐  │
+│                 │  │ ● Aurelia       Gen 2  │ │ ● Zephyr        Gen 1  │ │ ● Coral         Gen 1  │  │
+│                 │  │ Neon Tetra · 78% Energy│ │ Guppy · 84% Energy     │ │ Angelfish · 92% Energy │  │
+│                 │  │ [RENAME]   [DETAILS]   │ │ [RENAME]   [DETAILS]   │ │ [RENAME]   [DETAILS]   │  │
+│                 │  └────────────────────────┘ └────────────────────────┘ └────────────────────────┘  │
+├─────────────────┴──────────────────────────────────────────────────────────────────────────────────────┤
+│  [OK / A] Select   [B / Back] Close Menu   [Y / Rename] Rename Fish   [LB / RB] Switch Category        │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Aesthetic Direction**: Console Game HUD with deep oceanic obsidian backgrounds (`#050d18` / `#08162b`), crisp 1px glowing cyan borders (`#22d3ee` / `#38bdf8`), golden reward accents for credits, and vibrant status bars.
+- **Left Vertical Tab Bar**: Sleek vertical pills with gamepad bumper indicators `[LB] / [RB]`.
+- **Fish Card Interactions**: Clean cards showing colored species gem, name, generation, energy gauge, and dedicated `[Rename]` and `[Care / Feed]` buttons.
+- **Fish Rename Modal**: Minimalist floating dark overlay with a glowing input field, preset random name generator ("Bubbles", "Zephyr", "Aurelia", "Glacier"), and `Confirm [OK]` / `Cancel [Back]` buttons.
+- **TV Controller Navigation**: Full D-Pad up/down/left/right navigation across cards with distinct glowing white/cyan focus borders (`ring-2 ring-cyan-400 ring-offset-2 ring-offset-slate-950`).
 
 ---
 
-## 4. Firestore Write Optimization (Respect 20k Daily Quota) (`src/engine/firebaseBrainer.ts`, `src/App.tsx`, `src/components/TrainerApp.tsx`)
+## 3. Key Product Decisions & Trade-Offs
 
-- **Remove High-Frequency Polling Writes**:
-  - Remove the `1800ms` `setUserOnlineStatusInFirestore` interval and `10000ms` `syncUserBrainsToFirestore` interval in `src/App.tsx`.
-  - Remove the per-tick (`150ms–600ms`) Firestore `setDoc` inside `TrainerApp.tsx`'s Keeper interval.
-- **Range-Throttled Checkpoints (Every 3–5 Minutes) + Instant Event Writes**:
-  - Write to Firestore **immediately** only on high-value state transitions:
-    - Game session open / close (`visibilitychange`, `pagehide`, `beforeunload`)
-    - Fish death (starvation / old age) or natural baby birth
-    - Shop fish purchase, tank upgrade, or auto-feeder purchase
-    - Admin action in Trainer (Kill/Starve, Revive, Reproduce, Give Fish, Replace Fish, Reset Fishes, Save/Promote Model at end of training)
-  - For continuous background simulation (both in-game and in the 24/7 Keeper), batch dirty state updates and write to Firestore only once every **4 minutes (`240,000ms`)** if state has changed.
-  - Skip redundant `base_models` writes unless the user explicitly finishes training, promotes a version, or clicks Save Properties.
+- **Decision 1: Dual Firestore Sync (Snapshot Listener + 15s Periodic Poll Fallback)**
+  - *Chosen Approach*: Maintain the low-latency Firestore `onSnapshot` listener and add an active 15s interval check (`loadUserBrainsFromFirestore`) that compares both `adminOverrideAtMs` and `fishBrains` array differences.
+  - *Why*: Snapshot WebSockets can silently sleep or throttle on background tabs or low-power TV browsers; a 15-second lightweight polling heartbeat guarantees updates arrive even if WebSockets stall.
+- **Decision 2: Audio Synthesis for Death vs. Birth/Gift**
+  - *Chosen Approach*: Use Web Audio API oscillators to generate a distinct low-frequency warning tone (`220Hz -> 140Hz -> 90Hz` triangle wave) for fish deaths, and the existing bright crystalline arpeggio (`playBirthChime`) for new fishes, babies, or admin gifts.
+  - *Why*: Zero audio asset download overhead; instant, zero-latency playback on any device.
+- **Decision 3: MyPC Menu Return-Button Input Isolation**
+  - *Chosen Approach*: When MyPC emits `onPause` or when `screenState === 'paused'`, or when focus is outside the app's interactive root, disable `e.preventDefault()` and `e.stopPropagation()` on arrow keys and return keys.
+  - *Why*: Allows the native MyPC TV interface to receive arrow keys so the user can navigate MyPC's system exit menu without the game capturing focus.
+
+---
+
+## 4. Technical Architecture & Data Strategy
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            MYPC GAME RUNTIME                                 │
+│                                                                              │
+│  ┌──────────────────────┐      15s Poll / onSnapshot      ┌───────────────┐  │
+│  │ Firestore Brain Sync │ ◄─────────────────────────────► │ Cloud DB      │  │
+│  │ (mypc_user_brains)   │                                 │ (User Brains) │  │
+│  └──────────┬───────────┘                                 └───────────────┘  │
+│             │                                                                │
+│             ▼                                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ App.tsx: applyCloudRecordToEcosystem()                                 │  │
+│  │ - Detects: newly dead fish  ──► playDeathWarningTone() + Warning Toast │  │
+│  │ - Detects: newly added fish ──► playBirthChime()       + Gift Toast    │  │
+│  │ - Updates ecosystem state asynchronously                               │  │
+│  └──────────┬─────────────────────────────────────────────────────────────┘  │
+│             │                                                                │
+│             ▼                                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ ConsoleGameHUD (Redesigned Menu Component / Modal)                     │  │
+│  │ - Left Vertical Tabs: [LB] / [RB] Switcher                             │  │
+│  │ - Main Content: Fishes Grid, Shop Cards, Lighting & 3D Toggles         │  │
+│  │ - In-Game Rename Flow: [Rename] Button ──► Input Dialog ──► Save State │  │
+│  │ - Bottom TV Controller Legend                                          │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Entities Mutated**:
+  - `FishLineage.name`: Player-editable string (max 24 characters, sanitized).
+  - `SavedEcosystemState.fishes`: Updated upon rename, local save, and cloud sync.
+  - `audioEngine.playDeathWarningTone()`: Web Audio synthesized warning cue.
+
+---
+
+## 5. Verification Plan
+
+1. **Compilation**: Run `npm run lint` (`tsc --noEmit`) and `npm run build` to verify zero type errors and confirm `dist_dir` is generated properly.
+2. **Cloud Update Verification**: Simulate an admin action (kill or give fish in Trainer) and verify the player game updates within 15 seconds with the appropriate sound effect.
+3. **Fish Renaming**: Test renaming a fish in the HUD, confirming it updates the 3D label, the menu card, local storage, and Firestore record.
+4. **MyPC Menu & Return Key**: Test pressing Back/Escape/Return when MyPC menu is shown, verifying arrow keys navigate MyPC instead of the game.

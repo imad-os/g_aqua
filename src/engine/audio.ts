@@ -94,7 +94,25 @@ class AquariumAudioEngine {
   }
 
   public playBirthChime(): void {
-    this.playTone(523.25, 0.22, 'sine', this.sfxVolume * 0.25, 783.99);
+    this.playTone(523.25, 0.18, 'sine', this.sfxVolume * 0.26, 659.25);
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        this.playTone(659.25, 0.26, 'triangle', this.sfxVolume * 0.28, 987.77);
+      }, 140);
+    }
+  }
+
+  public playDeathWarningTone(): void {
+    this.playTone(240, 0.24, 'sawtooth', this.sfxVolume * 0.28, 135);
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        this.playTone(135, 0.38, 'triangle', this.sfxVolume * 0.32, 82);
+      }, 190);
+    }
+  }
+
+  public playRenameChime(): void {
+    this.playTone(587.33, 0.14, 'sine', this.sfxVolume * 0.22, 880);
   }
 
   public playTankUpgrade(): void {

@@ -822,16 +822,27 @@ export function subscribeToSingleUserBrainRecord(
   try {
     const docId = sanitizeKey(username);
     let lastProcessedAdminTs = 0;
+    let lastProcessedUpdatedMs = 0;
     return onSnapshot(
       doc(aiFirestore, 'mypc_user_brains', docId),
       (snap) => {
-        // Ignore our own local writes echoing back so we never waste CPU parsing self-writes
         if (!snap.exists() || snap.metadata.hasPendingWrites) return;
         const data = snap.data() as any;
         const adminTs = Number(data?.adminOverrideAtMs || 0);
-        // Only parse full brain weights if there is a new admin override timestamp
-        if (!adminTs || adminTs <= lastProcessedAdminTs) return;
-        lastProcessedAdminTs = adminTs;
+        const updatedMs = Number(data?.updatedAtMs || 0);
+        const lastSelfWriteMs = _lastCloudUserFirestoreWriteMs.get(docId) || 0;
+
+        // Ignore echo of our own player game write
+        const isSelfEcho = updatedMs > 0 && Math.abs(updatedMs - lastSelfWriteMs) < 1200 && adminTs <= lastProcessedAdminTs;
+        if (isSelfEcho) return;
+
+        const hasNewAdminOverride = adminTs > 0 && adminTs > lastProcessedAdminTs;
+        const hasNewExternalUpdate = updatedMs > 0 && updatedMs > lastProcessedUpdatedMs && Math.abs(updatedMs - lastSelfWriteMs) >= 1200;
+
+        if (!hasNewAdminOverride && !hasNewExternalUpdate) return;
+        if (adminTs > lastProcessedAdminTs) lastProcessedAdminTs = adminTs;
+        if (updatedMs > lastProcessedUpdatedMs) lastProcessedUpdatedMs = updatedMs;
+
         setTimeout(() => {
           onUpdate({
             ...data,

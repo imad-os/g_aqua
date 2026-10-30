@@ -1509,106 +1509,57 @@ export const TrainerApp: React.FC = () => {
   // ============================================================================
   if (!adminUser) {
     return (
-      <div className="fixed inset-0 w-full h-full bg-[#060a12] text-slate-100 flex items-center justify-center p-6 select-none">
-        <div className="w-full max-w-md rounded-2xl bg-[#0b1322] border border-cyan-500/40 p-7 shadow-2xl space-y-5">
-          <div className="flex items-start justify-between gap-3">
+      <div className="fixed inset-0 w-full h-full bg-[#02060d] text-slate-100 flex items-center justify-center p-6 select-none">
+        <div className="w-full max-w-md rounded-xl bg-[#040c1a] border-2 border-cyan-500 overflow-hidden">
+          <div className="px-6 py-4 bg-[#061328] border-b border-cyan-800 flex items-start justify-between gap-3">
             <div>
-              <span className="text-xs font-mono text-cyan-300 font-bold uppercase">
-                Standalone Back-Office Studio
-              </span>
-              <h1 className="text-xl font-bold text-white mt-1">
-                Abyssal Evo · AI Trainer &amp; 24/7 Fish Keeper
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500 text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">
+                  TRAINER HUD v1.7.3
+                </span>
+                <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">
+                  ADMIN AUTH GATE
+                </span>
+              </div>
+              <h1 className="text-lg font-extrabold tracking-wide uppercase text-white mt-1.5">
+                ABYSSAL EVO // AI COMMAND DECK
               </h1>
-              <p className="text-xs text-slate-400 mt-1">
-                Sign in with an authorized Admin Gmail account listed in the Firestore{' '}
-                <code className="text-cyan-300">admins</code> collection (
-                <code className="text-cyan-300">aquarium-caa2b</code>).
-              </p>
             </div>
             <button
               type="button"
               onClick={() => setActiveHelp(TRAINER_HELP.admins_collection)}
-              className="w-7 h-7 rounded-full bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 text-xs font-bold shrink-0"
+              className="w-7 h-7 rounded bg-cyan-950 border border-cyan-500 text-cyan-300 text-xs font-mono font-bold shrink-0"
               title="How Admin Auth Works"
             >
               ?
             </button>
           </div>
 
-          {authError && (
-            <div className="p-3 rounded-lg bg-rose-950/70 border border-rose-500/50 text-xs text-rose-200">
-              {authError}
-            </div>
-          )}
+          <div className="p-6 space-y-5">
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Sign in with an authorized Admin Gmail account listed in the Firestore{' '}
+              <code className="text-cyan-300 font-mono">admins</code> collection (
+              <code className="text-cyan-300 font-mono">aquarium-caa2b</code>).
+            </p>
 
-          <button
-            type="button"
-            disabled={authChecking}
-            onClick={async () => {
-              setAuthError(null);
-              const res = await signInWithGmailPopup();
-              if (res.success && res.email) {
-                const check = await verifyAdminInFirestoreCollection(
-                  res.email,
-                  res.displayName || res.email
-                );
-                if (check.adminRecord) {
-                  setAdminUser(check.adminRecord);
-                  setAdminsList(check.adminsList);
-                  if (typeof sessionStorage !== 'undefined') {
-                    sessionStorage.setItem(
-                      'abyssal_evo_verified_admin',
-                      JSON.stringify(check.adminRecord)
-                    );
-                  }
-                }
-              } else if (res.errorMessage) {
-                setAuthError(res.errorMessage);
-              }
-            }}
-            className="w-full py-3 px-4 rounded-xl bg-white text-slate-950 font-bold text-xs flex items-center justify-center gap-2.5 hover:bg-slate-100 transition-colors shadow"
-          >
-            <svg viewBox="0 0 24 24" className="w-4 h-4">
-              <path
-                fill="#EA4335"
-                d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.4 1 3.5 3.6 1.6 7.4l3.7 2.8C6.2 7.2 8.9 5 12 5z"
-              />
-              <path
-                fill="#4285F4"
-                d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5c-.3 1.5-1.1 2.8-2.4 3.6l3.7 2.9c2.2-2 3.7-5 3.7-8.7z"
-              />
-              <path
-                fill="#FBBC05"
-                d="M5.3 14.8c-.2-.8-.4-1.6-.4-2.5s.2-1.7.4-2.5L1.6 7C.6 9 0 11.2 0 13.5s.6 4.5 1.6 6.5l3.7-2.9z"
-              />
-              <path
-                fill="#34A853"
-                d="M12 24c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3.1 0-5.8-2.1-6.7-5l-3.7 2.9C3.5 21.4 7.4 24 12 24z"
-              />
-            </svg>
-            <span>Sign In with Google (Gmail Admin)</span>
-          </button>
+            {authError && (
+              <div className="p-3 rounded bg-[#2a0812] border border-rose-500 text-xs font-mono text-rose-200">
+                {authError}
+              </div>
+            )}
 
-          <div className="pt-3 border-t border-slate-800 space-y-2.5">
-            <div className="text-[11px] text-slate-400">
-              Testing inside an embedded preview where browser popups are blocked? Verify your
-              Gmail directly against the Firestore <code className="text-cyan-300">admins</code>{' '}
-              collection:
-            </div>
-            <div className="flex gap-2">
-              <input
-                type="email"
-                value={manualVerifyEmail}
-                onChange={(e) => setManualVerifyEmail(e.target.value)}
-                placeholder="admin@gmail.com"
-                className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-              />
-              <button
-                type="button"
-                onClick={async () => {
-                  setAuthError(null);
-                  const check = await verifyAdminInFirestoreCollection(manualVerifyEmail);
-                  if (check.authorized && check.adminRecord) {
+            <button
+              type="button"
+              disabled={authChecking}
+              onClick={async () => {
+                setAuthError(null);
+                const res = await signInWithGmailPopup();
+                if (res.success && res.email) {
+                  const check = await verifyAdminInFirestoreCollection(
+                    res.email,
+                    res.displayName || res.email
+                  );
+                  if (check.adminRecord) {
                     setAdminUser(check.adminRecord);
                     setAdminsList(check.adminsList);
                     if (typeof sessionStorage !== 'undefined') {
@@ -1617,38 +1568,96 @@ export const TrainerApp: React.FC = () => {
                         JSON.stringify(check.adminRecord)
                       );
                     }
-                  } else {
-                    setAuthError(
-                      `"${manualVerifyEmail}" is not in the Firestore "admins" collection.`
-                    );
                   }
-                }}
-                className="px-3.5 py-2 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400 whitespace-nowrap"
-              >
-                Verify in Firestore
-              </button>
+                } else if (res.errorMessage) {
+                  setAuthError(res.errorMessage);
+                }
+              }}
+              className="w-full py-3 px-4 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-mono font-extrabold uppercase tracking-wider text-xs flex items-center justify-center gap-2.5"
+            >
+              <svg viewBox="0 0 24 24" className="w-4 h-4 bg-white rounded-full p-0.5">
+                <path
+                  fill="#EA4335"
+                  d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.4 1 3.5 3.6 1.6 7.4l3.7 2.8C6.2 7.2 8.9 5 12 5z"
+                />
+                <path
+                  fill="#4285F4"
+                  d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5c-.3 1.5-1.1 2.8-2.4 3.6l3.7 2.9c2.2-2 3.7-5 3.7-8.7z"
+                />
+                <path
+                  fill="#FBBC05"
+                  d="M5.3 14.8c-.2-.8-.4-1.6-.4-2.5s.2-1.7.4-2.5L1.6 7C.6 9 0 11.2 0 13.5s.6 4.5 1.6 6.5l3.7-2.9z"
+                />
+                <path
+                  fill="#34A853"
+                  d="M12 24c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3.1 0-5.8-2.1-6.7-5l-3.7 2.9C3.5 21.4 7.4 24 12 24z"
+                />
+              </svg>
+              <span>SIGN IN WITH GOOGLE (ADMIN)</span>
+            </button>
+
+            <div className="pt-4 border-t border-cyan-900 space-y-2.5">
+              <div className="text-[11px] font-mono text-slate-400">
+                EMBEDDED PREVIEW / POPUP FALLBACK — VERIFY GMAIL IN FIRESTORE:
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="email"
+                  value={manualVerifyEmail}
+                  onChange={(e) => setManualVerifyEmail(e.target.value)}
+                  placeholder="admin@gmail.com"
+                  className="flex-1 bg-[#071426] border border-cyan-800 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                />
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setAuthError(null);
+                    const check = await verifyAdminInFirestoreCollection(manualVerifyEmail);
+                    if (check.authorized && check.adminRecord) {
+                      setAdminUser(check.adminRecord);
+                      setAdminsList(check.adminsList);
+                      if (typeof sessionStorage !== 'undefined') {
+                        sessionStorage.setItem(
+                          'abyssal_evo_verified_admin',
+                          JSON.stringify(check.adminRecord)
+                        );
+                      }
+                    } else {
+                      setAuthError(
+                        `"${manualVerifyEmail}" is not in the Firestore "admins" collection.`
+                      );
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-lg bg-[#071426] border border-cyan-400 text-cyan-200 hover:bg-cyan-400 hover:text-slate-950 text-xs font-mono font-bold uppercase whitespace-nowrap"
+                >
+                  VERIFY
+                </button>
+              </div>
             </div>
           </div>
         </div>
 
         {activeHelp && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
-            <div className="w-full max-w-md rounded-2xl bg-[#0b1528] border border-cyan-400/50 p-6 space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-base font-bold text-white">{activeHelp.title}</h3>
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#02060d] p-4">
+            <div className="w-full max-w-md rounded-xl bg-[#040c1a] border-2 border-cyan-400 p-6 space-y-4">
+              <div className="flex items-center justify-between pb-3 border-b border-cyan-900">
+                <h3 className="text-sm font-mono font-extrabold uppercase tracking-wider text-white">
+                  {activeHelp.title}
+                </h3>
                 <button
                   type="button"
                   onClick={() => setActiveHelp(null)}
-                  className="px-2.5 py-1 rounded bg-slate-800 text-xs text-slate-300"
+                  className="px-2.5 py-1 rounded bg-[#071426] border border-cyan-700 text-xs font-mono font-bold text-cyan-200"
                 >
-                  Close
+                  CLOSE
                 </button>
               </div>
               <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
                 {activeHelp.explanation}
               </p>
-              <div className="p-3 rounded-lg bg-cyan-950/60 border border-cyan-500/30 text-xs text-cyan-200">
-                <strong>Example:</strong> {activeHelp.example}
+              <div className="p-3 rounded-lg bg-[#071426] border border-cyan-700 text-xs text-cyan-200">
+                <strong className="font-mono uppercase text-cyan-400">Example:</strong>{' '}
+                {activeHelp.example}
               </div>
             </div>
           </div>
@@ -1689,23 +1698,24 @@ export const TrainerApp: React.FC = () => {
   });
 
   return (
-    <div className="fixed inset-0 w-full h-full bg-[#070b12] text-slate-100 flex flex-col overflow-hidden select-none">
-      {/* Top Back-Office Admin Header */}
-      <header className="h-14 px-6 bg-[#0b111e] border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
-        <div className="flex items-center gap-4">
-          <span className="text-xs font-mono font-bold text-cyan-300 uppercase">
-            BACK-OFFICE AI STUDIO
+    <div className="fixed inset-0 w-full h-full bg-[#02060d] text-slate-100 flex flex-col overflow-hidden select-none">
+      {/* Top Console Command Deck Header */}
+      <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
+        <div className="flex items-center gap-3">
+          <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
+            TRAINER HUD v1.7.3
           </span>
-          <span className="text-slate-600">·</span>
-          <span className="text-sm font-bold text-white">
-            Abyssal Evo · Advanced AI Trainer, 50-Species Lab &amp; Dynamic 24/7 Fish Keeper
+          <span className="text-sm font-extrabold uppercase tracking-wider text-white">
+            ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
           </span>
         </div>
 
         {/* Global CPU Usage Limit Control in Header + Admin Profile */}
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 bg-slate-900/90 border border-slate-700 rounded-lg px-3 py-1.5">
-            <span className="text-xs text-slate-300 font-medium">PC / Phone CPU Limit:</span>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 bg-[#071426] border border-cyan-800 rounded-lg px-3 py-1.5">
+            <span className="text-[11px] font-mono uppercase tracking-wider text-slate-300 font-bold">
+              CPU CAP:
+            </span>
             <input
               type="range"
               aria-label="CPU Usage Limit Percentage"
@@ -1714,15 +1724,15 @@ export const TrainerApp: React.FC = () => {
               step={5}
               value={cpuUsageLimitPct}
               onChange={(e) => setCpuUsageLimitPct(Number(e.target.value))}
-              className="w-24 accent-cyan-400 cursor-pointer"
+              className="w-20 accent-cyan-400 cursor-pointer"
             />
-            <span className="text-xs font-mono font-bold text-cyan-300 w-14 text-right">
+            <span className="text-xs font-mono font-extrabold text-cyan-300 w-10 text-right">
               {cpuUsageLimitPct === 100 ? 'MAX' : `${cpuUsageLimitPct}%`}
             </span>
             <button
               type="button"
               onClick={() => setActiveHelp(TRAINER_HELP.cpu_usage_limit)}
-              className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold"
+              className="w-5 h-5 rounded bg-cyan-950 border border-cyan-600 text-cyan-300 text-[11px] font-mono font-bold"
               title="What is CPU Usage Limit?"
             >
               ?
@@ -1730,8 +1740,8 @@ export const TrainerApp: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 text-xs">
-            <span className="text-slate-400 hidden md:inline font-mono">
-              Admin: <strong className="text-emerald-300">{adminUser.email}</strong>
+            <span className="px-2.5 py-1 rounded bg-[#071426] border border-emerald-800 text-slate-300 hidden md:inline font-mono text-[11px]">
+              ADMIN: <strong className="text-emerald-300">{adminUser.email}</strong>
             </span>
             <button
               type="button"
@@ -1742,79 +1752,78 @@ export const TrainerApp: React.FC = () => {
                 }
                 setAdminUser(null);
               }}
-              className="px-3 py-1.5 rounded bg-slate-800 text-slate-300 hover:text-white text-xs"
+              className="px-3 py-1.5 rounded-lg bg-[#071426] border border-slate-700 text-slate-300 hover:border-rose-500 hover:text-white text-xs font-mono font-bold uppercase"
             >
-              Sign Out
+              SIGN OUT
             </button>
           </div>
         </div>
       </header>
 
-      {/* 5-Tab Studio Navigation Bar */}
+      {/* 5-Tab Console Command Navigation Bar (Shortened Tab Names) */}
       <nav
         aria-label="Trainer Sections"
-        className="px-6 py-2.5 bg-[#0d1526] border-b border-slate-800 flex items-center justify-between gap-3 shrink-0 overflow-x-auto"
+        className="px-5 py-2 bg-[#061328] border-b border-cyan-900 flex items-center justify-between gap-3 shrink-0 overflow-x-auto"
       >
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => setActiveTab('train_models')}
-            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
               activeTab === 'train_models'
-                ? 'bg-cyan-400 text-slate-950'
-                : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                ? 'bg-cyan-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-cyan-500 hover:text-white'
             }`}
           >
-            1. Train Base Models (Up to 1,000+ Gens)
+            01 // TRAIN AI
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('offline_service')}
-            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
               activeTab === 'offline_service'
-                ? 'bg-emerald-400 text-slate-950'
-                : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                ? 'bg-emerald-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-emerald-500 hover:text-white'
             }`}
           >
-            2. Dynamic 24/7 Fish Keeper ({localOfflineKeeperFishes.length} in Keeper ·{' '}
-            {localOnlineInGameFishes.length} Online in Game)
+            02 // 24/7 KEEPER ({localOfflineKeeperFishes.length}/{localOnlineInGameFishes.length})
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('species_editor')}
-            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
               activeTab === 'species_editor'
-                ? 'bg-amber-400 text-slate-950'
-                : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                ? 'bg-amber-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-amber-500 hover:text-white'
             }`}
           >
-            3. Base Model Properties &amp; 50 Famous Fishes ({ecosystem.speciesList.length})
+            03 // SPECIES ({ecosystem.speciesList.length})
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('brain_lab')}
-            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
               activeTab === 'brain_lab'
-                ? 'bg-violet-400 text-slate-950'
-                : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                ? 'bg-violet-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-violet-500 hover:text-white'
             }`}
           >
-            4. Neural Brain Architecture Lab
+            04 // BRAIN LAB
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('evolution_lab')}
-            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`px-3.5 py-2 rounded-lg text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap border ${
               activeTab === 'evolution_lab'
-                ? 'bg-sky-400 text-slate-950'
-                : 'bg-slate-900 text-slate-300 hover:bg-slate-800'
+                ? 'bg-sky-400 text-slate-950 border-white'
+                : 'bg-[#040c1a] text-slate-300 border-cyan-900 hover:border-sky-500 hover:text-white'
             }`}
           >
-            5. Evolution Rules, Lineage, A/B Trials &amp; Admins
+            05 // EVOLUTION
           </button>
         </div>
 
@@ -1822,26 +1831,26 @@ export const TrainerApp: React.FC = () => {
           <button
             type="button"
             onClick={handleResetAllFishesKeepBaseModels}
-            className="px-3.5 py-2 rounded-lg bg-rose-500/20 border border-rose-400/60 text-rose-200 hover:bg-rose-500 hover:text-white text-xs font-bold transition-colors whitespace-nowrap shadow-sm"
+            className="px-3 py-2 rounded-lg bg-[#2a0812] border border-rose-500 text-rose-200 hover:bg-rose-500 hover:text-white text-xs font-mono font-extrabold uppercase tracking-wider whitespace-nowrap"
             title="Reset all fishes to fresh Gen 1 starters while keeping all trained Base Models and Species properties intact"
           >
-            Reset All Fishes (Keep Base Models)
+            RESET FISHES
           </button>
-          <span className="text-xs font-mono text-slate-400 hidden xl:inline">
+          <span className="px-2.5 py-1 rounded bg-[#040c1a] border border-cyan-900 text-[11px] font-mono text-cyan-300 hidden xl:inline">
             {firestoreSyncStatus}
           </span>
         </div>
       </nav>
 
       {statusBanner && (
-        <div className="px-6 py-2.5 bg-cyan-950/70 border-b border-cyan-700/50 flex items-center justify-between text-xs text-cyan-100 shrink-0">
+        <div className="px-5 py-2 bg-[#071f38] border-b border-cyan-500 flex items-center justify-between text-xs font-mono text-cyan-100 shrink-0">
           <span>{statusBanner}</span>
           <button
             type="button"
             onClick={() => setStatusBanner(null)}
-            className="text-cyan-300 hover:text-white font-bold ml-4"
+            className="px-2 py-0.5 rounded bg-[#040c1a] border border-cyan-500 text-cyan-300 hover:text-white font-bold uppercase ml-4"
           >
-            Dismiss
+            DISMISS
           </button>
         </div>
       )}
@@ -3987,24 +3996,27 @@ export const TrainerApp: React.FC = () => {
           role="dialog"
           aria-modal="true"
           aria-label={activeHelp.title}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#02060d] p-4"
         >
-          <div className="w-full max-w-md rounded-2xl bg-[#0b1528] border border-cyan-400/60 p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-white">{activeHelp.title}</h3>
+          <div className="w-full max-w-md rounded-xl bg-[#040c1a] border-2 border-cyan-400 p-6 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-cyan-900">
+              <h3 className="text-sm font-mono font-extrabold uppercase tracking-wider text-white">
+                {activeHelp.title}
+              </h3>
               <button
                 type="button"
                 onClick={() => setActiveHelp(null)}
-                className="px-3 py-1 rounded-lg bg-slate-800 text-xs font-semibold text-slate-300 hover:text-white"
+                className="px-3 py-1 rounded bg-[#071426] border border-cyan-700 text-xs font-mono font-bold text-cyan-200 hover:text-white uppercase"
               >
-                Close
+                CLOSE
               </button>
             </div>
             <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
               {activeHelp.explanation}
             </p>
-            <div className="p-3.5 rounded-xl bg-cyan-950/60 border border-cyan-500/30 text-xs text-cyan-200 leading-relaxed">
-              <strong>Example:</strong> {activeHelp.example}
+            <div className="p-3.5 rounded-lg bg-[#071426] border border-cyan-700 text-xs text-cyan-200 leading-relaxed">
+              <strong className="font-mono uppercase text-cyan-400">Example:</strong>{' '}
+              {activeHelp.example}
             </div>
           </div>
         </div>

@@ -35,6 +35,7 @@ export interface AquariumCanvas3DProps {
   framelessTvMode?: boolean;
   activeTankTier: number;
   isPaused: boolean;
+  isMenuOpen?: boolean;
   onTickSimulation: (dt: number) => void;
   onSelectFish?: (fishId: string) => void;
   onPolygonStatsUpdate?: (stats: { trianglesPerFish: number; totalFishTriangles: number }) => void;
@@ -963,6 +964,7 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
   framelessTvMode = true,
   activeTankTier,
   isPaused,
+  isMenuOpen = false,
   onTickSimulation,
   onPolygonStatsUpdate,
   onFpsUpdate,
@@ -986,6 +988,9 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
 
   const isPausedRef = useRef(isPaused);
   isPausedRef.current = isPaused;
+
+  const isMenuOpenRef = useRef(isMenuOpen);
+  isMenuOpenRef.current = isMenuOpen;
 
   const onTickRef = useRef(onTickSimulation);
   onTickRef.current = onTickSimulation;
@@ -1755,6 +1760,15 @@ export const AquariumCanvas3D: React.FC<AquariumCanvas3DProps> = ({
       if (!isPausedRef.current) {
         elapsedTotal += rawDt;
         onTickRef.current(rawDt);
+      }
+
+      // Low-Resource TV Hardware Optimization:
+      // When any full-screen Console HUD / Rename / Help / Pause menu is open, completely skip
+      // 3D WebGL scene matrix updates and renderer.render() so 100% of TV GPU & CPU resources
+      // are dedicated to instant, lag-free D-Pad / Remote menu navigation!
+      if (isMenuOpenRef.current) {
+        frameId = requestAnimationFrame(tick);
+        return;
       }
 
       const eco = ecosystemRef.current;
