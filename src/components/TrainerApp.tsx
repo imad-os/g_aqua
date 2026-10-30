@@ -68,7 +68,6 @@ import {
   SpeciesConfig,
 } from '../engine/types';
 import {
-  AquariumCanvas3D,
   FISH_3D_MODELS_CATALOG,
   FishModelPreview3D,
 } from './AquariumCanvas3D';
@@ -1969,7 +1968,7 @@ export const TrainerApp: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500 text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">
-                  TRAINER HUD v1.7.9
+                  TRAINER HUD v1.8.0
                 </span>
                 <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">
                   ADMIN AUTH GATE
@@ -2157,7 +2156,7 @@ export const TrainerApp: React.FC = () => {
       <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
-            TRAINER HUD v1.7.9
+            TRAINER HUD v1.8.0
           </span>
           <span className="text-sm font-extrabold uppercase tracking-wider text-white">
             ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
@@ -2640,21 +2639,10 @@ export const TrainerApp: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Right Column: Live 3D Species Preview + Last 5 Saved Versions */}
+                {/* Right Column: Saved Versions for Selected Fish Type */}
                 <div className="p-6 rounded-2xl bg-[#101827] border border-slate-800 flex flex-col justify-between space-y-4">
                   <div className="space-y-3">
-                    <FishModelPreview3D
-                      bodyStyle={selectedSpecies.bodyStyle}
-                      primaryColorHex={selectedSpecies.primaryColorHex}
-                      secondaryColorHex={selectedSpecies.secondaryColorHex}
-                      accentColorHex={selectedSpecies.accentColorHex}
-                      speciesName={selectedSpecies.name}
-                      aggressiveness={selectedSpecies.baseBrainConfig.aggressiveness ?? 0}
-                      heightClass="h-40"
-                      compact={true}
-                    />
-
-                    <div className="flex items-center justify-between pt-1">
+                    <div className="flex items-center justify-between">
                       <div>
                         <h3 className="text-sm font-bold text-white">
                           Last 5 Versions ({selectedSpecies.name}) — Newest First
@@ -3037,18 +3025,6 @@ export const TrainerApp: React.FC = () => {
                           No Feeder (Starve)
                         </button>
                       </div>
-
-                      <button
-                        type="button"
-                        onClick={() => setVisualModeEnabled((v) => !v)}
-                        className={`px-3.5 py-2 rounded-xl text-xs font-bold border ${
-                          visualModeEnabled
-                            ? 'bg-cyan-400 text-slate-950 border-cyan-300'
-                            : 'bg-slate-900 text-slate-300 border-slate-700'
-                        }`}
-                      >
-                        {visualModeEnabled ? '3D Visuals: ON' : '3D Visuals: OFF (Low CPU)'}
-                      </button>
                     </div>
                   </div>
 
@@ -3262,29 +3238,6 @@ export const TrainerApp: React.FC = () => {
                     </button>
                   </div>
                 </div>
-
-                {/* Optional 3D Visual Peek Window */}
-                {visualModeEnabled && (
-                  <div className="h-80 rounded-2xl overflow-hidden border border-cyan-500/40 relative">
-                    <AquariumCanvas3D
-                      ecosystemRef={ecosystemRef}
-                      pelletsRef={pelletsRef}
-                      threatsRef={threatsRef}
-                      cursorPosRef={cursorPosRef}
-                      cameraOrbitRef={cameraOrbitRef}
-                      selectedFishId={activeSelectedRow?.fishId || null}
-                      screensaverMode={true}
-                      qualityTier="mid"
-                      fishPolygonQuality="high"
-                      activeTankTier={ecosystem.activeTankTier}
-                      isPaused={!serviceRunning}
-                      onTickSimulation={() => {}}
-                    />
-                    <div className="absolute top-3 left-3 px-3 py-1.5 rounded bg-black/70 text-xs font-mono text-cyan-300">
-                      Live 3D Peek · Offline Fish Keeper Tank (Dead fishes are greyed out &amp; float belly-up)
-                    </div>
-                  </div>
-                )}
 
                 {/* =================================================================
                     CLICKABLE USERS LIST + ALL FISHES LIST + SELECTED FISH INSPECTOR

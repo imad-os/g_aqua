@@ -2434,7 +2434,7 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-400 font-bold">
-                      ABYSSAL EVO v1.7.9 // TV LITE HUD
+                      ABYSSAL EVO v1.8.0 // TV LITE HUD
                     </span>
                     <span className="px-1.5 py-0.5 rounded bg-[#062e22] border border-emerald-400 text-[10px] font-mono font-bold text-emerald-300">
                       CLOUD SYNC

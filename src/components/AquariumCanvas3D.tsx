@@ -2550,7 +2550,7 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
   primaryColorHex,
   secondaryColorHex,
   accentColorHex,
-  polygonQuality = 'high',
+  polygonQuality = 'medium',
   speciesName,
   aggressiveness = 0,
   heightClass = 'h-72',
@@ -2558,6 +2558,9 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
   onSelectPolygonQuality,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const rigRef = useRef<FishMeshRig | null>(null);
+
   const [cameraMode, setCameraMode] = useState<'turntable' | 'side' | 'quarter' | 'front' | 'top'>(
     'turntable'
   );
@@ -2590,65 +2593,47 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
     zoom: 1.0,
   });
 
+  // 1. Initialize WebGLRenderer, Scene, Camera, and Lights ONCE on mount (zero context recreation)
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
 
-    const isSoftwareGl = (() => {
-      const gl = document.createElement('canvas').getContext('webgl2');
-      if (!gl) return true;
-      const ext = gl.getExtension('WEBGL_debug_renderer_info');
-      const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
-      const gpu = String(gl.getParameter(param));
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
-      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-    })();
-
     const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl,
-      powerPreference: 'high-performance',
+      antialias: false,
+      powerPreference: 'low-power',
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.setPixelRatio(1);
 
     const w = Math.max(120, container.clientWidth || 360);
-    const h = Math.max(120, container.clientHeight || 260);
+    const h = Math.max(120, container.clientHeight || 240);
     renderer.setSize(w, h);
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x040d1a);
+    sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(40, w / h, 0.1, 50);
+    const camera = new THREE.PerspectiveCamera(40, w / h, 0.1, 40);
     camera.position.set(2.1, 0.5, 2.1);
     camera.lookAt(0, 0, 0);
 
-    const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    const envTex = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.environment = envTex;
-    pmremGenerator.dispose();
-
-    const hemiLight = new THREE.HemisphereLight(0xbae6fd, 0x082f49, 1.35);
+    const hemiLight = new THREE.HemisphereLight(0xbae6fd, 0x082f49, 1.45);
     hemiLight.position.set(0, 10, 0);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfffbeb, 2.1);
+    const keyLight = new THREE.DirectionalLight(0xfffbeb, 1.9);
     keyLight.position.set(4, 6, 5);
     scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x22d3ee, 1.25);
+    const rimLight = new THREE.DirectionalLight(0x22d3ee, 1.15);
     rimLight.position.set(-5, 3, -4);
     scene.add(rimLight);
 
-    const fillLight = new THREE.DirectionalLight(0x38bdf8, 0.75);
-    fillLight.position.set(-3, -2, 5);
-    scene.add(fillLight);
-
-    // Subtle holographic studio pedestal grid ring beneath the fish
-    const studioRingGeo = new THREE.RingGeometry(0.68, 0.73, 48);
+    // Subtle studio pedestal ring beneath the fish
+    const studioRingGeo = new THREE.RingGeometry(0.68, 0.73, 32);
     studioRingGeo.rotateX(-Math.PI / 2);
     const studioRingMat = new THREE.MeshBasicMaterial({
       color: 0x06b6d4,
@@ -2660,28 +2645,21 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
     studioRing.position.set(0, -0.68, 0);
     scene.add(studioRing);
 
-    const innerDiscGeo = new THREE.CircleGeometry(0.68, 36);
-    innerDiscGeo.rotateX(-Math.PI / 2);
-    const innerDiscMat = new THREE.MeshBasicMaterial({
-      color: 0x083344,
-      transparent: true,
-      opacity: 0.25,
-    });
-    const innerDisc = new THREE.Mesh(innerDiscGeo, innerDiscMat);
-    innerDisc.position.set(0, -0.685, 0);
-    scene.add(innerDisc);
-
-    const rig = createSculpted3DFishRig(
-      `preview_${bodyStyle}`,
-      primaryColorHex,
-      secondaryColorHex,
-      accentColorHex,
-      bodyStyle,
-      localPolyQuality,
-      'high'
-    );
-    scene.add(rig.group);
-    setTriangleCount(rig.triangleCount);
+    // Build initial fish rig if not yet created by the second effect
+    if (!rigRef.current) {
+      const initialRig = createSculpted3DFishRig(
+        `preview_${bodyStyle}`,
+        primaryColorHex,
+        secondaryColorHex,
+        accentColorHex,
+        bodyStyle,
+        localPolyQuality,
+        'mid'
+      );
+      scene.add(initialRig.group);
+      rigRef.current = initialRig;
+      setTriangleCount(initialRig.triangleCount);
+    }
 
     const resizeObserver = new ResizeObserver(() => {
       if (!container) return;
@@ -2693,99 +2671,95 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
     });
     resizeObserver.observe(container);
 
-    const ClockCtor = (THREE as unknown as { Timer?: new () => { update: () => void; getDelta: () => number } }).Timer;
-    const timer = ClockCtor ? new ClockCtor() : null;
-    let lastTimeMs = performance.now();
+    let lastRenderMs = performance.now();
     let elapsed = 0;
     let tailPhase = 0;
     let frameId = 0;
     let unmounted = false;
 
-    const tick = () => {
+    const tick = (nowMs: number) => {
       if (unmounted) return;
-      let dt = 0.016;
-      if (timer) {
-        timer.update();
-        dt = Math.min(0.05, timer.getDelta());
-      } else {
-        const now = performance.now();
-        dt = Math.min(0.05, (now - lastTimeMs) / 1000);
-        lastTimeMs = now;
+      frameId = requestAnimationFrame(tick);
+
+      // Pace preview at ~30 FPS when not dragging so Trainer UI stays ultra-snappy and cool
+      const deltaMs = nowMs - lastRenderMs;
+      if (!dragOrbitRef.current.isDragging && deltaMs < 32) {
+        return;
       }
+      const dt = Math.min(0.05, Math.max(0.008, deltaMs / 1000));
+      lastRenderMs = nowMs;
       elapsed += dt;
 
-      // Apply wireframe state
-      const wf = wireframeRef.current;
-      if (rig.bodyMat.wireframe !== wf) {
-        rig.bodyMat.wireframe = wf;
-        rig.finMat.wireframe = wf;
-      }
-
-      // Compute animation parameters based on animMode
-      const mode = animModeRef.current;
-      let speedFreq = 6.5;
-      let swimAmp = 0.095;
-      let lungeZ = 0;
-      let lungePitch = 0;
-      let lungeRoll = 0;
-
-      if (mode === 'attack_lunge') {
-        speedFreq = 14.5;
-        swimAmp = 0.145;
-        const cycle = (elapsed * 1.8) % 1.0;
-        if (cycle < 0.35) {
-          // Wind-up & rapid forward strike lunge
-          const strikeT = Math.sin((cycle / 0.35) * Math.PI);
-          lungeZ = strikeT * 0.42;
-          lungePitch = -strikeT * 0.14;
-          studioRingMat.color.setHex(0xf43f5e);
-        } else {
-          lungeZ = Math.sin(elapsed * 2) * 0.04;
-          studioRingMat.color.setHex(0xfb7185);
+      const rig = rigRef.current;
+      if (rig) {
+        const wf = wireframeRef.current;
+        if (rig.bodyMat.wireframe !== wf) {
+          rig.bodyMat.wireframe = wf;
+          rig.finMat.wireframe = wf;
         }
-      } else if (mode === 'counter_attack') {
-        speedFreq = 16.0;
-        swimAmp = 0.16;
-        const cycle = (elapsed * 2.2) % 1.0;
-        const snap = Math.sin(cycle * Math.PI * 2);
-        lungeZ = Math.max(-0.15, snap * 0.38);
-        lungeRoll = Math.sin(elapsed * 12) * 0.16;
-        studioRingMat.color.setHex(0xe11d48);
-      } else if (mode === 'flee_dart') {
-        speedFreq = 15.5;
-        swimAmp = 0.15;
-        lungeZ = Math.sin(elapsed * 5.0) * 0.28;
-        lungeRoll = Math.sin(elapsed * 7.5) * 0.12;
-        studioRingMat.color.setHex(0x38bdf8);
-      } else if (mode === 'slowed_down') {
-        speedFreq = 2.4;
-        swimAmp = 0.042;
-        lungePitch = 0.08;
-        lungeRoll = Math.sin(elapsed * 1.5) * 0.08;
-        studioRingMat.color.setHex(0xf59e0b);
-      } else {
-        studioRingMat.color.setHex(0x06b6d4);
+
+        const mode = animModeRef.current;
+        let speedFreq = 6.2;
+        let swimAmp = 0.092;
+        let lungeZ = 0;
+        let lungePitch = 0;
+        let lungeRoll = 0;
+
+        if (mode === 'attack_lunge') {
+          speedFreq = 14.0;
+          swimAmp = 0.14;
+          const cycle = (elapsed * 1.8) % 1.0;
+          if (cycle < 0.35) {
+            const strikeT = Math.sin((cycle / 0.35) * Math.PI);
+            lungeZ = strikeT * 0.42;
+            lungePitch = -strikeT * 0.14;
+            studioRingMat.color.setHex(0xf43f5e);
+          } else {
+            lungeZ = Math.sin(elapsed * 2) * 0.04;
+            studioRingMat.color.setHex(0xfb7185);
+          }
+        } else if (mode === 'counter_attack') {
+          speedFreq = 15.5;
+          swimAmp = 0.155;
+          const cycle = (elapsed * 2.2) % 1.0;
+          const snap = Math.sin(cycle * Math.PI * 2);
+          lungeZ = Math.max(-0.15, snap * 0.38);
+          lungeRoll = Math.sin(elapsed * 12) * 0.16;
+          studioRingMat.color.setHex(0xe11d48);
+        } else if (mode === 'flee_dart') {
+          speedFreq = 15.0;
+          swimAmp = 0.145;
+          lungeZ = Math.sin(elapsed * 5.0) * 0.28;
+          lungeRoll = Math.sin(elapsed * 7.5) * 0.12;
+          studioRingMat.color.setHex(0x38bdf8);
+        } else if (mode === 'slowed_down') {
+          speedFreq = 2.4;
+          swimAmp = 0.042;
+          lungePitch = 0.08;
+          lungeRoll = Math.sin(elapsed * 1.5) * 0.08;
+          studioRingMat.color.setHex(0xf59e0b);
+        } else {
+          studioRingMat.color.setHex(0x06b6d4);
+        }
+
+        tailPhase += dt * speedFreq;
+        rig.spineUniforms.uTailPhase.value = tailPhase;
+        rig.spineUniforms.uSwimAmp.value = swimAmp;
+
+        rig.tailPeduncleGroup.rotation.y = Math.sin(tailPhase) * (swimAmp * 4.8);
+        rig.tailBladeMesh.rotation.y = Math.sin(tailPhase - 0.65) * (swimAmp * 3.1);
+
+        const scull = Math.cos(tailPhase * 0.85);
+        const feather = Math.sin(tailPhase * 0.85);
+        rig.pectoralLeftGroup.rotation.y = scull * 0.38;
+        rig.pectoralLeftGroup.rotation.z = feather * 0.2;
+        rig.pectoralRightGroup.rotation.y = -scull * 0.38;
+        rig.pectoralRightGroup.rotation.z = -feather * 0.2;
+
+        rig.group.position.set(0, Math.sin(elapsed * 1.8) * 0.04, lungeZ);
+        rig.group.rotation.set(lungePitch, 0, lungeRoll, 'YXZ');
       }
 
-      tailPhase += dt * speedFreq;
-      rig.spineUniforms.uTailPhase.value = tailPhase;
-      rig.spineUniforms.uSwimAmp.value = swimAmp;
-
-      // Caudal & Pectoral fin articulation
-      rig.tailPeduncleGroup.rotation.y = Math.sin(tailPhase) * ( swimAmp * 4.8 );
-      rig.tailBladeMesh.rotation.y = Math.sin(tailPhase - 0.65) * ( swimAmp * 3.1 );
-
-      const scull = Math.cos(tailPhase * 0.85);
-      const feather = Math.sin(tailPhase * 0.85);
-      rig.pectoralLeftGroup.rotation.y = scull * 0.38;
-      rig.pectoralLeftGroup.rotation.z = feather * 0.2;
-      rig.pectoralRightGroup.rotation.y = -scull * 0.38;
-      rig.pectoralRightGroup.rotation.z = -feather * 0.2;
-
-      rig.group.position.set(0, Math.sin(elapsed * 1.8) * 0.04, lungeZ);
-      rig.group.rotation.set(lungePitch, 0, lungeRoll, 'YXZ');
-
-      // Camera positioning
       const cMode = cameraModeRef.current;
       const orb = dragOrbitRef.current;
       const dist = 2.55 * orb.zoom;
@@ -2820,24 +2794,52 @@ export const FishModelPreview3D: React.FC<FishModelPreview3DProps> = ({
       camera.lookAt(0, 0.02, 0);
 
       renderer.render(scene, camera);
-      frameId = requestAnimationFrame(tick);
     };
 
-    tick();
+    frameId = requestAnimationFrame(tick);
 
     return () => {
       unmounted = true;
       cancelAnimationFrame(frameId);
       resizeObserver.disconnect();
-      envTex.dispose();
       studioRingGeo.dispose();
       studioRingMat.dispose();
-      innerDiscGeo.dispose();
-      innerDiscMat.dispose();
-      rig.bodyMat.dispose();
-      rig.finMat.dispose();
+      if (rigRef.current) {
+        rigRef.current.bodyMat.dispose();
+        rigRef.current.finMat.dispose();
+        rigRef.current = null;
+      }
+      sceneRef.current = null;
       renderer.dispose();
     };
+  }, []);
+
+  // 2. Fast in-place Fish Rig swap when bodyStyle, colors, or Mesh LOD change (zero WebGLRenderer recreation!)
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    if (rigRef.current) {
+      scene.remove(rigRef.current.group);
+      rigRef.current.bodyMat.dispose();
+      rigRef.current.finMat.dispose();
+      rigRef.current = null;
+    }
+
+    const nextRig = createSculpted3DFishRig(
+      `preview_${bodyStyle}`,
+      primaryColorHex,
+      secondaryColorHex,
+      accentColorHex,
+      bodyStyle,
+      localPolyQuality,
+      'mid'
+    );
+    nextRig.bodyMat.wireframe = wireframeRef.current;
+    nextRig.finMat.wireframe = wireframeRef.current;
+    scene.add(nextRig.group);
+    rigRef.current = nextRig;
+    setTriangleCount(nextRig.triangleCount);
   }, [bodyStyle, primaryColorHex, secondaryColorHex, accentColorHex, localPolyQuality]);
 
   const catalogMeta =
