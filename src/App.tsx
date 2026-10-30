@@ -287,15 +287,28 @@ export default function App() {
       if (!cloudRecord || !Array.isArray(cloudRecord.fishBrains)) return;
       const eco = ecosystemRef.current;
 
+      // Merge permanent tombstones (removedFishIds) so removed dead bodies never reappear
+      const mergedRemovedSet = new Set<string>([
+        ...(eco.removedFishIds || []),
+        ...(cloudRecord.removedFishIds || []),
+      ]);
+      eco.removedFishIds = Array.from(mergedRemovedSet).slice(-200);
+
+      const ackDeadSet = new Set<string>(eco.acknowledgedDeadFishIds || []);
+
+      // Filter cloudRecord.fishBrains against mergedRemovedSet
+      const validCloudBrains = cloudRecord.fishBrains.filter(
+        (cb) => cb && !mergedRemovedSet.has(cb.fishId)
+      );
+
       const overrideTs = cloudRecord.adminOverrideAtMs || 0;
       const cloudUpdatedMs = cloudRecord.updatedAtMs || 0;
 
-      // Detect if there is any structural difference between cloudRecord and local fishes
-      // (e.g. fish killed/revived, fish added/removed, or species/name replaced)
+      // Detect if there is any structural difference between validCloudBrains and local fishes
       const localFishMap = new Map(eco.fishes.map((f) => [f.lineage.fishId, f]));
-      let hasStructuralDifference = cloudRecord.fishBrains.length !== eco.fishes.length;
+      let hasStructuralDifference = validCloudBrains.length !== eco.fishes.length;
       if (!hasStructuralDifference) {
-        for (const cb of cloudRecord.fishBrains) {
+        for (const cb of validCloudBrains) {
           const lf = localFishMap.get(cb.fishId);
           if (
             !lf ||
@@ -334,19 +347,24 @@ export default function App() {
         lastAppliedCloudUpdatedMsRef.current = cloudUpdatedMs;
       }
 
-      const cloudFishIds = new Set(cloudRecord.fishBrains.map((cb) => cb.fishId));
+      const cloudFishIds = new Set(validCloudBrains.map((cb) => cb.fishId));
       const treatAsAuthoritative =
         isAuthoritativeOverride || isNewAdminOverride || hasStructuralDifference;
 
       if (treatAsAuthoritative) {
-        eco.fishes = eco.fishes.filter((f) => cloudFishIds.has(f.lineage.fishId));
+        eco.fishes = eco.fishes.filter(
+          (f) => cloudFishIds.has(f.lineage.fishId) && !mergedRemovedSet.has(f.lineage.fishId)
+        );
+        eco.deceasedArchive = eco.deceasedArchive.filter(
+          (d) => !mergedRemovedSet.has(d.fishId)
+        );
       }
 
       const newlyKilledNames: string[] = [];
       const newlyAddedNames: string[] = [];
       const newlyReplacedOrRevivedNames: string[] = [];
 
-      for (const cb of cloudRecord.fishBrains) {
+      for (const cb of validCloudBrains) {
         const localFish = eco.fishes.find((f) => f.lineage.fishId === cb.fishId);
         const sp =
           eco.speciesList.find((s) => s.id === cb.speciesId) ||
@@ -370,18 +388,25 @@ export default function App() {
             localFish.state.health = 0;
             localFish.state.energy = 0;
             localFish.state.hunger = 100;
-            if (wasAlive) newlyKilledNames.push(localFish.lineage.name);
-            if (!eco.deceasedArchive.some((d) => d.fishId === localFish.lineage.fishId)) {
-              eco.deceasedArchive.unshift({ ...localFish.lineage });
+            // Only warn ONCE per dead fishId
+            if (wasAlive && !ackDeadSet.has(cb.fishId)) {
+              ackDeadSet.add(cb.fishId);
+              newlyKilledNames.push(localFish.lineage.name);
             }
           } else {
+            ackDeadSet.delete(cb.fishId);
             localFish.state.health = Math.max(80, localFish.state.health);
             if (!wasAlive || prevSpeciesId !== cb.speciesId) {
               newlyReplacedOrRevivedNames.push(`${cb.name} (${sp.name})`);
             }
           }
         } else {
-          // Reconstruct newly gifted or hatched fish from Trainer / Keeper cloud sync
+          // Never spawn a dead fish from cloud sync that does not exist in our tank!
+          if (!cb.alive) {
+            mergedRemovedSet.add(cb.fishId);
+            continue;
+          }
+          // Reconstruct newly gifted or hatched live fish from Trainer / Keeper cloud sync
           const spawned = spawnFoundingFish(
             sp,
             eco.activeTankTier,
@@ -395,29 +420,26 @@ export default function App() {
           spawned.lineage.modelVersion = cb.modelVersion;
           spawned.lineage.motherId = cb.motherId;
           spawned.lineage.fatherId = cb.fatherId;
-          spawned.lineage.alive = cb.alive;
-          spawned.lineage.causeOfDeath = (cb.causeOfDeath as any) || null;
+          spawned.lineage.alive = true;
+          spawned.lineage.causeOfDeath = null;
           spawned.state.energy = cb.energy;
           spawned.state.hunger = cb.hunger;
           spawned.state.ageSimHours = cb.ageSimHours;
           spawned.state.lifeStage =
             cb.ageSimHours < sp.lifespan.sexualMaturityAgeHours ? 'juvenile' : 'adult';
-          if (!cb.alive) {
-            spawned.state.health = 0;
-            spawned.state.energy = 0;
-            newlyKilledNames.push(spawned.lineage.name);
-          } else {
-            newlyAddedNames.push(`${spawned.lineage.name} (${sp.name})`);
-          }
+          newlyAddedNames.push(`${spawned.lineage.name} (${sp.name})`);
           eco.fishes.push(spawned);
         }
       }
+
+      eco.removedFishIds = Array.from(mergedRemovedSet).slice(-200);
+      eco.acknowledgedDeadFishIds = Array.from(ackDeadSet).slice(-200);
 
       saveEcosystemStateAsync(eco, 300);
       ecosystemRef.current = eco;
       setEcosystem({ ...eco });
 
-      // Play distinct sound effects and show toast notifications for real-time updates
+      // Play distinct sound effects and show toast notifications for real-time updates (only once!)
       if (newlyKilledNames.length > 0) {
         audioEngine.playDeathWarningTone();
         showToast(`Alert: ${newlyKilledNames.join(', ')} died from starvation!`);
@@ -435,9 +457,6 @@ export default function App() {
             ? `Aquarium Update: ${cloudRecord.lastAdminAction}`
             : `Fish Updated: ${newlyReplacedOrRevivedNames.join(', ')}`
         );
-      } else if (isNewAdminOverride && cloudRecord.lastAdminAction) {
-        audioEngine.playBirthChime();
-        showToast(`Trainer Update: ${cloudRecord.lastAdminAction}`);
       }
     },
     [showToast]
@@ -587,7 +606,9 @@ export default function App() {
 
       publishActiveGameSessionLease(currentTank.id, true);
       // Single event write when game opens (not every second!)
-      syncUserBrainsToFirestore(username, profileId, latest.fishes, true, feederCount);
+      syncUserBrainsToFirestore(username, profileId, latest.fishes, true, feederCount, {
+        removedFishIds: latest.removedFishIds,
+      });
       lastFirestoreSyncMsRef.current = performance.now();
     } else {
       publishActiveGameSessionLease(currentTank.id, false);
@@ -628,7 +649,9 @@ export default function App() {
         setEcosystem({ ...latest });
         const fCount = latest.autoFeederCountByTank[tankNow.id] || 0;
         publishActiveGameSessionLease(tankNow.id, true);
-        syncUserBrainsToFirestore(uName, pId, latest.fishes, true, fCount);
+        syncUserBrainsToFirestore(uName, pId, latest.fishes, true, fCount, {
+          removedFishIds: latest.removedFishIds,
+        });
         lastFirestoreSyncMsRef.current = performance.now();
         loadUserBrainsFromFirestore(uName).then((cloudRecord) => {
           if (cloudRecord && Array.isArray(cloudRecord.fishBrains)) {
@@ -639,7 +662,9 @@ export default function App() {
         saveEcosystemState(ecosystemRef.current);
         const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
         publishActiveGameSessionLease(tankNow.id, false);
-        syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount);
+        syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount, {
+          removedFishIds: ecosystemRef.current.removedFishIds,
+        });
       }
     };
 
@@ -650,7 +675,9 @@ export default function App() {
       const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
       saveEcosystemState(ecosystemRef.current);
       publishActiveGameSessionLease(tankNow.id, false);
-      syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount);
+      syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount, {
+        removedFishIds: ecosystemRef.current.removedFishIds,
+      });
     };
 
     const handleStorageEvent = (ev: StorageEvent) => {
@@ -927,15 +954,28 @@ export default function App() {
     showToast('Added a new pair of starter fishes to your aquarium.');
   };
 
-  // Remove a single dead fish body from the aquarium
+  // Remove a single dead fish body from the aquarium AND completely delete it from database & Trainer
   const handleRemoveDeadFish = (fishId: string) => {
     const eco = ecosystemRef.current;
     const target = eco.fishes.find((f) => f.lineage.fishId === fishId);
     if (target && !target.lineage.alive) {
-      if (!eco.deceasedArchive.some((d) => d.fishId === target.lineage.fishId)) {
-        eco.deceasedArchive.unshift({ ...target.lineage });
-      }
+      const removedSet = new Set<string>(eco.removedFishIds || []);
+      removedSet.add(fishId);
+      eco.removedFishIds = Array.from(removedSet).slice(-200);
+
+      const ackSet = new Set<string>(eco.acknowledgedDeadFishIds || []);
+      ackSet.add(fishId);
+      eco.acknowledgedDeadFishIds = Array.from(ackSet).slice(-200);
+
+      // Completely delete from fishes and deceasedArchive so neither Game nor Trainer sees it
       eco.fishes = eco.fishes.filter((f) => f.lineage.fishId !== fishId);
+      eco.deceasedArchive = eco.deceasedArchive.filter((d) => d.fishId !== fishId);
+      const now = Date.now();
+      eco.adminOverrideAtMs = now;
+      eco.lastSavedAtMs = now;
+      lastAppliedAdminOverrideMsRef.current = now;
+      lastAppliedCloudUpdatedMsRef.current = now;
+
       saveEcosystemState(eco);
       setEcosystem({ ...eco });
       const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
@@ -946,23 +986,41 @@ export default function App() {
         profileId,
         eco.fishes,
         true,
-        eco.autoFeederCountByTank[tank.id] || 0
+        eco.autoFeederCountByTank[tank.id] || 0,
+        {
+          adminOverrideAtMs: now,
+          lastAdminAction: `User removed dead fish [${target.lineage.name}]`,
+          removedFishIds: eco.removedFishIds,
+        }
       );
-      showToast(`Removed deceased fish (${target.lineage.name}) from your tank.`);
+      showToast(`Removed deceased fish [${target.lineage.name}] completely from tank & cloud database.`);
     }
   };
 
-  // Clear all dead fish bodies from the aquarium
+  // Clear all dead fish bodies from the aquarium AND completely delete them from database & Trainer
   const handleClearAllDeadFishes = () => {
     const eco = ecosystemRef.current;
     const deadList = eco.fishes.filter((f) => !f.lineage.alive);
     if (deadList.length === 0) return;
+
+    const removedSet = new Set<string>(eco.removedFishIds || []);
+    const ackSet = new Set<string>(eco.acknowledgedDeadFishIds || []);
     for (const df of deadList) {
-      if (!eco.deceasedArchive.some((d) => d.fishId === df.lineage.fishId)) {
-        eco.deceasedArchive.unshift({ ...df.lineage });
-      }
+      removedSet.add(df.lineage.fishId);
+      ackSet.add(df.lineage.fishId);
     }
+    eco.removedFishIds = Array.from(removedSet).slice(-200);
+    eco.acknowledgedDeadFishIds = Array.from(ackSet).slice(-200);
+
+    // Completely remove from fishes and deceasedArchive so Trainer also never sees them
     eco.fishes = eco.fishes.filter((f) => f.lineage.alive);
+    eco.deceasedArchive = [];
+    const now = Date.now();
+    eco.adminOverrideAtMs = now;
+    eco.lastSavedAtMs = now;
+    lastAppliedAdminOverrideMsRef.current = now;
+    lastAppliedCloudUpdatedMsRef.current = now;
+
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
     const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
@@ -973,9 +1031,14 @@ export default function App() {
       profileId,
       eco.fishes,
       true,
-      eco.autoFeederCountByTank[tank.id] || 0
+      eco.autoFeederCountByTank[tank.id] || 0,
+      {
+        adminOverrideAtMs: now,
+        lastAdminAction: `User removed ${deadList.length} dead fish body(s)`,
+        removedFishIds: eco.removedFishIds,
+      }
     );
-    showToast(`Cleared ${deadList.length} deceased fish(es) from your aquarium.`);
+    showToast(`Removed ${deadList.length} deceased fish(es) completely from tank & cloud database.`);
   };
 
   // Open the Rename Fish Console Dialog
@@ -1003,6 +1066,12 @@ export default function App() {
       }
       const oldName = target.lineage.name;
       target.lineage.name = cleaned;
+      const now = Date.now();
+      eco.adminOverrideAtMs = now;
+      eco.lastSavedAtMs = now;
+      lastAppliedAdminOverrideMsRef.current = now;
+      lastAppliedCloudUpdatedMsRef.current = now;
+
       saveEcosystemStateAsync(eco, 200);
       setEcosystem({ ...eco });
       setRenamingFishId(null);
@@ -1016,9 +1085,14 @@ export default function App() {
         pId,
         eco.fishes,
         true,
-        eco.autoFeederCountByTank[tank.id] || 0
+        eco.autoFeederCountByTank[tank.id] || 0,
+        {
+          adminOverrideAtMs: now,
+          lastAdminAction: `User renamed fish [${oldName}] -> [${cleaned}]`,
+          removedFishIds: eco.removedFishIds,
+        }
       );
-      showToast(`Renamed "${oldName}" → "${cleaned}"!`);
+      showToast(`Renamed "${oldName}" → "[${cleaned}]"!`);
     },
     [mypc, renameDraft, showToast]
   );
@@ -1185,18 +1259,27 @@ export default function App() {
     setForceOfflineOverride(false);
     const latest = loadEcosystemState();
     latest.timeMultiplier = 1;
-    ecosystemRef.current = latest;
-    setEcosystem({ ...latest });
-    setScreenState('playing');
 
-    const deadNow = latest.fishes.filter((f) => !f.lineage.alive);
-    if (deadNow.length > 0) {
+    const ackSet = new Set<string>(latest.acknowledgedDeadFishIds || []);
+    const unwarnedDead = latest.fishes.filter(
+      (f) => !f.lineage.alive && !ackSet.has(f.lineage.fishId)
+    );
+    if (unwarnedDead.length > 0) {
+      for (const d of unwarnedDead) {
+        ackSet.add(d.lineage.fishId);
+      }
+      latest.acknowledgedDeadFishIds = Array.from(ackSet).slice(-200);
+      saveEcosystemStateAsync(latest, 200);
       showToast(
-        `Warning: ${deadNow.map((d) => d.lineage.name).join(', ')} died from ${
-          deadNow[0].lineage.causeOfDeath || 'starvation'
+        `Warning: ${unwarnedDead.map((d) => d.lineage.name).join(', ')} died from ${
+          unwarnedDead[0].lineage.causeOfDeath || 'starvation'
         } while away!`
       );
     }
+
+    ecosystemRef.current = latest;
+    setEcosystem({ ...latest });
+    setScreenState('playing');
   }, [showToast]);
 
   const toggleOwnerMenuFromController = useCallback(
@@ -1787,14 +1870,23 @@ export default function App() {
           );
         },
         onDeath: (fish, reason) => {
-          audioEngine.playDeathWarningTone();
+          const ackSet = new Set<string>(eco.acknowledgedDeadFishIds || []);
+          const alreadyWarned = ackSet.has(fish.lineage.fishId);
+          ackSet.add(fish.lineage.fishId);
+          eco.acknowledgedDeadFishIds = Array.from(ackSet).slice(-200);
+
           saveEcosystemStateAsync(eco, 400);
           setEcosystem({ ...eco });
           const username = mypc.info()?.profile?.name || 'Keeper';
           const profileId = mypc.info()?.profile?.id || 'local-caretaker';
           const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
-          syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
-          showToast(`${fish.lineage.name} passed away from ${reason}.`);
+          syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount, {
+            removedFishIds: eco.removedFishIds,
+          });
+          if (!alreadyWarned) {
+            audioEngine.playDeathWarningTone();
+            showToast(`${fish.lineage.name} passed away from ${reason}.`);
+          }
         },
       });
 
@@ -2197,14 +2289,14 @@ export default function App() {
               <div>
                 <div className="font-bold text-rose-300 uppercase tracking-wide">
                   [WARNING] {deadFishes.length} Fish{deadFishes.length > 1 ? 'es' : ''} Found Dead
-                  in Tank ({deadFishes.map((f) => f.lineage.name).join(', ')})
+                  in Tank ({deadFishes.map((f) => `[${f.lineage.name}]`).join(', ')})
                 </div>
                 <div className="text-[11px] text-rose-200 font-mono mt-0.5">
                   Cause of Death:{' '}
                   {deadFishes
                     .map((f) => (f.lineage.causeOfDeath || 'starvation').toUpperCase())
                     .join(', ')}{' '}
-                  · Floating belly-up near top water surface
+                  · Click &ldquo;Remove Dead Body&rdquo; to permanently delete from tank &amp; cloud
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -2223,7 +2315,7 @@ export default function App() {
                   type="button"
                   data-tv-focusable="true"
                   onClick={handleClearAllDeadFishes}
-                  className="px-3 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 font-semibold"
+                  className="px-3 py-1.5 rounded bg-slate-900 border border-emerald-400 text-emerald-200 font-bold"
                 >
                   Remove Dead Body
                 </button>
@@ -2270,7 +2362,7 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-400 font-bold">
-                      ABYSSAL EVO v1.7.3 // TV LITE HUD
+                      ABYSSAL EVO v1.7.4 // TV LITE HUD
                     </span>
                     <span className="px-1.5 py-0.5 rounded bg-[#062e22] border border-emerald-400 text-[10px] font-mono font-bold text-emerald-300">
                       CLOUD SYNC

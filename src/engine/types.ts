@@ -390,6 +390,8 @@ export interface SavedEcosystemState {
   lastSavedAtMs?: number;
   adminOverrideAtMs?: number;
   lastAdminAction?: string;
+  removedFishIds?: string[];
+  acknowledgedDeadFishIds?: string[];
   simHoursTotal: number;
   timeMultiplier: number;
   paused: boolean;

@@ -171,10 +171,16 @@ export const TrainerApp: React.FC = () => {
   // CPU Usage Throttling State (10% -> 100% Max)
   const [cpuUsageLimitPct, setCpuUsageLimitPct] = useState<number>(25);
 
-  // Tab 1: Train Base Models State (Extended Generations up to 1,000+)
+  // Tab 1: Train Base Models State (Extended Generations up to 1,000+ & Multi-Species Batch Loop)
   const [selectedSpeciesId, setSelectedSpeciesId] = useState<string>(
     ecosystem.speciesList[0]?.id || DEFAULT_SPECIES_LIST[0].id
   );
+  const [batchSelectedSpeciesIds, setBatchSelectedSpeciesIds] = useState<string[]>(() => [
+    ecosystem.speciesList[0]?.id || DEFAULT_SPECIES_LIST[0].id,
+  ]);
+  const [batchCurrentIndex, setBatchCurrentIndex] = useState<number>(0);
+  const [batchTotalCount, setBatchTotalCount] = useState<number>(1);
+  const [batchCurrentSpeciesName, setBatchCurrentSpeciesName] = useState<string>('');
   const [trainingGoal, setTrainingGoal] = useState<'forager' | 'survivor' | 'balanced'>('balanced');
   const [trainGenerations, setTrainGenerations] = useState<number>(50);
   const [trainPopulationSize, setTrainPopulationSize] = useState<number>(28);
@@ -320,8 +326,58 @@ export const TrainerApp: React.FC = () => {
       setEcosystem(next);
     });
 
+    const syncLocalOwnerFromCloudRecords = (records: CloudUserBrainRecord[]) => {
+      const myRecord = records.find((r) => r.username === profileName);
+      if (!myRecord) return;
+      const eco = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+      const removedSet = new Set<string>([
+        ...(eco.removedFishIds || []),
+        ...(myRecord.removedFishIds || []),
+      ]);
+      const cloudFishMap = new Map(myRecord.fishBrains.map((b) => [b.fishId, b]));
+      let changed = false;
+
+      if (removedSet.size !== (eco.removedFishIds || []).length) {
+        eco.removedFishIds = Array.from(removedSet).slice(-200);
+        changed = true;
+      }
+
+      const prevCount = eco.fishes.length;
+      const prevArchCount = eco.deceasedArchive.length;
+
+      // Remove any fish explicitly in removedFishIds OR any local dead fish that was already cleared in Firestore
+      eco.fishes = eco.fishes.filter((f) => {
+        if (removedSet.has(f.lineage.fishId)) return false;
+        if (!f.lineage.alive && !cloudFishMap.has(f.lineage.fishId)) return false;
+        return true;
+      });
+      eco.deceasedArchive = eco.deceasedArchive.filter(
+        (d) => !removedSet.has(d.fishId) && cloudFishMap.has(d.fishId)
+      );
+
+      if (eco.fishes.length !== prevCount || eco.deceasedArchive.length !== prevArchCount) {
+        changed = true;
+      }
+
+      // Sync custom player-assigned fish names [name123] from Firestore into local Trainer state
+      for (const f of eco.fishes) {
+        const cb = cloudFishMap.get(f.lineage.fishId);
+        if (cb && cb.name && cb.name !== f.lineage.name) {
+          f.lineage.name = cb.name;
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        saveEcosystemState(eco);
+        ecosystemRef.current = eco;
+        setEcosystem(eco);
+      }
+    };
+
     fetchAllUserBrainRecordsFromFirestore().then((records) => {
       if (mounted && records.length > 0) {
+        syncLocalOwnerFromCloudRecords(records);
         setCloudUsers(records);
       }
     });
@@ -329,6 +385,7 @@ export const TrainerApp: React.FC = () => {
     // Real-time Firestore listener so when a user opens or closes the game, Keeper updates immediately
     const unsubCloudUsers = subscribeToAllUserBrainRecords((records) => {
       if (mounted) {
+        syncLocalOwnerFromCloudRecords(records);
         setCloudUsers(records);
       }
     });
@@ -398,7 +455,13 @@ export const TrainerApp: React.FC = () => {
 
       const currentEco = ecosystemRef.current;
       const activeTank = TANK_TIERS[currentEco.activeTankTier] || TANK_TIERS[0];
-      const isOwnerOnlineInGame = localActiveTankIds.includes(activeTank.id);
+      const nowMs = Date.now();
+      const myCloudRecord = cloudUsers.find((cu) => cu.username === profileName);
+      const isMyCloudOnline =
+        Boolean(myCloudRecord?.isActivelyPlaying) &&
+        nowMs - (myCloudRecord?.lastGameHeartbeatMs || 0) < 300000;
+      const isOwnerOnlineInGame =
+        localActiveTankIds.includes(activeTank.id) || isMyCloudOnline;
 
       let stepRes = {
         liveFishUpdated: 0,
@@ -411,11 +474,18 @@ export const TrainerApp: React.FC = () => {
       // A fish must run in ONLY ONE place: either in its owner's open game OR in this Trainer Keeper.
       // When the owner has the game open, Keeper does NOT step or overwrite localStorage — instead it reads the live state.
       if (isOwnerOnlineInGame) {
-        const latestFromGame = loadEcosystemState();
-        ecosystemRef.current = latestFromGame;
-        setEcosystem(latestFromGame);
+        if (localActiveTankIds.includes(activeTank.id)) {
+          const latestFromGame = loadEcosystemState();
+          ecosystemRef.current = latestFromGame;
+          setEcosystem(latestFromGame);
+        }
       } else {
         const eco = ecosystemRef.current;
+        const removedSet = new Set(eco.removedFishIds || []);
+        if (removedSet.size > 0) {
+          eco.fishes = eco.fishes.filter((f) => !removedSet.has(f.lineage.fishId));
+          eco.deceasedArchive = eco.deceasedArchive.filter((d) => !removedSet.has(d.fishId));
+        }
         const prevMultiplier = eco.timeMultiplier;
         const prevPaused = eco.paused;
         eco.paused = false;
@@ -427,7 +497,7 @@ export const TrainerApp: React.FC = () => {
           onlyOfflineFish: true,
           activeSessionTankIds: localActiveTankIds,
           onDeath: (fish, reason) => {
-            lastDeathMsg = `${fish.lineage.name} (Gen ${fish.lineage.generation}) died of ${reason} at ${fish.state.ageSimHours.toFixed(1)}h`;
+            lastDeathMsg = `[${fish.lineage.name}] (Gen ${fish.lineage.generation}) died of ${reason} at ${fish.state.ageSimHours.toFixed(1)}h`;
           },
         });
 
@@ -448,7 +518,7 @@ export const TrainerApp: React.FC = () => {
       let skippedActive = 0;
 
       for (const f of eco.fishes) {
-        const isOnline = localActiveTankIds.includes(f.lineage.tankId);
+        const isOnline = localActiveTankIds.includes(f.lineage.tankId) || isMyCloudOnline;
         if (isOnline) {
           if (f.lineage.alive) skippedActive++;
         } else {
@@ -460,14 +530,13 @@ export const TrainerApp: React.FC = () => {
       // Also step any remote offline MyPC users stored in Firestore (`mypc_user_brains`)
       let cloudOfflineLiveCount = 0;
       let cloudOnlineSkippedCount = 0;
-      const nowMs = Date.now();
       const cloudSimHoursDelta =
         stepRes.simHoursDelta > 0 ? stepRes.simHoursDelta : (0.4 * serviceSpeed) / 60;
 
       for (const cu of cloudUsers) {
         if (cu.username === profileName) continue;
         const isUserOnlineNow =
-          cu.isActivelyPlaying && nowMs - (cu.lastGameHeartbeatMs || 0) < 15000;
+          cu.isActivelyPlaying && nowMs - (cu.lastGameHeartbeatMs || 0) < 300000;
         if (isUserOnlineNow) {
           // User has the game open right now — their fishes are removed from Keeper!
           cloudOnlineSkippedCount += cu.fishBrains.filter((b) => b.alive).length;
@@ -481,7 +550,7 @@ export const TrainerApp: React.FC = () => {
           cloudOfflineLiveCount += cloudStep.updatedLiveCount;
           totalUpdates += cloudStep.updatedLiveCount;
           if (cloudStep.newlyStarvedNames.length > 0) {
-            lastDeathMsg = `${cloudStep.newlyStarvedNames[0]} starved (no owner feeder)`;
+            lastDeathMsg = `[${cloudStep.newlyStarvedNames[0]}] starved (no owner feeder)`;
           }
         }
       }
@@ -495,7 +564,7 @@ export const TrainerApp: React.FC = () => {
         cpuUsageLimitPct,
         activeInGameTankIds: localActiveTankIds,
         offlineLiveFishCount: offlineLive + cloudOfflineLiveCount,
-        offlineDeceasedFishCount: offlineDead + eco.deceasedArchive.length,
+        offlineDeceasedFishCount: offlineDead,
         skippedActivePlayFishCount: skippedActive + cloudOnlineSkippedCount,
         totalBrainUpdatesExecuted: totalUpdates,
         ticksPerSecond: Number(((1000 / intervalMs) * Math.max(1, offlineLive)).toFixed(1)),
@@ -513,12 +582,15 @@ export const TrainerApp: React.FC = () => {
 
       if (!isOwnerOnlineInGame && (hasLifecycleEvent || checkpointDue)) {
         lastKeeperFirestoreSyncMsRef.current = nowMs;
+        const removedSet = new Set(eco.removedFishIds || []);
+        const cleanFishes = eco.fishes.filter((f) => !removedSet.has(f.lineage.fishId));
         syncUserBrainsToFirestore(
           profileName,
           profileId,
-          eco.fishes,
+          cleanFishes,
           false,
-          ownerFeederCount
+          ownerFeederCount,
+          { removedFishIds: eco.removedFishIds || [] }
         ).then((ok) => {
           setFirestoreSyncStatus(
             ok
@@ -562,103 +634,125 @@ export const TrainerApp: React.FC = () => {
       JSON.stringify(ecosystemRef.current)
     ) as SavedEcosystemState;
 
-    const sp =
-      workingState.speciesList.find((s) => s.id === selectedSpecies.id) ||
-      workingState.speciesList[0];
-    if (trainingGoal === 'forager') {
-      workingState.evolutionConfig.selectionStrengthForaging = 0.95;
-      workingState.evolutionConfig.selectionStrengthSurvival = 0.65;
-      sp.baseBrainConfig.learningRate = 0.035;
-    } else if (trainingGoal === 'survivor') {
-      workingState.evolutionConfig.selectionStrengthSurvival = 0.95;
-      workingState.evolutionConfig.selectionStrengthForaging = 0.65;
-      sp.baseBrainConfig.evasionModuleEnabled = true;
-    } else {
-      workingState.evolutionConfig.selectionStrengthForaging = 0.85;
-      workingState.evolutionConfig.selectionStrengthSurvival = 0.85;
-    }
-
-    // Determine cumulative base generation before this run (0 if only v1.0-base exists)
-    const priorTrainedModels = workingState.modelRegistry.filter(
-      (m) => m.speciesId === selectedSpecies.id && m.versionId !== 'v1.0-base'
+    // Resolve target species queue (multi-select batch loop or current selected species)
+    const validQueueIds = batchSelectedSpeciesIds.filter((id) =>
+      workingState.speciesList.some((s) => s.id === id)
     );
-    const baseGenBeforeRun =
-      priorTrainedModels.length > 0
-        ? Math.max(...priorTrainedModels.map((m) => m.generationTrained || 0))
-        : 0;
+    const targetSpeciesQueueIds =
+      validQueueIds.length > 0 ? validQueueIds : [selectedSpecies.id];
 
-    let runningBrain: FishBrainInstance | undefined = undefined;
-    let totalSimulated = 0;
-    let totalGensCompleted = 0;
+    setBatchTotalCount(targetSpeciesQueueIds.length);
+    const trainedResults: string[] = [];
+    let grandTotalSimulated = 0;
 
-    // For large generation counts (100 - 1000+), batch 1 to 5 generations per UI frame according to CPU limit
-    const batchGens = totalGens >= 250 && cpuUsageLimitPct >= 50 ? 5 : totalGens >= 100 ? 2 : 1;
-
-    for (let g = 1; g <= totalGens; g += batchGens) {
+    for (let idx = 0; idx < targetSpeciesQueueIds.length; idx++) {
       if (cancelTrainingRef.current) break;
-      const gensThisChunk = Math.min(batchGens, totalGens - g + 1);
+      const targetSpId = targetSpeciesQueueIds[idx];
+      const sp =
+        workingState.speciesList.find((s) => s.id === targetSpId) ||
+        workingState.speciesList[0];
 
-      // Evolve in memory ONLY (commitVersionToRegistry: false) so no intermediate versions are created
-      const stepRes = runAcceleratedHeadlessTraining(
-        workingState,
-        selectedSpecies.id,
-        gensThisChunk,
-        popSize,
-        0.1,
-        {
-          commitVersionToRegistry: false,
-          initialBrainOverride: runningBrain,
-          totalGenerationsTrained: baseGenBeforeRun + totalGensCompleted + gensThisChunk,
-        }
+      setBatchCurrentIndex(idx + 1);
+      setBatchCurrentSpeciesName(sp.name);
+      setSelectedSpeciesId(sp.id);
+      setTrainingProgressGen(0);
+
+      if (trainingGoal === 'forager') {
+        workingState.evolutionConfig.selectionStrengthForaging = 0.95;
+        workingState.evolutionConfig.selectionStrengthSurvival = 0.65;
+        sp.baseBrainConfig.learningRate = 0.035;
+      } else if (trainingGoal === 'survivor') {
+        workingState.evolutionConfig.selectionStrengthSurvival = 0.95;
+        workingState.evolutionConfig.selectionStrengthForaging = 0.65;
+        sp.baseBrainConfig.evasionModuleEnabled = true;
+      } else {
+        workingState.evolutionConfig.selectionStrengthForaging = 0.85;
+        workingState.evolutionConfig.selectionStrengthSurvival = 0.85;
+      }
+
+      // Determine cumulative base generation before this run (0 if only v1.0-base exists)
+      const priorTrainedModels = workingState.modelRegistry.filter(
+        (m) => m.speciesId === sp.id && m.versionId !== 'v1.0-base'
       );
-      runningBrain = stepRes.evolvedBrain;
-      totalSimulated += stepRes.fishSimulatedCount;
-      totalGensCompleted += gensThisChunk;
-      setTrainingProgressGen(totalGensCompleted);
+      const baseGenBeforeRun =
+        priorTrainedModels.length > 0
+          ? Math.max(...priorTrainedModels.map((m) => m.generationTrained || 0))
+          : 0;
 
-      const sleepMs =
-        cpuUsageLimitPct >= 95
-          ? 6
-          : Math.round(((100 - cpuUsageLimitPct) / Math.max(10, cpuUsageLimitPct)) * 28);
-      await new Promise((r) => window.setTimeout(r, sleepMs));
+      let runningBrain: FishBrainInstance | undefined = undefined;
+      let totalSimulated = 0;
+      let totalGensCompleted = 0;
+
+      const batchGens =
+        totalGens >= 250 && cpuUsageLimitPct >= 50 ? 5 : totalGens >= 100 ? 2 : 1;
+
+      for (let g = 1; g <= totalGens; g += batchGens) {
+        if (cancelTrainingRef.current) break;
+        const gensThisChunk = Math.min(batchGens, totalGens - g + 1);
+
+        const stepRes = runAcceleratedHeadlessTraining(
+          workingState,
+          sp.id,
+          gensThisChunk,
+          popSize,
+          0.1,
+          {
+            commitVersionToRegistry: false,
+            initialBrainOverride: runningBrain,
+            totalGenerationsTrained: baseGenBeforeRun + totalGensCompleted + gensThisChunk,
+          }
+        );
+        runningBrain = stepRes.evolvedBrain;
+        totalSimulated += stepRes.fishSimulatedCount;
+        grandTotalSimulated += stepRes.fishSimulatedCount;
+        totalGensCompleted += gensThisChunk;
+        setTrainingProgressGen(totalGensCompleted);
+
+        const sleepMs =
+          cpuUsageLimitPct >= 95
+            ? 6
+            : Math.round(((100 - cpuUsageLimitPct) / Math.max(10, cpuUsageLimitPct)) * 28);
+        await new Promise((r) => window.setTimeout(r, sleepMs));
+      }
+
+      // Commit 1 final version for this species at the end of its run and save to Firestore
+      if (totalGensCompleted > 0 && runningBrain) {
+        const finalGenLabel = baseGenBeforeRun + totalGensCompleted;
+        const finalCommit = runAcceleratedHeadlessTraining(
+          workingState,
+          sp.id,
+          0,
+          popSize,
+          0.1,
+          {
+            commitVersionToRegistry: true,
+            initialBrainOverride: runningBrain,
+            totalGenerationsTrained: finalGenLabel,
+          }
+        );
+        const lastCandidate = finalCommit.candidateModel;
+        lastCandidate.speciesConfig = { ...sp };
+
+        const pruneResult = pruneSpeciesModelVersions(workingState.modelRegistry, sp.id);
+        workingState.modelRegistry = pruneResult.keptRegistry;
+
+        await saveModelVersionToFirestore(adminUser?.email || profileName, lastCandidate);
+
+        saveEcosystemState(workingState);
+        ecosystemRef.current = workingState;
+        setEcosystem({ ...workingState });
+
+        trainedResults.push(
+          `${sp.name} -> ${lastCandidate.versionId} (${lastCandidate.benchmark.overallComposite}% Composite)`
+        );
+      }
     }
 
-    // Commit ONLY 1 final version at the end of training and save to Firestore once
-    if (totalGensCompleted > 0 && runningBrain) {
-      const finalGenLabel = baseGenBeforeRun + totalGensCompleted;
-      const finalCommit = runAcceleratedHeadlessTraining(
-        workingState,
-        selectedSpecies.id,
-        0,
-        popSize,
-        0.1,
-        {
-          commitVersionToRegistry: true,
-          initialBrainOverride: runningBrain,
-          totalGenerationsTrained: finalGenLabel,
-        }
-      );
-      const lastCandidate = finalCommit.candidateModel;
-      lastCandidate.speciesConfig = { ...sp };
-
-      // Prune to at most MAX_VERSIONS_PER_SPECIES (10) in local registry & Firestore
-      const pruneResult = pruneSpeciesModelVersions(
-        workingState.modelRegistry,
-        selectedSpecies.id
-      );
-      workingState.modelRegistry = pruneResult.keptRegistry;
-
-      await saveModelVersionToFirestore(adminUser?.email || profileName, lastCandidate);
-
-      saveEcosystemState(workingState);
-      ecosystemRef.current = workingState;
-      setEcosystem(workingState);
-
-      const keptForSp = workingState.modelRegistry.filter(
-        (m) => m.speciesId === selectedSpecies.id
-      ).length;
-
-      const summary = `Trained 1 final version (${lastCandidate.versionId}) for ${selectedSpecies.name} across ${totalGensCompleted} generations (${totalSimulated.toLocaleString()} fishes simulated at ${cpuUsageLimitPct}% CPU). Foraging: ${lastCandidate.benchmark.foragingEfficiency}% · Composite: ${lastCandidate.benchmark.overallComposite}% — Saved once at end of training to Firestore "base_models/${selectedSpecies.id}__${lastCandidate.versionId}" (${keptForSp}/${MAX_VERSIONS_PER_SPECIES} versions kept).`;
+    if (trainedResults.length > 0) {
+      const summary =
+        trainedResults.length === 1
+          ? `Trained 1 species (${trainedResults[0]}) across ${totalGens} generations (${grandTotalSimulated.toLocaleString()} fishes simulated at ${cpuUsageLimitPct}% CPU) — Saved to Firestore "base_models".`
+          : `Batch Trained ${trainedResults.length} species sequentially (${totalGens}G each, ${grandTotalSimulated.toLocaleString()} total fishes simulated at ${cpuUsageLimitPct}% CPU): ${trainedResults.join(' · ')}`;
       setLastTrainingSummary(summary);
       setStatusBanner(summary);
     }
@@ -1203,7 +1297,84 @@ export const TrainerApp: React.FC = () => {
       actionDesc
     );
 
-    setStatusBanner(`Revived "${target.lineage.name}" with 85% Energy and 100% Health!`);
+    setStatusBanner(`Revived "[${target.lineage.name}]" with 85% Energy and 100% Health!`);
+  };
+
+  // Permanently remove a dead fish body from database & Trainer so neither user nor Trainer sees it again
+  const handleDeleteDeadFishInTrainer = async (targetFishId?: string, ownerUsername?: string) => {
+    const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
+    const candidateId = targetFishId || selectedFishId;
+    if (!candidateId) return;
+
+    if (resolvedOwner !== profileName) {
+      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      if (cuIdx === -1) return;
+      const cu = cloudUsers[cuIdx];
+      const targetB = cu.fishBrains.find((b) => b.fishId === candidateId);
+      const updatedBrains = cu.fishBrains.filter((b) => b.fishId !== candidateId);
+      const updatedRemoved = Array.from(
+        new Set([...(cu.removedFishIds || []), candidateId])
+      ).slice(-200);
+      const actionDesc = `Removed dead fish [${targetB?.name || candidateId}] from database`;
+      const nextCloudUsers = [...cloudUsers];
+      nextCloudUsers[cuIdx] = {
+        ...cu,
+        fishBrains: updatedBrains,
+        removedFishIds: updatedRemoved,
+        updatedAtMs: Date.now(),
+        adminOverrideAtMs: Date.now(),
+        lastAdminAction: actionDesc,
+      };
+      setCloudUsers(nextCloudUsers);
+      await saveAdminOverrideForUserInFirestore(
+        cu.username,
+        cu.profileId,
+        updatedBrains,
+        cu.isActivelyPlaying,
+        cu.autoFeederStock,
+        actionDesc,
+        updatedRemoved
+      );
+      setStatusBanner(
+        `Permanently removed dead fish "[${targetB?.name || candidateId}]" (Owner: ${resolvedOwner}) from Firestore database.`
+      );
+      return;
+    }
+
+    const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
+    const target = next.fishes.find((f) => f.lineage.fishId === candidateId);
+    const removedName = target?.lineage.name || candidateId;
+    next.fishes = next.fishes.filter((f) => f.lineage.fishId !== candidateId);
+    next.deceasedArchive = next.deceasedArchive.filter((d) => d.fishId !== candidateId);
+    next.removedFishIds = Array.from(
+      new Set([...(next.removedFishIds || []), candidateId])
+    ).slice(-200);
+    next.acknowledgedDeadFishIds = Array.from(
+      new Set([...(next.acknowledgedDeadFishIds || []), candidateId])
+    ).slice(-200);
+    const actionDesc = `Removed dead fish [${removedName}] from database`;
+    next.adminOverrideAtMs = Date.now();
+    next.lastAdminAction = actionDesc;
+
+    saveEcosystemState(next);
+    ecosystemRef.current = next;
+    setEcosystem(next);
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await saveAdminOverrideForUserInFirestore(
+      profileName,
+      profileId,
+      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount,
+      actionDesc,
+      next.removedFishIds
+    );
+
+    setStatusBanner(
+      `Permanently removed dead fish "[${removedName}]" from tank and Firestore database.`
+    );
   };
 
   // Give fishes of any species to ANY user from Trainer UI (Bypasses player tank capacity limit!)
@@ -1515,7 +1686,7 @@ export const TrainerApp: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500 text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">
-                  TRAINER HUD v1.7.3
+                  TRAINER HUD v1.7.4
                 </span>
                 <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">
                   ADMIN AUTH GATE
@@ -1703,7 +1874,7 @@ export const TrainerApp: React.FC = () => {
       <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
-            TRAINER HUD v1.7.3
+            TRAINER HUD v1.7.4
           </span>
           <span className="text-sm font-extrabold uppercase tracking-wider text-white">
             ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
@@ -1907,36 +2078,98 @@ export const TrainerApp: React.FC = () => {
                     </button>
                   </div>
 
-                  {/* Step 1: Choose Fish Type */}
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-slate-300 block">
-                      Step 1: Choose Fish Species to Train ({ecosystem.speciesList.length} in
-                      Active Catalog)
-                    </label>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 max-h-48 overflow-y-auto lab-scroll pr-1">
-                      {ecosystem.speciesList.map((sp) => (
+                  {/* Step 1: Choose Fish Species (Single or Multi-Species Batch Loop) */}
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="text-xs font-semibold text-slate-300 block">
+                        Step 1: Select Fish Species to Train ({batchSelectedSpeciesIds.length} of{' '}
+                        {ecosystem.speciesList.length} Selected for Loop Training)
+                      </label>
+                      <div className="flex items-center gap-1.5">
                         <button
-                          key={sp.id}
                           type="button"
-                          onClick={() => setSelectedSpeciesId(sp.id)}
-                          className={`p-3 rounded-xl border text-left transition-colors ${
-                            selectedSpecies.id === sp.id
-                              ? 'bg-cyan-500/20 border-cyan-400 text-white'
-                              : 'bg-slate-900/90 border-slate-800 text-slate-300 hover:border-slate-700'
-                          }`}
+                          onClick={() =>
+                            setBatchSelectedSpeciesIds(ecosystem.speciesList.map((s) => s.id))
+                          }
+                          className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500/60 text-[11px] font-mono font-bold text-cyan-200 hover:bg-cyan-900"
                         >
-                          <div className="flex items-center gap-2">
-                            <span
-                              className="w-3 h-3 rounded-full shrink-0"
-                              style={{ backgroundColor: sp.primaryColorHex }}
-                            />
-                            <span className="text-xs font-bold truncate">{sp.name}</span>
-                          </div>
-                          <div className="text-[11px] font-mono text-cyan-300 mt-1">
-                            {sp.activeBaseModelVersion} · {sp.lifespan.lifespanSimHours}h Life
-                          </div>
+                          Select All ({ecosystem.speciesList.length})
                         </button>
-                      ))}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const untrained = ecosystem.speciesList
+                              .filter((s) => s.activeBaseModelVersion === 'v1.0-base')
+                              .map((s) => s.id);
+                            setBatchSelectedSpeciesIds(
+                              untrained.length > 0 ? untrained : [selectedSpecies.id]
+                            );
+                          }}
+                          className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-[11px] font-mono font-bold text-slate-300 hover:border-cyan-500"
+                        >
+                          Select v1.0 Untrained
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBatchSelectedSpeciesIds([selectedSpecies.id])}
+                          className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-[11px] font-mono font-bold text-slate-300 hover:border-slate-500"
+                        >
+                          Only Active (1)
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 max-h-52 overflow-y-auto lab-scroll pr-1">
+                      {ecosystem.speciesList.map((sp) => {
+                        const isBatchChecked = batchSelectedSpeciesIds.includes(sp.id);
+                        const isFocused = selectedSpecies.id === sp.id;
+                        return (
+                          <button
+                            key={sp.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedSpeciesId(sp.id);
+                              setBatchSelectedSpeciesIds((prev) => {
+                                if (prev.includes(sp.id)) {
+                                  return prev.length > 1
+                                    ? prev.filter((id) => id !== sp.id)
+                                    : prev;
+                                }
+                                return [...prev, sp.id];
+                              });
+                            }}
+                            className={`p-3 rounded-xl border text-left transition-colors ${
+                              isBatchChecked
+                                ? isFocused
+                                  ? 'bg-cyan-500/25 border-2 border-cyan-400 text-white'
+                                  : 'bg-cyan-950/50 border border-cyan-500/60 text-white'
+                                : 'bg-slate-900/90 border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span
+                                  className="w-3 h-3 rounded-full shrink-0"
+                                  style={{ backgroundColor: sp.primaryColorHex }}
+                                />
+                                <span className="text-xs font-bold truncate">{sp.name}</span>
+                              </div>
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-extrabold shrink-0 ${
+                                  isBatchChecked
+                                    ? 'bg-cyan-400 text-slate-950'
+                                    : 'bg-slate-800 text-slate-400'
+                                }`}
+                              >
+                                {isBatchChecked ? '[✓]' : '[ ]'}
+                              </span>
+                            </div>
+                            <div className="text-[11px] font-mono text-cyan-300 mt-1">
+                              {sp.activeBaseModelVersion} · {sp.lifespan.lifespanSimHours}h Life
+                            </div>
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -1987,7 +2220,7 @@ export const TrainerApp: React.FC = () => {
                     <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold text-slate-300">
-                          Generations to Train
+                          Generations per Species
                         </span>
                         <input
                           type="number"
@@ -2060,15 +2293,17 @@ export const TrainerApp: React.FC = () => {
                         onClick={handleStartCpuThrottledTraining}
                         className="w-full py-3.5 rounded-xl bg-cyan-400 text-slate-950 font-bold text-sm hover:bg-cyan-300 transition-colors shadow-lg"
                       >
-                        Start Training {selectedSpecies.name} ({trainGenerations} Generations at{' '}
-                        {cpuUsageLimitPct}% CPU)
+                        {batchSelectedSpeciesIds.length > 1
+                          ? `Start Batch Loop Training (${batchSelectedSpeciesIds.length} Species × ${trainGenerations} Generations at ${cpuUsageLimitPct}% CPU)`
+                          : `Start Training ${selectedSpecies.name} (${trainGenerations} Generations at ${cpuUsageLimitPct}% CPU)`}
                       </button>
                     ) : (
                       <div className="space-y-2">
                         <div className="flex items-center justify-between text-xs font-mono">
                           <span className="text-cyan-300">
-                            Training Generation {trainingProgressGen} of {trainGenerations} (CPU
-                            capped at {cpuUsageLimitPct}%)...
+                            Species {batchCurrentIndex}/{batchTotalCount} [{batchCurrentSpeciesName}]
+                            — Gen {trainingProgressGen} of {trainGenerations} (CPU capped at{' '}
+                            {cpuUsageLimitPct}%)...
                           </span>
                           <button
                             type="button"
@@ -2086,7 +2321,12 @@ export const TrainerApp: React.FC = () => {
                             style={{
                               width: `${Math.min(
                                 100,
-                                Math.round((trainingProgressGen / Math.max(1, trainGenerations)) * 100)
+                                Math.round(
+                                  (((batchCurrentIndex - 1) * trainGenerations +
+                                    trainingProgressGen) /
+                                    Math.max(1, batchTotalCount * trainGenerations)) *
+                                    100
+                                )
                               )}%`,
                             }}
                           />
@@ -2215,11 +2455,13 @@ export const TrainerApp: React.FC = () => {
               bodyScaleGene: number;
             }
 
+            const localRemovedSet = new Set(ecosystem.removedFishIds || []);
             const localOwnerOnline = activeSessionTankIds.includes(currentTank.id);
             const allUnifiedFishes: KeeperUnifiedFishRow[] = [];
 
-            // 1. Add local owner's fishes
+            // 1. Add local owner's fishes (excluding removed dead fishes)
             for (const f of ecosystem.fishes) {
+              if (localRemovedSet.has(f.lineage.fishId)) continue;
               const isOnline = activeSessionTankIds.includes(f.lineage.tankId);
               allUnifiedFishes.push({
                 fishId: f.lineage.fishId,
@@ -2250,10 +2492,12 @@ export const TrainerApp: React.FC = () => {
             // 2. Add all remote cloud users' fishes from Firestore `mypc_user_brains`
             for (const cu of cloudUsers) {
               if (cu.username === profileName) continue;
+              const cuRemovedSet = new Set(cu.removedFishIds || []);
               const isCuOnline =
                 Boolean(cu.isActivelyPlaying) &&
-                Date.now() - (cu.lastGameHeartbeatMs || 0) < 180000;
+                Date.now() - (cu.lastGameHeartbeatMs || 0) < 300000;
               for (const b of cu.fishBrains) {
+                if (cuRemovedSet.has(b.fishId)) continue;
                 const sp =
                   ecosystem.speciesList.find((s) => s.id === b.speciesId) ||
                   ecosystem.speciesList[0] ||
@@ -2905,11 +3149,14 @@ export const TrainerApp: React.FC = () => {
                                       </span>
                                     )}
                                     <span
-                                      className={`text-sm font-bold ${
-                                        !f.alive ? 'text-slate-300 line-through' : 'text-white'
+                                      className={`px-2 py-0.5 rounded font-mono text-xs font-extrabold border ${
+                                        !f.alive
+                                          ? 'bg-slate-800 border-slate-500 text-slate-300 line-through'
+                                          : 'bg-cyan-950 border-cyan-400 text-cyan-200'
                                       }`}
+                                      title="Player-assigned fish name"
                                     >
-                                      {f.name}
+                                      [{f.name}]
                                     </span>
                                     <span className="text-xs font-mono text-cyan-300">
                                       Gen {f.generation}
@@ -2973,17 +3220,29 @@ export const TrainerApp: React.FC = () => {
                                       </button>
                                     </>
                                   ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setSelectedFishId(f.fishId);
-                                        setSelectedFishOwnerUsername(f.ownerUsername);
-                                        handleReviveFish(f.fishId, f.ownerUsername);
-                                      }}
-                                      className="px-2.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-bold"
-                                    >
-                                      Revive
-                                    </button>
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSelectedFishId(f.fishId);
+                                          setSelectedFishOwnerUsername(f.ownerUsername);
+                                          handleReviveFish(f.fishId, f.ownerUsername);
+                                        }}
+                                        className="px-2.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-bold"
+                                      >
+                                        Revive
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleDeleteDeadFishInTrainer(f.fishId, f.ownerUsername);
+                                        }}
+                                        className="px-2.5 py-1.5 rounded-lg bg-rose-950 border border-rose-500/60 hover:bg-rose-800 text-rose-200 text-[11px] font-bold"
+                                        title="Permanently delete this dead body from database"
+                                      >
+                                        Remove Body
+                                      </button>
+                                    </>
                                   )}
                                 </div>
                               </div>
@@ -3002,13 +3261,22 @@ export const TrainerApp: React.FC = () => {
                           <span className="text-[10px] font-mono font-bold uppercase text-cyan-300">
                             Selected Fish Inspector &amp; Actions
                           </span>
-                          <h3 className="text-base font-bold text-white mt-0.5">
-                            {activeSelectedRow
-                              ? `${activeSelectedRow.name} (Gen ${activeSelectedRow.generation})`
-                              : 'No Fish Selected'}
+                          <h3 className="text-base font-bold text-white mt-0.5 flex items-center gap-2 flex-wrap">
+                            {activeSelectedRow ? (
+                              <>
+                                <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-400 text-cyan-200 font-mono text-sm">
+                                  [{activeSelectedRow.name}]
+                                </span>
+                                <span className="text-xs font-mono text-slate-300">
+                                  (Gen {activeSelectedRow.generation})
+                                </span>
+                              </>
+                            ) : (
+                              'No Fish Selected'
+                            )}
                           </h3>
                           {activeSelectedRow && (
-                            <div className="text-xs font-mono text-slate-400">
+                            <div className="text-xs font-mono text-slate-400 mt-1">
                               Owner: <strong className="text-cyan-300">{activeSelectedRow.ownerUsername}</strong>
                             </div>
                           )}
@@ -3037,7 +3305,7 @@ export const TrainerApp: React.FC = () => {
                           {/* Actions Panel for Selected Fish */}
                           <div className="p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 space-y-2.5">
                             <div className="text-xs font-mono font-bold text-cyan-300 uppercase">
-                              Fish Actions ({activeSelectedRow.name})
+                              Fish Actions ([{activeSelectedRow.name}])
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                               <button
@@ -3092,6 +3360,20 @@ export const TrainerApp: React.FC = () => {
                               >
                                 Revive Dead Fish
                               </button>
+                              {!activeSelectedRow.alive && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteDeadFishInTrainer(
+                                      activeSelectedRow.fishId,
+                                      activeSelectedRow.ownerUsername
+                                    )
+                                  }
+                                  className="col-span-2 py-2 px-3 rounded-xl bg-rose-950 border border-rose-500/60 hover:bg-rose-800 text-rose-200 text-xs font-bold transition-colors"
+                                >
+                                  Remove Dead Body Permanently from Database
+                                </button>
+                              )}
                             </div>
 
                             {/* Change / Replace This Fish By Another Species */}

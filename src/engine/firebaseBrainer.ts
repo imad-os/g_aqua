@@ -85,6 +85,7 @@ export interface CloudUserBrainRecord {
   updatedAtIso?: string;
   adminOverrideAtMs?: number;
   lastAdminAction?: string;
+  removedFishIds?: string[];
   isActivelyPlaying: boolean;
   lastGameHeartbeatMs: number;
   autoFeederStock: number;
@@ -688,7 +689,11 @@ export function syncUserBrainsToFirestore(
   fishes: FishEntity[],
   isActivelyPlaying: boolean,
   autoFeederStock: number,
-  adminOverrideOpts?: { adminOverrideAtMs?: number; lastAdminAction?: string }
+  adminOverrideOpts?: {
+    adminOverrideAtMs?: number;
+    lastAdminAction?: string;
+    removedFishIds?: string[];
+  }
 ): Promise<boolean> {
   return new Promise((resolve) => {
     setTimeout(async () => {
@@ -697,6 +702,9 @@ export function syncUserBrainsToFirestore(
         const now = Date.now();
         _lastCloudUserFirestoreWriteMs.set(docId, now);
 
+        const removedSet = new Set(adminOverrideOpts?.removedFishIds || []);
+        const filteredFishes = fishes.filter((f) => !removedSet.has(f.lineage.fishId));
+
         const firestorePayload: Record<string, any> = {
           username: username || 'Keeper',
           profileId: profileId || 'default',
@@ -704,7 +712,9 @@ export function syncUserBrainsToFirestore(
           isActivelyPlaying,
           lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
           autoFeederStock,
-          fishBrains: fishes.slice(0, 50).map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
+          fishBrains: filteredFishes
+            .slice(0, 50)
+            .map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
         };
 
         if (adminOverrideOpts?.adminOverrideAtMs) {
@@ -712,6 +722,9 @@ export function syncUserBrainsToFirestore(
         }
         if (adminOverrideOpts?.lastAdminAction) {
           firestorePayload.lastAdminAction = adminOverrideOpts.lastAdminAction;
+        }
+        if (adminOverrideOpts?.removedFishIds) {
+          firestorePayload.removedFishIds = adminOverrideOpts.removedFishIds.slice(-200);
         }
 
         await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), firestorePayload, {
@@ -727,7 +740,7 @@ export function syncUserBrainsToFirestore(
 }
 
 /**
- * Authoritatively saves an Admin action (Kill/Starve, Revive, Reproduce, Give Fish, or Replace Fish)
+ * Authoritatively saves an Admin action (Kill/Starve, Revive, Reproduce, Give Fish, Replace Fish, or Remove Dead)
  * on any CloudUserBrainRecord directly to Firestore so even if the user has the game open,
  * their live game immediately receives the override via `onSnapshot` and applies it!
  */
@@ -737,7 +750,8 @@ export async function saveAdminOverrideForUserInFirestore(
   fishBrains?: CloudUserFishBrainItem[],
   isActivelyPlaying?: boolean,
   autoFeederStock?: number,
-  actionSummary?: string
+  actionSummary?: string,
+  removedFishIds?: string[]
 ): Promise<boolean> {
   try {
     let record: CloudUserBrainRecord;
@@ -756,6 +770,7 @@ export async function saveAdminOverrideForUserInFirestore(
         lastGameHeartbeatMs: isActivelyPlaying ? Date.now() : 0,
         autoFeederStock: Number(autoFeederStock || 0),
         fishBrains: Array.isArray(fishBrains) ? fishBrains : [],
+        removedFishIds: Array.isArray(removedFishIds) ? removedFishIds.slice(-200) : undefined,
       };
     }
 
@@ -766,20 +781,24 @@ export async function saveAdminOverrideForUserInFirestore(
     record.lastAdminAction = summary;
     _lastCloudUserFirestoreWriteMs.set(docId, now);
 
-    await setDoc(
-      doc(aiFirestore, 'mypc_user_brains', docId),
-      {
-        ...record,
-        updatedAtMs: now,
-        adminOverrideAtMs: now,
-        lastAdminAction: summary,
-        fishBrains: record.fishBrains.map((fb) => ({
-          ...fb,
-          brain: toFirestoreSafeBrain(fb.brain),
-        })),
-      },
-      { merge: true }
-    );
+    const removedSet = new Set(record.removedFishIds || []);
+    const cleanBrains = record.fishBrains.filter((fb) => !removedSet.has(fb.fishId));
+
+    const payload: Record<string, any> = {
+      ...record,
+      updatedAtMs: now,
+      adminOverrideAtMs: now,
+      lastAdminAction: summary,
+      fishBrains: cleanBrains.map((fb) => ({
+        ...fb,
+        brain: toFirestoreSafeBrain(fb.brain),
+      })),
+    };
+    if (record.removedFishIds) {
+      payload.removedFishIds = record.removedFishIds.slice(-200);
+    }
+
+    await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), payload, { merge: true });
     return true;
   } catch {
     return false;
@@ -798,12 +817,16 @@ export async function loadUserBrainsFromFirestore(
     const snap = await getDoc(doc(aiFirestore, 'mypc_user_brains', docId));
     if (!snap.exists()) return null;
     const data = snap.data() as any;
+    const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
     return {
       ...data,
-      fishBrains: (data.fishBrains || []).map((fb: any) => ({
-        ...fb,
-        brain: fromFirestoreSafeBrain(fb.brain),
-      })),
+      removedFishIds: Array.from(removedSet),
+      fishBrains: (data.fishBrains || [])
+        .filter((fb: any) => fb && !removedSet.has(fb.fishId))
+        .map((fb: any) => ({
+          ...fb,
+          brain: fromFirestoreSafeBrain(fb.brain),
+        })),
     } as CloudUserBrainRecord;
   } catch {
     return null;
@@ -843,13 +866,17 @@ export function subscribeToSingleUserBrainRecord(
         if (adminTs > lastProcessedAdminTs) lastProcessedAdminTs = adminTs;
         if (updatedMs > lastProcessedUpdatedMs) lastProcessedUpdatedMs = updatedMs;
 
+        const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
         setTimeout(() => {
           onUpdate({
             ...data,
-            fishBrains: (data.fishBrains || []).map((fb: any) => ({
-              ...fb,
-              brain: fromFirestoreSafeBrain(fb.brain),
-            })),
+            removedFishIds: Array.from(removedSet),
+            fishBrains: (data.fishBrains || [])
+              .filter((fb: any) => fb && !removedSet.has(fb.fishId))
+              .map((fb: any) => ({
+                ...fb,
+                brain: fromFirestoreSafeBrain(fb.brain),
+              })),
           } as CloudUserBrainRecord);
         }, 0);
       },
@@ -874,12 +901,16 @@ export async function fetchAllUserBrainRecordsFromFirestore(): Promise<
     const list: CloudUserBrainRecord[] = [];
     snap.forEach((d) => {
       const data = d.data() as any;
+      const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
       list.push({
         ...data,
-        fishBrains: (data.fishBrains || []).map((fb: any) => ({
-          ...fb,
-          brain: fromFirestoreSafeBrain(fb.brain),
-        })),
+        removedFishIds: Array.from(removedSet),
+        fishBrains: (data.fishBrains || [])
+          .filter((fb: any) => fb && !removedSet.has(fb.fishId))
+          .map((fb: any) => ({
+            ...fb,
+            brain: fromFirestoreSafeBrain(fb.brain),
+          })),
       } as CloudUserBrainRecord);
     });
     return list;
@@ -904,12 +935,16 @@ export function subscribeToAllUserBrainRecords(
         const list: CloudUserBrainRecord[] = [];
         snap.forEach((d) => {
           const data = d.data() as any;
+          const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
           list.push({
             ...data,
-            fishBrains: (data.fishBrains || []).map((fb: any) => ({
-              ...fb,
-              brain: fromFirestoreSafeBrain(fb.brain),
-            })),
+            removedFishIds: Array.from(removedSet),
+            fishBrains: (data.fishBrains || [])
+              .filter((fb: any) => fb && !removedSet.has(fb.fishId))
+              .map((fb: any) => ({
+                ...fb,
+                brain: fromFirestoreSafeBrain(fb.brain),
+              })),
           } as CloudUserBrainRecord);
         });
         onUpdate(list);

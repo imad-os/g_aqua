@@ -6,7 +6,7 @@
   "type": "game",
   "entry": "index.html",
   "icon": "icon.svg",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "scores": true,
   "config": {
     "allow_background_running": true,
