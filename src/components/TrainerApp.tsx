@@ -220,6 +220,10 @@ export const TrainerApp: React.FC = () => {
   );
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const lastKeeperFirestoreSyncMsRef = useRef<number>(0);
+  const cloudUsersRef = useRef<CloudUserBrainRecord[]>(cloudUsers);
+  cloudUsersRef.current = cloudUsers;
+  const lastAdminWriteByUserMsRef = useRef<Record<string, number>>({});
+  const hasAutoSelectedRealUserRef = useRef<boolean>(false);
 
   const pelletsRef = useRef<FoodPellet[]>([]);
   const threatsRef = useRef([]);
@@ -326,9 +330,57 @@ export const TrainerApp: React.FC = () => {
       setEcosystem(next);
     });
 
+    const mergeIncomingCloudUsersWithAdminProtection = (
+      incoming: CloudUserBrainRecord[]
+    ): CloudUserBrainRecord[] => {
+      const now = Date.now();
+      const currentList = cloudUsersRef.current;
+      const merged = incoming.map((inc) => {
+        const lastAdminMs = lastAdminWriteByUserMsRef.current[inc.username] || 0;
+        if (now - lastAdminMs < 15000 && (inc.adminOverrideAtMs || 0) < lastAdminMs) {
+          const localProtected = currentList.find((c) => c.username === inc.username);
+          if (localProtected) return localProtected;
+        }
+        return inc;
+      });
+      // Also preserve any brand-new user created by Admin Gift within the last 15s
+      for (const cur of currentList) {
+        const lastAdminMs = lastAdminWriteByUserMsRef.current[cur.username] || 0;
+        if (now - lastAdminMs < 15000 && !merged.some((m) => m.username === cur.username)) {
+          merged.unshift(cur);
+        }
+      }
+      return merged;
+    };
+
     const syncLocalOwnerFromCloudRecords = (records: CloudUserBrainRecord[]) => {
+      // Auto-select the first real non-Keeper user if one exists in Firestore so Admin gifts target the real player by default
+      if (!hasAutoSelectedRealUserRef.current && records.length > 0) {
+        const activeNonDefaultUser =
+          records.find((r) => r.username !== profileName && r.isActivelyPlaying) ||
+          records.find((r) => r.username !== profileName);
+        if (activeNonDefaultUser) {
+          hasAutoSelectedRealUserRef.current = true;
+          setGiftTargetUsername(activeNonDefaultUser.username);
+          setSelectedFishOwnerUsername(activeNonDefaultUser.username);
+          if (activeNonDefaultUser.fishBrains[0]) {
+            setSelectedFishId(activeNonDefaultUser.fishBrains[0].fishId);
+          }
+        }
+      }
+
       const myRecord = records.find((r) => r.username === profileName);
       if (!myRecord) return;
+
+      const lastAdminMs = lastAdminWriteByUserMsRef.current[profileName] || 0;
+      if (
+        Date.now() - lastAdminMs < 15000 &&
+        (myRecord.adminOverrideAtMs || 0) < lastAdminMs
+      ) {
+        // Protect recent local Admin override from being reverted by an older snapshot
+        return;
+      }
+
       const eco = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
       const removedSet = new Set<string>([
         ...(eco.removedFishIds || []),
@@ -359,13 +411,59 @@ export const TrainerApp: React.FC = () => {
         changed = true;
       }
 
-      // Sync custom player-assigned fish names [name123] from Firestore into local Trainer state
+      // Sync custom player-assigned fish names [name123] and status from Firestore into local Trainer state
       for (const f of eco.fishes) {
         const cb = cloudFishMap.get(f.lineage.fishId);
-        if (cb && cb.name && cb.name !== f.lineage.name) {
-          f.lineage.name = cb.name;
-          changed = true;
+        if (cb) {
+          if (cb.name && cb.name !== f.lineage.name) {
+            f.lineage.name = cb.name;
+            changed = true;
+          }
+          if (cb.speciesId && cb.speciesId !== f.lineage.speciesId) {
+            f.lineage.speciesId = cb.speciesId;
+            changed = true;
+          }
         }
+      }
+
+      // Also add any new fishes born or bought in the player's game for `profileName`
+      const localIds = new Set(eco.fishes.map((f) => f.lineage.fishId));
+      for (const cb of myRecord.fishBrains) {
+        if (removedSet.has(cb.fishId) || localIds.has(cb.fishId)) continue;
+        let sp = eco.speciesList.find((s) => s.id === cb.speciesId);
+        if (!sp) {
+          const famousTpl = FAMOUS_AQUARIUM_FISHES_50.find((ft) => ft.id === cb.speciesId);
+          if (famousTpl) {
+            sp = createSpeciesConfigFromFamousFish(famousTpl);
+            eco.speciesList.push(sp);
+          } else {
+            sp = eco.speciesList[0] || DEFAULT_SPECIES_LIST[0];
+          }
+        }
+        const spawned = spawnFoundingFish(
+          sp,
+          eco.activeTankTier,
+          eco.simHoursTotal,
+          eco.fishes.length,
+          cb.brain
+        );
+        spawned.lineage.fishId = cb.fishId;
+        spawned.lineage.name = cb.name || spawned.lineage.name;
+        spawned.lineage.speciesId = sp.id;
+        spawned.lineage.generation = cb.generation || 1;
+        spawned.lineage.alive = Boolean(cb.alive);
+        spawned.lineage.causeOfDeath = (cb.causeOfDeath as FishEntity['lineage']['causeOfDeath']) || null;
+        spawned.state.energy = cb.energy ?? 85;
+        spawned.state.hunger = cb.hunger ?? 15;
+        spawned.state.ageSimHours = cb.ageSimHours ?? 0.5;
+        eco.fishes.push(spawned);
+        changed = true;
+      }
+
+      if ((myRecord.adminOverrideAtMs || 0) > (eco.adminOverrideAtMs || 0)) {
+        eco.adminOverrideAtMs = myRecord.adminOverrideAtMs;
+        eco.lastAdminAction = myRecord.lastAdminAction;
+        changed = true;
       }
 
       if (changed) {
@@ -377,16 +475,20 @@ export const TrainerApp: React.FC = () => {
 
     fetchAllUserBrainRecordsFromFirestore().then((records) => {
       if (mounted && records.length > 0) {
-        syncLocalOwnerFromCloudRecords(records);
-        setCloudUsers(records);
+        const merged = mergeIncomingCloudUsersWithAdminProtection(records);
+        syncLocalOwnerFromCloudRecords(merged);
+        cloudUsersRef.current = merged;
+        setCloudUsers(merged);
       }
     });
 
     // Real-time Firestore listener so when a user opens or closes the game, Keeper updates immediately
     const unsubCloudUsers = subscribeToAllUserBrainRecords((records) => {
       if (mounted) {
-        syncLocalOwnerFromCloudRecords(records);
-        setCloudUsers(records);
+        const merged = mergeIncomingCloudUsersWithAdminProtection(records);
+        syncLocalOwnerFromCloudRecords(merged);
+        cloudUsersRef.current = merged;
+        setCloudUsers(merged);
       }
     });
 
@@ -394,7 +496,15 @@ export const TrainerApp: React.FC = () => {
     const handleStorageChange = () => {
       if (!mounted) return;
       setActiveSessionTankIds(getActiveGameSessionTankIds());
+      const lastAdminMs = lastAdminWriteByUserMsRef.current[profileName] || 0;
+      if (Date.now() - lastAdminMs < 15000) {
+        // Never allow a background game tab storage write to revert a recent Trainer Admin action!
+        return;
+      }
       const freshEco = loadEcosystemState();
+      if ((freshEco.adminOverrideAtMs || 0) < (ecosystemRef.current.adminOverrideAtMs || 0)) {
+        return;
+      }
       ecosystemRef.current = freshEco;
       setEcosystem(freshEco);
     };
@@ -474,10 +584,19 @@ export const TrainerApp: React.FC = () => {
       // A fish must run in ONLY ONE place: either in its owner's open game OR in this Trainer Keeper.
       // When the owner has the game open, Keeper does NOT step or overwrite localStorage — instead it reads the live state.
       if (isOwnerOnlineInGame) {
-        if (localActiveTankIds.includes(activeTank.id)) {
+        const lastAdminMs = lastAdminWriteByUserMsRef.current[profileName] || 0;
+        if (
+          localActiveTankIds.includes(activeTank.id) &&
+          nowMs - lastAdminMs >= 15000
+        ) {
           const latestFromGame = loadEcosystemState();
-          ecosystemRef.current = latestFromGame;
-          setEcosystem(latestFromGame);
+          if (
+            (latestFromGame.adminOverrideAtMs || 0) >=
+            (ecosystemRef.current.adminOverrideAtMs || 0)
+          ) {
+            ecosystemRef.current = latestFromGame;
+            setEcosystem(latestFromGame);
+          }
         }
       } else {
         const eco = ecosystemRef.current;
@@ -533,8 +652,13 @@ export const TrainerApp: React.FC = () => {
       const cloudSimHoursDelta =
         stepRes.simHoursDelta > 0 ? stepRes.simHoursDelta : (0.4 * serviceSpeed) / 60;
 
-      for (const cu of cloudUsers) {
+      for (const cu of cloudUsersRef.current) {
         if (cu.username === profileName) continue;
+        const lastAdminMs = lastAdminWriteByUserMsRef.current[cu.username] || 0;
+        if (nowMs - lastAdminMs < 15000) {
+          // Do not step or overwrite a user record right after an Admin action
+          continue;
+        }
         const isUserOnlineNow =
           cu.isActivelyPlaying && nowMs - (cu.lastGameHeartbeatMs || 0) < 300000;
         if (isUserOnlineNow) {
@@ -941,14 +1065,16 @@ export const TrainerApp: React.FC = () => {
   const handleStarveFish = async (targetFishId?: string, ownerUsername?: string) => {
     const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
     const candidateId = targetFishId || selectedFishId;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) {
         setStatusBanner(`User "${resolvedOwner}" not found.`);
         return;
       }
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const updatedBrains = cu.fishBrains.map((b) => ({ ...b }));
       let targetB = updatedBrains.find((b) => b.fishId === candidateId && b.alive);
       if (!targetB) targetB = updatedBrains.find((b) => b.alive);
@@ -961,15 +1087,16 @@ export const TrainerApp: React.FC = () => {
       targetB.energy = 0;
       targetB.hunger = 100;
 
-      const actionDesc = `Admin starved ${targetB.name} (${resolvedOwner})`;
-      const nextCloudUsers = [...cloudUsers];
+      const actionDesc = `Admin starved [${targetB.name}] (${resolvedOwner})`;
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
       setSelectedFishId(targetB.fishId);
       setSelectedFishOwnerUsername(resolvedOwner);
@@ -980,10 +1107,11 @@ export const TrainerApp: React.FC = () => {
         updatedBrains,
         cu.isActivelyPlaying,
         cu.autoFeederStock,
-        actionDesc
+        actionDesc,
+        cu.removedFishIds || []
       );
       setStatusBanner(
-        `Killed "${targetB.name}" (Owner: ${resolvedOwner}) by STARVATION! Authoritative override pushed — even if ${resolvedOwner} has the game open right now, "${targetB.name}" immediately turns dead and greyed out.`
+        `Killed "[${targetB.name}]" (Owner: ${resolvedOwner}) by STARVATION! Authoritative override pushed — even if ${resolvedOwner} has the game open right now, "[${targetB.name}]" immediately turns dead and greyed out.`
       );
       return;
     }
@@ -1013,8 +1141,8 @@ export const TrainerApp: React.FC = () => {
       next.deceasedArchive.unshift({ ...target.lineage });
     }
 
-    const actionDesc = `Admin starved ${target.lineage.name}`;
-    next.adminOverrideAtMs = Date.now();
+    const actionDesc = `Admin starved [${target.lineage.name}]`;
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1025,7 +1153,7 @@ export const TrainerApp: React.FC = () => {
 
     const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
     const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
-    const serialized = next.fishes.map(serializeFishEntityToCloudBrainItem);
+    const serialized = next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f));
 
     await saveAdminOverrideForUserInFirestore(
       profileName,
@@ -1033,11 +1161,12 @@ export const TrainerApp: React.FC = () => {
       serialized,
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
-      actionDesc
+      actionDesc,
+      next.removedFishIds || []
     );
 
     setStatusBanner(
-      `Fish "${target.lineage.name}" (Gen ${target.lineage.generation}) died from STARVATION! Authoritative override pushed — even if the owner has the game open right now, "${target.lineage.name}" turns dead and greyed out immediately.`
+      `Fish "[${target.lineage.name}]" (Gen ${target.lineage.generation}) died from STARVATION! Authoritative override pushed — even if the owner has the game open right now, "[${target.lineage.name}]" turns dead and greyed out immediately.`
     );
   };
 
@@ -1045,11 +1174,13 @@ export const TrainerApp: React.FC = () => {
   const handleReproduceFish = async (targetFishId?: string, ownerUsername?: string) => {
     const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
     const candidateId = targetFishId || selectedFishId;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) return;
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const updatedBrains = cu.fishBrains.map((b) => ({ ...b }));
       let parentB = updatedBrains.find((b) => b.fishId === candidateId && b.alive);
       if (!parentB) parentB = updatedBrains.find((b) => b.alive);
@@ -1075,15 +1206,16 @@ export const TrainerApp: React.FC = () => {
       const babyItem = serializeFishEntityToCloudBrainItem(babySpawned);
       updatedBrains.push(babyItem);
 
-      const actionDesc = `Admin reproduced ${parentB.name} -> baby ${babyItem.name}`;
-      const nextCloudUsers = [...cloudUsers];
+      const actionDesc = `Admin reproduced [${parentB.name}] -> baby [${babyItem.name}]`;
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
 
       await saveAdminOverrideForUserInFirestore(
@@ -1092,10 +1224,11 @@ export const TrainerApp: React.FC = () => {
         updatedBrains,
         cu.isActivelyPlaying,
         cu.autoFeederStock,
-        actionDesc
+        actionDesc,
+        cu.removedFishIds || []
       );
       setStatusBanner(
-        `"${parentB.name}" (Owner: ${resolvedOwner}) reproduced! Baby "${babyItem.name}" (Gen ${babyItem.generation}) added to ${resolvedOwner}'s aquarium.`
+        `"[${parentB.name}]" (Owner: ${resolvedOwner}) reproduced! Baby "[${babyItem.name}]" (Gen ${babyItem.generation}) added to ${resolvedOwner}'s aquarium.`
       );
       return;
     }
@@ -1135,8 +1268,8 @@ export const TrainerApp: React.FC = () => {
     parentFish.state.reproductionCooldownHours = sp.lifespan.reproductionIntervalHours;
     next.fishes.push(babyFish);
 
-    const actionDesc = `Admin reproduced ${parentFish.lineage.name} -> baby ${babyFish.lineage.name}`;
-    next.adminOverrideAtMs = Date.now();
+    const actionDesc = `Admin reproduced [${parentFish.lineage.name}] -> baby [${babyFish.lineage.name}]`;
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1148,14 +1281,15 @@ export const TrainerApp: React.FC = () => {
     await saveAdminOverrideForUserInFirestore(
       profileName,
       profileId,
-      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
-      actionDesc
+      actionDesc,
+      next.removedFishIds || []
     );
 
     setStatusBanner(
-      `"${parentFish.lineage.name}" reproduced! New baby "${babyFish.lineage.name}" (Gen ${babyFish.lineage.generation}, Juvenile) was born into the tank.`
+      `"[${parentFish.lineage.name}]" reproduced! New baby "[${babyFish.lineage.name}]" (Gen ${babyFish.lineage.generation}, Juvenile) was born into the tank.`
     );
   };
 
@@ -1163,11 +1297,13 @@ export const TrainerApp: React.FC = () => {
   const handleFeedSingleFish = async (targetFishId?: string, ownerUsername?: string) => {
     const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
     const candidateId = targetFishId || selectedFishId;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) return;
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const updatedBrains = cu.fishBrains.map((b) => ({ ...b }));
       const targetB = updatedBrains.find((b) => b.fishId === candidateId && b.alive);
       if (!targetB) {
@@ -1176,15 +1312,16 @@ export const TrainerApp: React.FC = () => {
       }
       targetB.energy = Math.min(100, targetB.energy + 50);
       targetB.hunger = Math.max(0, 100 - targetB.energy);
-      const actionDesc = `Admin fed ${targetB.name}`;
-      const nextCloudUsers = [...cloudUsers];
+      const actionDesc = `Admin fed [${targetB.name}]`;
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
       await saveAdminOverrideForUserInFirestore(
         cu.username,
@@ -1192,9 +1329,12 @@ export const TrainerApp: React.FC = () => {
         updatedBrains,
         cu.isActivelyPlaying,
         cu.autoFeederStock,
-        actionDesc
+        actionDesc,
+        cu.removedFishIds || []
       );
-      setStatusBanner(`Fed "${targetB.name}" (Owner: ${resolvedOwner}, Energy ${targetB.energy.toFixed(0)}%).`);
+      setStatusBanner(
+        `Fed "[${targetB.name}]" (Owner: ${resolvedOwner}, Energy ${targetB.energy.toFixed(0)}%).`
+      );
       return;
     }
 
@@ -1207,8 +1347,8 @@ export const TrainerApp: React.FC = () => {
     target.state.energy = Math.min(100, target.state.energy + 50);
     target.state.hunger = Math.max(0, 100 - target.state.energy);
     target.state.health = Math.min(100, target.state.health + 20);
-    const actionDesc = `Admin fed ${target.lineage.name}`;
-    next.adminOverrideAtMs = Date.now();
+    const actionDesc = `Admin fed [${target.lineage.name}]`;
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1220,24 +1360,29 @@ export const TrainerApp: React.FC = () => {
     await saveAdminOverrideForUserInFirestore(
       profileName,
       profileId,
-      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
-      actionDesc
+      actionDesc,
+      next.removedFishIds || []
     );
 
-    setStatusBanner(`Fed "${target.lineage.name}" (+50% Energy, Health ${target.state.health.toFixed(0)}%).`);
+    setStatusBanner(
+      `Fed "[${target.lineage.name}]" (+50% Energy, Health ${target.state.health.toFixed(0)}%).`
+    );
   };
 
   // Revive a dead fish (local or cloud user)
   const handleReviveFish = async (targetFishId?: string, ownerUsername?: string) => {
     const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
     const candidateId = targetFishId || selectedFishId;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) return;
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const updatedBrains = cu.fishBrains.map((b) => ({ ...b }));
       const targetB = updatedBrains.find((b) => b.fishId === candidateId && !b.alive);
       if (!targetB) return;
@@ -1245,15 +1390,16 @@ export const TrainerApp: React.FC = () => {
       targetB.causeOfDeath = null;
       targetB.energy = 85;
       targetB.hunger = 15;
-      const actionDesc = `Admin revived ${targetB.name}`;
-      const nextCloudUsers = [...cloudUsers];
+      const actionDesc = `Admin revived [${targetB.name}]`;
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
       await saveAdminOverrideForUserInFirestore(
         cu.username,
@@ -1261,9 +1407,10 @@ export const TrainerApp: React.FC = () => {
         updatedBrains,
         cu.isActivelyPlaying,
         cu.autoFeederStock,
-        actionDesc
+        actionDesc,
+        cu.removedFishIds || []
       );
-      setStatusBanner(`Revived "${targetB.name}" (Owner: ${resolvedOwner}) with 85% Energy!`);
+      setStatusBanner(`Revived "[${targetB.name}]" (Owner: ${resolvedOwner}) with 85% Energy!`);
       return;
     }
 
@@ -1278,8 +1425,8 @@ export const TrainerApp: React.FC = () => {
     target.state.health = 100;
     target.state.stress = 5;
     next.deceasedArchive = next.deceasedArchive.filter((d) => d.fishId !== target.lineage.fishId);
-    const actionDesc = `Admin revived ${target.lineage.name}`;
-    next.adminOverrideAtMs = Date.now();
+    const actionDesc = `Admin revived [${target.lineage.name}]`;
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1291,10 +1438,11 @@ export const TrainerApp: React.FC = () => {
     await saveAdminOverrideForUserInFirestore(
       profileName,
       profileId,
-      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
-      actionDesc
+      actionDesc,
+      next.removedFishIds || []
     );
 
     setStatusBanner(`Revived "[${target.lineage.name}]" with 85% Energy and 100% Health!`);
@@ -1305,26 +1453,29 @@ export const TrainerApp: React.FC = () => {
     const resolvedOwner = ownerUsername || selectedFishOwnerUsername || profileName;
     const candidateId = targetFishId || selectedFishId;
     if (!candidateId) return;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) return;
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const targetB = cu.fishBrains.find((b) => b.fishId === candidateId);
       const updatedBrains = cu.fishBrains.filter((b) => b.fishId !== candidateId);
       const updatedRemoved = Array.from(
         new Set([...(cu.removedFishIds || []), candidateId])
       ).slice(-200);
       const actionDesc = `Removed dead fish [${targetB?.name || candidateId}] from database`;
-      const nextCloudUsers = [...cloudUsers];
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
         removedFishIds: updatedRemoved,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
       await saveAdminOverrideForUserInFirestore(
         cu.username,
@@ -1353,7 +1504,7 @@ export const TrainerApp: React.FC = () => {
       new Set([...(next.acknowledgedDeadFishIds || []), candidateId])
     ).slice(-200);
     const actionDesc = `Removed dead fish [${removedName}] from database`;
-    next.adminOverrideAtMs = Date.now();
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1365,7 +1516,7 @@ export const TrainerApp: React.FC = () => {
     await saveAdminOverrideForUserInFirestore(
       profileName,
       profileId,
-      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
       actionDesc,
@@ -1381,6 +1532,8 @@ export const TrainerApp: React.FC = () => {
   const handleGiveFishToUser = async () => {
     const targetUser = (giftTargetUsername || profileName).trim();
     const qty = Math.max(1, Math.min(10, giftQuantity || 1));
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[targetUser] = now;
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
 
     // Ensure the species exists in speciesList (can also be from the 50 Famous Fishes catalog)
@@ -1408,12 +1561,12 @@ export const TrainerApp: React.FC = () => {
           customBrain
         );
         next.fishes.push(newFish);
-        spawnedNames.push(newFish.lineage.name);
+        spawnedNames.push(`[${newFish.lineage.name}]`);
         setSelectedFishId(newFish.lineage.fishId);
         setSelectedFishOwnerUsername(profileName);
       }
       const actionDesc = `Admin gifted ${qty}x ${sp.name} (${spawnedNames.join(', ')}) to ${profileName}`;
-      next.adminOverrideAtMs = Date.now();
+      next.adminOverrideAtMs = now;
       next.lastAdminAction = actionDesc;
 
       saveEcosystemState(next);
@@ -1425,10 +1578,11 @@ export const TrainerApp: React.FC = () => {
       await saveAdminOverrideForUserInFirestore(
         profileName,
         profileId,
-        next.fishes.map(serializeFishEntityToCloudBrainItem),
+        next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
         activeSessionTankIds.includes(activeTank.id),
         ownerFeederCount,
-        actionDesc
+        actionDesc,
+        next.removedFishIds || []
       );
 
       setStatusBanner(
@@ -1438,15 +1592,15 @@ export const TrainerApp: React.FC = () => {
     }
 
     // Remote Cloud User (or create new cloud user record if not yet in cloudUsers)
-    const existingIdx = cloudUsers.findIndex((u) => u.username === targetUser);
+    const existingIdx = cloudUsersRef.current.findIndex((u) => u.username === targetUser);
     const existingRecord: CloudUserBrainRecord =
       existingIdx >= 0
-        ? cloudUsers[existingIdx]
+        ? cloudUsersRef.current[existingIdx]
         : {
             username: targetUser,
             profileId: `user-${targetUser.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
             updatedAtIso: new Date().toISOString(),
-            updatedAtMs: Date.now(),
+            updatedAtMs: now,
             isActivelyPlaying: false,
             lastGameHeartbeatMs: 0,
             autoFeederStock: 1,
@@ -1465,7 +1619,7 @@ export const TrainerApp: React.FC = () => {
       );
       const item = serializeFishEntityToCloudBrainItem(newFish);
       updatedBrains.push(item);
-      spawnedNames.push(item.name);
+      spawnedNames.push(`[${item.name}]`);
       setSelectedFishId(item.fishId);
       setSelectedFishOwnerUsername(targetUser);
     }
@@ -1474,15 +1628,16 @@ export const TrainerApp: React.FC = () => {
     const updatedUserRecord: CloudUserBrainRecord = {
       ...existingRecord,
       fishBrains: updatedBrains,
-      updatedAtMs: Date.now(),
-      adminOverrideAtMs: Date.now(),
+      updatedAtMs: now,
+      adminOverrideAtMs: now,
       lastAdminAction: actionDesc,
     };
 
     const nextCloudUsers =
       existingIdx >= 0
-        ? cloudUsers.map((u, idx) => (idx === existingIdx ? updatedUserRecord : u))
-        : [updatedUserRecord, ...cloudUsers];
+        ? cloudUsersRef.current.map((u, idx) => (idx === existingIdx ? updatedUserRecord : u))
+        : [updatedUserRecord, ...cloudUsersRef.current];
+    cloudUsersRef.current = nextCloudUsers;
     setCloudUsers(nextCloudUsers);
 
     // Save species to local ecosystem if newly added from catalog
@@ -1496,7 +1651,8 @@ export const TrainerApp: React.FC = () => {
       updatedBrains,
       updatedUserRecord.isActivelyPlaying,
       updatedUserRecord.autoFeederStock,
-      actionDesc
+      actionDesc,
+      updatedUserRecord.removedFishIds || []
     );
 
     setStatusBanner(
@@ -1517,6 +1673,8 @@ export const TrainerApp: React.FC = () => {
       setStatusBanner('Select a fish first to change its species.');
       return;
     }
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[resolvedOwner] = now;
 
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
     let newSp = next.speciesList.find((s) => s.id === desiredSpeciesId);
@@ -1534,9 +1692,9 @@ export const TrainerApp: React.FC = () => {
     const shortPrefix = newSp.name.split(' ')[0] || 'Aqua';
 
     if (resolvedOwner !== profileName) {
-      const cuIdx = cloudUsers.findIndex((u) => u.username === resolvedOwner);
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === resolvedOwner);
       if (cuIdx === -1) return;
-      const cu = cloudUsers[cuIdx];
+      const cu = cloudUsersRef.current[cuIdx];
       const updatedBrains = cu.fishBrains.map((b) => ({ ...b }));
       const targetB = updatedBrains.find((b) => b.fishId === candidateId);
       if (!targetB) return;
@@ -1551,15 +1709,16 @@ export const TrainerApp: React.FC = () => {
       targetB.energy = 90;
       targetB.hunger = 10;
 
-      const actionDesc = `Admin changed fish ${oldName} -> ${targetB.name} (${newSp.name})`;
-      const nextCloudUsers = [...cloudUsers];
+      const actionDesc = `Admin changed fish [${oldName}] -> [${targetB.name}] (${newSp.name})`;
+      const nextCloudUsers = [...cloudUsersRef.current];
       nextCloudUsers[cuIdx] = {
         ...cu,
         fishBrains: updatedBrains,
-        updatedAtMs: Date.now(),
-        adminOverrideAtMs: Date.now(),
+        updatedAtMs: now,
+        adminOverrideAtMs: now,
         lastAdminAction: actionDesc,
       };
+      cloudUsersRef.current = nextCloudUsers;
       setCloudUsers(nextCloudUsers);
 
       saveEcosystemState(next);
@@ -1572,11 +1731,12 @@ export const TrainerApp: React.FC = () => {
         updatedBrains,
         cu.isActivelyPlaying,
         cu.autoFeederStock,
-        actionDesc
+        actionDesc,
+        cu.removedFishIds || []
       );
 
       setStatusBanner(
-        `Changed "${oldName}" (Owner: ${resolvedOwner}) into "${newSp.name}" (${targetB.name}) and synced immediately to the user's game!`
+        `Changed "[${oldName}]" (Owner: ${resolvedOwner}) into "${newSp.name}" ([${targetB.name}]) and synced immediately to the user's game!`
       );
       return;
     }
@@ -1597,8 +1757,8 @@ export const TrainerApp: React.FC = () => {
     target.state.stress = 5;
     next.deceasedArchive = next.deceasedArchive.filter((d) => d.fishId !== target.lineage.fishId);
 
-    const actionDesc = `Admin changed fish ${oldName} -> ${target.lineage.name} (${newSp.name})`;
-    next.adminOverrideAtMs = Date.now();
+    const actionDesc = `Admin changed fish [${oldName}] -> [${target.lineage.name}] (${newSp.name})`;
+    next.adminOverrideAtMs = now;
     next.lastAdminAction = actionDesc;
 
     saveEcosystemState(next);
@@ -1610,32 +1770,49 @@ export const TrainerApp: React.FC = () => {
     await saveAdminOverrideForUserInFirestore(
       profileName,
       profileId,
-      next.fishes.map(serializeFishEntityToCloudBrainItem),
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
       activeSessionTankIds.includes(activeTank.id),
       ownerFeederCount,
-      actionDesc
+      actionDesc,
+      next.removedFishIds || []
     );
 
     setStatusBanner(
-      `Changed "${oldName}" into "${newSp.name}" (${target.lineage.name})! The 3D aquarium mesh and brain updated immediately.`
+      `Changed "[${oldName}]" into "${newSp.name}" ([${target.lineage.name}])! The 3D aquarium mesh and brain updated immediately.`
     );
   };
 
   // Offline Fish Actions
   const handleFeedOfflineFishes = async () => {
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[profileName] = now;
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
     for (const f of next.fishes) {
-      if (f.lineage.alive && !activeSessionTankIds.includes(f.lineage.tankId)) {
+      if (f.lineage.alive) {
         f.state.energy = Math.min(100, f.state.energy + 35);
         f.state.hunger = Math.max(0, 100 - f.state.energy);
       }
     }
-    next.adminOverrideAtMs = Date.now();
-    next.lastAdminAction = 'Admin fed all offline fishes';
+    const actionDesc = 'Admin fed all fishes (+35% Energy)';
+    next.adminOverrideAtMs = now;
+    next.lastAdminAction = actionDesc;
     saveEcosystemState(next);
     ecosystemRef.current = next;
     setEcosystem(next);
-    setStatusBanner('Fed all live offline fishes in the Keeper (+35% Energy).');
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await saveAdminOverrideForUserInFirestore(
+      profileName,
+      profileId,
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount,
+      actionDesc,
+      next.removedFishIds || []
+    );
+
+    setStatusBanner('Fed all live fishes (+35% Energy) and synced to Firestore.');
   };
 
   const handleToggleSimulatedOwnerOnlineState = () => {
@@ -1662,17 +1839,78 @@ export const TrainerApp: React.FC = () => {
     handleStarveFish(selectedFishId || undefined);
   };
 
-  const handleAddOfflinePair = () => {
+  const handleAddOfflinePair = async () => {
+    const targetOwner =
+      selectedKeeperUserFilter !== 'ALL'
+        ? selectedKeeperUserFilter
+        : selectedFishOwnerUsername || giftTargetUsername || profileName;
+    const now = Date.now();
+    lastAdminWriteByUserMsRef.current[targetOwner] = now;
+
+    if (targetOwner !== profileName) {
+      const cuIdx = cloudUsersRef.current.findIndex((u) => u.username === targetOwner);
+      if (cuIdx >= 0) {
+        const cu = cloudUsersRef.current[cuIdx];
+        const sp = ecosystemRef.current.speciesList[0] || DEFAULT_SPECIES_LIST[0];
+        const f1 = spawnFoundingFish(sp, 0, ecosystemRef.current.simHoursTotal, cu.fishBrains.length);
+        const f2 = spawnFoundingFish(sp, 0, ecosystemRef.current.simHoursTotal, cu.fishBrains.length + 1);
+        const item1 = serializeFishEntityToCloudBrainItem(f1);
+        const item2 = serializeFishEntityToCloudBrainItem(f2);
+        const updatedBrains = [...cu.fishBrains, item1, item2];
+        const actionDesc = `Admin added 2 fishes ([${item1.name}], [${item2.name}]) to ${targetOwner}`;
+        const nextCloudUsers = [...cloudUsersRef.current];
+        nextCloudUsers[cuIdx] = {
+          ...cu,
+          fishBrains: updatedBrains,
+          updatedAtMs: now,
+          adminOverrideAtMs: now,
+          lastAdminAction: actionDesc,
+        };
+        cloudUsersRef.current = nextCloudUsers;
+        setCloudUsers(nextCloudUsers);
+        setSelectedFishId(item1.fishId);
+        setSelectedFishOwnerUsername(targetOwner);
+        await saveAdminOverrideForUserInFirestore(
+          cu.username,
+          cu.profileId,
+          updatedBrains,
+          cu.isActivelyPlaying,
+          cu.autoFeederStock,
+          actionDesc,
+          cu.removedFishIds || []
+        );
+        setStatusBanner(`Added 2 live fishes ([${item1.name}], [${item2.name}]) to "${targetOwner}" and synced to Firestore.`);
+        return;
+      }
+    }
+
     const next = JSON.parse(JSON.stringify(ecosystemRef.current)) as SavedEcosystemState;
     const sp = next.speciesList[0] || DEFAULT_SPECIES_LIST[0];
     const f1 = spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length);
     const f2 = spawnFoundingFish(sp, next.activeTankTier, next.simHoursTotal, next.fishes.length + 1);
     next.fishes.push(f1, f2);
+    const actionDesc = `Admin added 2 fishes ([${f1.lineage.name}], [${f2.lineage.name}])`;
+    next.adminOverrideAtMs = now;
+    next.lastAdminAction = actionDesc;
     saveEcosystemState(next);
     ecosystemRef.current = next;
     setEcosystem(next);
     setSelectedFishId(f1.lineage.fishId);
-    setStatusBanner('Added 2 live fishes to the tank.');
+    setSelectedFishOwnerUsername(profileName);
+
+    const activeTank = TANK_TIERS[next.activeTankTier] || TANK_TIERS[0];
+    const ownerFeederCount = next.autoFeederCountByTank[activeTank.id] || 0;
+    await saveAdminOverrideForUserInFirestore(
+      profileName,
+      profileId,
+      next.fishes.map((f) => serializeFishEntityToCloudBrainItem(f)),
+      activeSessionTankIds.includes(activeTank.id),
+      ownerFeederCount,
+      actionDesc,
+      next.removedFishIds || []
+    );
+
+    setStatusBanner(`Added 2 live fishes ([${f1.lineage.name}], [${f2.lineage.name}]) to the tank and synced to Firestore.`);
   };
 
   // ============================================================================
@@ -1686,7 +1924,7 @@ export const TrainerApp: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-500 text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">
-                  TRAINER HUD v1.7.4
+                  TRAINER HUD v1.7.5
                 </span>
                 <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">
                   ADMIN AUTH GATE
@@ -1874,7 +2112,7 @@ export const TrainerApp: React.FC = () => {
       <header className="h-14 px-5 bg-[#040c1a] border-b-2 border-cyan-800 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <span className="px-2.5 py-1 rounded bg-cyan-950 border border-cyan-500 text-[11px] font-mono font-extrabold text-cyan-300 uppercase tracking-widest">
-            TRAINER HUD v1.7.4
+            TRAINER HUD v1.7.5
           </span>
           <span className="text-sm font-extrabold uppercase tracking-wider text-white">
             ABYSSAL EVO // AI LAB &amp; 24/7 KEEPER
@@ -3123,6 +3361,7 @@ export const TrainerApp: React.FC = () => {
                               onClick={() => {
                                 setSelectedFishId(f.fishId);
                                 setSelectedFishOwnerUsername(f.ownerUsername);
+                                setGiftTargetUsername(f.ownerUsername);
                               }}
                               className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
                                 isSelected

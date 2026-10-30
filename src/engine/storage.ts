@@ -225,6 +225,10 @@ export function resetFishesKeepBaseModels(currentState: SavedEcosystemState): Sa
     ],
     modelRegistry: preservedModelRegistry,
     experiments: preservedExperiments,
+    adminOverrideAtMs: Date.now(),
+    lastAdminAction: 'Admin reset all fishes to fresh Gen 1 starters',
+    removedFishIds: [],
+    acknowledgedDeadFishIds: [],
   };
 
   saveEcosystemState(nextState);
@@ -324,10 +328,27 @@ export function loadEcosystemState(): SavedEcosystemState {
 /**
  * Saves the player's progress (fishes, bought tanks, auto-feeders, credits) via `MyPC.save`
  * and mirrors to localStorage for immediate cross-tab Trainer access.
+ * Rejects stale writes if localStorage already contains a newer Trainer `adminOverrideAtMs`.
  */
 export function saveEcosystemState(state: SavedEcosystemState): void {
   const mypc = getMyPC();
   try {
+    if (typeof localStorage !== 'undefined') {
+      const existingRaw = localStorage.getItem(`mypc:abyssal-evo:${ECOSYSTEM_SAVE_KEY}`);
+      if (existingRaw) {
+        try {
+          const existingParsed = JSON.parse(existingRaw) as SavedEcosystemState;
+          const existingOverrideMs = Number(existingParsed?.adminOverrideAtMs || 0);
+          const incomingOverrideMs = Number(state.adminOverrideAtMs || 0);
+          if (existingOverrideMs > incomingOverrideMs) {
+            // Do not overwrite a newer Trainer Admin Override with stale in-memory game state!
+            return;
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+    }
     state.lastSavedAtMs = Date.now();
     mypc.save(ECOSYSTEM_SAVE_KEY, state);
     if (typeof localStorage !== 'undefined') {

@@ -176,23 +176,89 @@ interface FirestoreSafeBrain {
 }
 
 function round4(n: number): number {
-  return Math.round(n * 10000) / 10000;
+  return Math.round((Number(n) || 0) * 10000) / 10000;
 }
 
-export function toFirestoreSafeBrain(brain: FishBrainInstance): FirestoreSafeBrain {
-  const layers = brain.inheritedWeights.map((iw, idx) => ({
-    iw: iw.map(round4),
-    ib: (brain.inheritedBiases[idx] || []).map(round4),
-    dw: (brain.learnedDeltaWeights[idx] || []).map(round4),
-    db: (brain.learnedDeltaBiases[idx] || []).map(round4),
+/**
+ * Recursively strips `undefined` properties from objects and replaces `undefined` array items with `null`
+ * so Firestore `setDoc()` NEVER throws `FirebaseError: Unsupported field value: undefined`.
+ */
+function stripUndefinedDeep<T>(val: T): T {
+  if (val === undefined) return null as unknown as T;
+  if (val === null || typeof val !== 'object') return val;
+  if (Array.isArray(val)) {
+    return val.map((item) => (item === undefined ? null : stripUndefinedDeep(item))) as unknown as T;
+  }
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(val as Record<string, any>)) {
+    if (v !== undefined) {
+      out[k] = stripUndefinedDeep(v);
+    }
+  }
+  return out as T;
+}
+
+export function toFirestoreSafeBrain(brain: any): FirestoreSafeBrain {
+  // If already converted to FirestoreSafeBrain (has .layers and no .inheritedWeights), return cleanly
+  if (brain && Array.isArray(brain.layers) && !Array.isArray(brain.inheritedWeights)) {
+    return {
+      architecture: brain.architecture || {
+        inputCount: 10,
+        hiddenLayers: [16, 12],
+        outputCount: 4,
+        activation: 'tanh',
+        recurrentMemoryEnabled: true,
+        attentionModuleEnabled: true,
+      },
+      layers: brain.layers.map((l: any) => ({
+        iw: Array.isArray(l?.iw) ? l.iw.map(round4) : [],
+        ib: Array.isArray(l?.ib) ? l.ib.map(round4) : [],
+        dw: Array.isArray(l?.dw) ? l.dw.map(round4) : [],
+        db: Array.isArray(l?.db) ? l.db.map(round4) : [],
+      })),
+      recurrentState: Array.isArray(brain.recurrentState) ? brain.recurrentState.map(round4) : [],
+      attentionGates: Array.isArray(brain.attentionGates) ? brain.attentionGates.map(round4) : [],
+      lastInputs: Array.isArray(brain.lastInputs) ? brain.lastInputs.map(round4) : [],
+      lastOutputs: Array.isArray(brain.lastOutputs) ? brain.lastOutputs.map(round4) : [],
+    };
+  }
+
+  const inheritedWeights: number[][] = Array.isArray(brain?.inheritedWeights)
+    ? brain.inheritedWeights
+    : [];
+  const inheritedBiases: number[][] = Array.isArray(brain?.inheritedBiases)
+    ? brain.inheritedBiases
+    : [];
+  const learnedDeltaWeights: number[][] = Array.isArray(brain?.learnedDeltaWeights)
+    ? brain.learnedDeltaWeights
+    : [];
+  const learnedDeltaBiases: number[][] = Array.isArray(brain?.learnedDeltaBiases)
+    ? brain.learnedDeltaBiases
+    : [];
+
+  const layers = inheritedWeights.map((iw, idx) => ({
+    iw: (Array.isArray(iw) ? iw : []).map(round4),
+    ib: (Array.isArray(inheritedBiases[idx]) ? inheritedBiases[idx] : []).map(round4),
+    dw: (Array.isArray(learnedDeltaWeights[idx]) ? learnedDeltaWeights[idx] : []).map(round4),
+    db: (Array.isArray(learnedDeltaBiases[idx]) ? learnedDeltaBiases[idx] : []).map(round4),
   }));
+
   return {
-    architecture: { ...brain.architecture },
+    architecture: brain?.architecture
+      ? { ...brain.architecture }
+      : {
+          inputCount: 10,
+          hiddenLayers: [16, 12],
+          outputCount: 4,
+          activation: 'tanh',
+          recurrentMemoryEnabled: true,
+          attentionModuleEnabled: true,
+        },
     layers,
-    recurrentState: brain.recurrentState.map(round4),
-    attentionGates: brain.attentionGates.map(round4),
-    lastInputs: brain.lastInputs.map(round4),
-    lastOutputs: brain.lastOutputs.map(round4),
+    recurrentState: (Array.isArray(brain?.recurrentState) ? brain.recurrentState : []).map(round4),
+    attentionGates: (Array.isArray(brain?.attentionGates) ? brain.attentionGates : []).map(round4),
+    lastInputs: (Array.isArray(brain?.lastInputs) ? brain.lastInputs : []).map(round4),
+    lastOutputs: (Array.isArray(brain?.lastOutputs) ? brain.lastOutputs : []).map(round4),
   };
 }
 
@@ -649,31 +715,38 @@ export function setUserOnlineStatusInFirestore(
   });
 }
 
-export function serializeFishEntityToCloudBrainItem(f: FishEntity, lifespanHours = 24): CloudUserFishBrainItem {
+export function serializeFishEntityToCloudBrainItem(
+  f: FishEntity,
+  lifespanHours = 24
+): CloudUserFishBrainItem {
   return {
     fishId: f.lineage.fishId,
-    name: f.lineage.name,
+    name: f.lineage.name || 'Fish',
     speciesId: f.lineage.speciesId,
-    generation: f.lineage.generation,
-    modelVersion: f.lineage.modelVersion,
-    motherId: f.lineage.motherId,
-    fatherId: f.lineage.fatherId,
-    alive: f.lineage.alive,
-    causeOfDeath: f.lineage.causeOfDeath,
-    energy: Math.round(f.state.energy * 100) / 100,
-    hunger: Math.round(f.state.hunger * 100) / 100,
-    ageSimHours: Math.round(f.state.ageSimHours * 1000) / 1000,
-    lifespanSimHours: lifespanHours,
-    brain: toFirestoreSafeBrain(f.brain) as unknown as FishBrainInstance,
-    foragingEfficiency: Math.round(
-      (f.state.metrics.foodPelletsEaten /
-        Math.max(1, f.state.metrics.foragingAttempts)) *
-        1000
-    ) / 10,
-    lifetimeReward: Math.round(f.state.metrics.lifetimeReward * 100) / 100,
-    decisionsMade: f.state.metrics.decisionsMade,
-    foodPelletsEaten: f.state.metrics.foodPelletsEaten,
-    inheritedMutations: f.lineage.inheritedMutations.slice(0, 8),
+    generation: f.lineage.generation || 1,
+    modelVersion: f.lineage.modelVersion || 'v1.0-base',
+    motherId: f.lineage.motherId ?? null,
+    fatherId: f.lineage.fatherId ?? null,
+    alive: Boolean(f.lineage.alive),
+    causeOfDeath: f.lineage.causeOfDeath ?? null,
+    energy: Math.round((Number(f.state.energy) || 0) * 100) / 100,
+    hunger: Math.round((Number(f.state.hunger) || 0) * 100) / 100,
+    ageSimHours: Math.round((Number(f.state.ageSimHours) || 0) * 1000) / 1000,
+    lifespanSimHours: lifespanHours || 24,
+    // Keep a valid FishBrainInstance in memory so Trainer simulation & reproduction never fail
+    brain: fromFirestoreSafeBrain(f.brain),
+    foragingEfficiency:
+      Math.round(
+        ((f.state.metrics?.foodPelletsEaten || 0) /
+          Math.max(1, f.state.metrics?.foragingAttempts || 1)) *
+          1000
+      ) / 10,
+    lifetimeReward: Math.round((f.state.metrics?.lifetimeReward || 0) * 100) / 100,
+    decisionsMade: f.state.metrics?.decisionsMade || 0,
+    foodPelletsEaten: f.state.metrics?.foodPelletsEaten || 0,
+    inheritedMutations: Array.isArray(f.lineage.inheritedMutations)
+      ? f.lineage.inheritedMutations.slice(0, 8)
+      : [],
   };
 }
 
@@ -709,12 +782,16 @@ export function syncUserBrainsToFirestore(
           username: username || 'Keeper',
           profileId: profileId || 'default',
           updatedAtMs: now,
-          isActivelyPlaying,
+          isActivelyPlaying: Boolean(isActivelyPlaying),
           lastGameHeartbeatMs: isActivelyPlaying ? now : 0,
-          autoFeederStock,
-          fishBrains: filteredFishes
-            .slice(0, 50)
-            .map((f) => serializeFishEntityToCloudBrainItem(f, 24)),
+          autoFeederStock: Number(autoFeederStock || 0),
+          fishBrains: filteredFishes.slice(0, 50).map((f) => {
+            const item = serializeFishEntityToCloudBrainItem(f, 24);
+            return {
+              ...item,
+              brain: toFirestoreSafeBrain(item.brain),
+            };
+          }),
         };
 
         if (adminOverrideOpts?.adminOverrideAtMs) {
@@ -723,11 +800,24 @@ export function syncUserBrainsToFirestore(
         if (adminOverrideOpts?.lastAdminAction) {
           firestorePayload.lastAdminAction = adminOverrideOpts.lastAdminAction;
         }
-        if (adminOverrideOpts?.removedFishIds) {
-          firestorePayload.removedFishIds = adminOverrideOpts.removedFishIds.slice(-200);
+        if (Array.isArray(adminOverrideOpts?.removedFishIds)) {
+          firestorePayload.removedFishIds = adminOverrideOpts!.removedFishIds.slice(-200);
         }
 
-        await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), firestorePayload, {
+        const existingSnap = await getDoc(doc(aiFirestore, 'mypc_user_brains', docId));
+        if (existingSnap.exists()) {
+          const existingData = existingSnap.data() as any;
+          const remoteOverrideMs = Number(existingData?.adminOverrideAtMs || 0);
+          const localOverrideMs = Number(adminOverrideOpts?.adminOverrideAtMs || 0);
+          if (remoteOverrideMs > localOverrideMs) {
+            // Do not clobber a newer Admin Override in Firestore with stale game state!
+            resolve(false);
+            return;
+          }
+        }
+
+        const safePayload = stripUndefinedDeep(firestorePayload);
+        await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), safePayload, {
           merge: true,
         });
         resolve(true);
@@ -758,20 +848,28 @@ export async function saveAdminOverrideForUserInFirestore(
     let summary: string;
 
     if (typeof recordOrUsername === 'object' && recordOrUsername !== null) {
-      record = recordOrUsername;
-      summary = typeof profileIdOrActionSummary === 'string' ? profileIdOrActionSummary : 'Admin Override';
+      record = { ...recordOrUsername };
+      summary =
+        typeof profileIdOrActionSummary === 'string'
+          ? profileIdOrActionSummary
+          : 'Admin Override';
     } else {
       summary = actionSummary || 'Admin Override';
       record = {
-        username: String(recordOrUsername),
-        profileId: typeof profileIdOrActionSummary === 'string' ? profileIdOrActionSummary : 'local-caretaker',
+        username: String(recordOrUsername || 'Keeper'),
+        profileId:
+          typeof profileIdOrActionSummary === 'string'
+            ? profileIdOrActionSummary
+            : 'local-caretaker',
         updatedAtMs: Date.now(),
         isActivelyPlaying: Boolean(isActivelyPlaying),
         lastGameHeartbeatMs: isActivelyPlaying ? Date.now() : 0,
         autoFeederStock: Number(autoFeederStock || 0),
         fishBrains: Array.isArray(fishBrains) ? fishBrains : [],
-        removedFishIds: Array.isArray(removedFishIds) ? removedFishIds.slice(-200) : undefined,
       };
+      if (Array.isArray(removedFishIds)) {
+        record.removedFishIds = removedFishIds.slice(-200);
+      }
     }
 
     const docId = sanitizeKey(record.username);
@@ -782,25 +880,52 @@ export async function saveAdminOverrideForUserInFirestore(
     _lastCloudUserFirestoreWriteMs.set(docId, now);
 
     const removedSet = new Set(record.removedFishIds || []);
-    const cleanBrains = record.fishBrains.filter((fb) => !removedSet.has(fb.fishId));
+    const cleanBrains = (record.fishBrains || []).filter(
+      (fb) => fb && !removedSet.has(fb.fishId)
+    );
 
     const payload: Record<string, any> = {
-      ...record,
+      username: record.username || 'Keeper',
+      profileId: record.profileId || 'local-caretaker',
       updatedAtMs: now,
       adminOverrideAtMs: now,
       lastAdminAction: summary,
+      isActivelyPlaying: Boolean(record.isActivelyPlaying),
+      lastGameHeartbeatMs: record.isActivelyPlaying ? Number(record.lastGameHeartbeatMs || now) : 0,
+      autoFeederStock: Number(record.autoFeederStock || 0),
       fishBrains: cleanBrains.map((fb) => ({
-        ...fb,
+        fishId: fb.fishId,
+        name: fb.name || 'Fish',
+        speciesId: fb.speciesId,
+        generation: Number(fb.generation) || 1,
+        modelVersion: fb.modelVersion || 'v1.0-base',
+        motherId: fb.motherId ?? null,
+        fatherId: fb.fatherId ?? null,
+        alive: Boolean(fb.alive),
+        causeOfDeath: fb.causeOfDeath ?? null,
+        energy: Number(fb.energy) || 0,
+        hunger: Number(fb.hunger) || 0,
+        ageSimHours: Number(fb.ageSimHours) || 0.1,
+        lifespanSimHours: Number(fb.lifespanSimHours) || 24,
         brain: toFirestoreSafeBrain(fb.brain),
+        foragingEfficiency: Number(fb.foragingEfficiency) || 65,
+        lifetimeReward: Number(fb.lifetimeReward) || 0,
+        decisionsMade: Number(fb.decisionsMade) || 0,
+        foodPelletsEaten: Number(fb.foodPelletsEaten) || 0,
+        inheritedMutations: Array.isArray(fb.inheritedMutations)
+          ? fb.inheritedMutations.slice(0, 8)
+          : [],
       })),
     };
-    if (record.removedFishIds) {
+    if (Array.isArray(record.removedFishIds)) {
       payload.removedFishIds = record.removedFishIds.slice(-200);
     }
 
-    await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), payload, { merge: true });
+    const safePayload = stripUndefinedDeep(payload);
+    await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), safePayload, { merge: true });
     return true;
-  } catch {
+  } catch (err) {
+    console.error('[saveAdminOverrideForUserInFirestore] Failed to write override:', err);
     return false;
   }
 }
@@ -817,7 +942,9 @@ export async function loadUserBrainsFromFirestore(
     const snap = await getDoc(doc(aiFirestore, 'mypc_user_brains', docId));
     if (!snap.exists()) return null;
     const data = snap.data() as any;
-    const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
+    const removedSet = new Set<string>(
+      Array.isArray(data?.removedFishIds) ? data.removedFishIds : []
+    );
     return {
       ...data,
       removedFishIds: Array.from(removedSet),
@@ -835,7 +962,7 @@ export async function loadUserBrainsFromFirestore(
 
 /**
  * Real-time subscription to a SINGLE user's `mypc_user_brains/{username}` document.
- * Used by the player game (`App.tsx`) so if an Admin kills, revives, gives, or replaces a fish
+ * Used by the player game (`App.tsx`) so if an Admin kills, revives, gives, reproduces, or replaces a fish
  * while the player has the game open, the player's game immediately applies the change in real time!
  */
 export function subscribeToSingleUserBrainRecord(
@@ -844,29 +971,14 @@ export function subscribeToSingleUserBrainRecord(
 ): () => void {
   try {
     const docId = sanitizeKey(username);
-    let lastProcessedAdminTs = 0;
-    let lastProcessedUpdatedMs = 0;
     return onSnapshot(
       doc(aiFirestore, 'mypc_user_brains', docId),
       (snap) => {
-        if (!snap.exists() || snap.metadata.hasPendingWrites) return;
+        if (!snap.exists()) return;
         const data = snap.data() as any;
-        const adminTs = Number(data?.adminOverrideAtMs || 0);
-        const updatedMs = Number(data?.updatedAtMs || 0);
-        const lastSelfWriteMs = _lastCloudUserFirestoreWriteMs.get(docId) || 0;
-
-        // Ignore echo of our own player game write
-        const isSelfEcho = updatedMs > 0 && Math.abs(updatedMs - lastSelfWriteMs) < 1200 && adminTs <= lastProcessedAdminTs;
-        if (isSelfEcho) return;
-
-        const hasNewAdminOverride = adminTs > 0 && adminTs > lastProcessedAdminTs;
-        const hasNewExternalUpdate = updatedMs > 0 && updatedMs > lastProcessedUpdatedMs && Math.abs(updatedMs - lastSelfWriteMs) >= 1200;
-
-        if (!hasNewAdminOverride && !hasNewExternalUpdate) return;
-        if (adminTs > lastProcessedAdminTs) lastProcessedAdminTs = adminTs;
-        if (updatedMs > lastProcessedUpdatedMs) lastProcessedUpdatedMs = updatedMs;
-
-        const removedSet = new Set<string>(Array.isArray(data?.removedFishIds) ? data.removedFishIds : []);
+        const removedSet = new Set<string>(
+          Array.isArray(data?.removedFishIds) ? data.removedFishIds : []
+        );
         setTimeout(() => {
           onUpdate({
             ...data,
@@ -1039,18 +1151,32 @@ export async function stepAndSyncCloudUserOfflineFishes(
   if (shouldWriteToFirestore) {
     _lastCloudUserFirestoreWriteMs.set(docId, now);
     try {
-      await setDoc(
-        doc(aiFirestore, 'mypc_user_brains', docId),
-        {
-          ...record,
-          updatedAtMs: now,
-          fishBrains: record.fishBrains.map((fb) => ({
-            ...fb,
-            brain: toFirestoreSafeBrain(fb.brain),
-          })),
-        },
-        { merge: true }
-      );
+      const existingSnap = await getDoc(doc(aiFirestore, 'mypc_user_brains', docId));
+      if (existingSnap.exists()) {
+        const existingData = existingSnap.data() as any;
+        const remoteOverrideMs = Number(existingData?.adminOverrideAtMs || 0);
+        const localOverrideMs = Number(record.adminOverrideAtMs || 0);
+        if (remoteOverrideMs > localOverrideMs) {
+          return {
+            updatedLiveCount,
+            newlyStarvedNames,
+            usedOwnerAutoFeeder: !trainerAutoFeedOverride && ownerHasAutoFeeder,
+            wroteToFirestore: false,
+          };
+        }
+      }
+
+      const safePayload = stripUndefinedDeep({
+        ...record,
+        updatedAtMs: now,
+        fishBrains: record.fishBrains.map((fb) => ({
+          ...fb,
+          brain: toFirestoreSafeBrain(fb.brain),
+        })),
+      });
+      await setDoc(doc(aiFirestore, 'mypc_user_brains', docId), safePayload, {
+        merge: true,
+      });
       wroteToFirestore = true;
     } catch {
       // ignore transient offline

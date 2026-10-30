@@ -7,6 +7,10 @@ import { audioEngine } from './engine/audio';
 import { createBaseBrainInstance } from './engine/brain';
 import { DEFAULT_SPECIES_LIST, TANK_TIERS } from './engine/defaults';
 import {
+  createSpeciesConfigFromFamousFish,
+  FAMOUS_AQUARIUM_FISHES_50,
+} from './engine/famousFishCatalog';
+import {
   CloudUserBrainRecord,
   fetchBaseModelsFromFirestore,
   FIRESTORE_CHECKPOINT_INTERVAL_MS,
@@ -301,8 +305,9 @@ export default function App() {
         (cb) => cb && !mergedRemovedSet.has(cb.fishId)
       );
 
-      const overrideTs = cloudRecord.adminOverrideAtMs || 0;
-      const cloudUpdatedMs = cloudRecord.updatedAtMs || 0;
+      const overrideTs = Number(cloudRecord.adminOverrideAtMs || 0);
+      const cloudUpdatedMs = Number(cloudRecord.updatedAtMs || 0);
+      const isNewAdminOverride = overrideTs > lastAppliedAdminOverrideMsRef.current;
 
       // Detect if there is any structural difference between validCloudBrains and local fishes
       const localFishMap = new Map(eco.fishes.map((f) => [f.lineage.fishId, f]));
@@ -322,19 +327,17 @@ export default function App() {
         }
       }
 
-      const isNewAdminOverride = overrideTs > lastAppliedAdminOverrideMsRef.current;
-      const isNewCloudTimestamp =
-        cloudUpdatedMs > lastAppliedCloudUpdatedMsRef.current &&
-        cloudUpdatedMs > (eco.lastSavedAtMs || 0);
-
-      if (!isNewAdminOverride && !isNewCloudTimestamp && !hasStructuralDifference) {
+      // If neither a new admin override nor a newer cloud timestamp nor a structural difference, skip
+      if (!isNewAdminOverride && !hasStructuralDifference && cloudUpdatedMs <= lastAppliedCloudUpdatedMsRef.current) {
         return;
       }
+
+      // If there is a structural difference, only apply if it comes from a new admin override,
+      // an authoritative listener update, or a cloud record newer than our last local admin/user action
       if (
-        !isAuthoritativeOverride &&
         !isNewAdminOverride &&
-        !hasStructuralDifference &&
-        cloudUpdatedMs <= (eco.lastSavedAtMs || 0)
+        !isAuthoritativeOverride &&
+        overrideTs < (eco.adminOverrideAtMs || 0)
       ) {
         return;
       }
@@ -366,10 +369,18 @@ export default function App() {
 
       for (const cb of validCloudBrains) {
         const localFish = eco.fishes.find((f) => f.lineage.fishId === cb.fishId);
-        const sp =
-          eco.speciesList.find((s) => s.id === cb.speciesId) ||
-          eco.speciesList[0] ||
-          DEFAULT_SPECIES_LIST[0];
+
+        // Ensure species exists in eco.speciesList (including any of the 50 Famous Fishes gifted/replaced in Trainer!)
+        let sp = eco.speciesList.find((s) => s.id === cb.speciesId);
+        if (!sp) {
+          const famousTpl = FAMOUS_AQUARIUM_FISHES_50.find((f) => f.id === cb.speciesId);
+          if (famousTpl) {
+            sp = createSpeciesConfigFromFamousFish(famousTpl);
+            eco.speciesList.push(sp);
+          } else {
+            sp = eco.speciesList[0] || DEFAULT_SPECIES_LIST[0];
+          }
+        }
 
         if (localFish) {
           const wasAlive = localFish.lineage.alive;
@@ -415,6 +426,7 @@ export default function App() {
             cb.brain
           );
           spawned.lineage.fishId = cb.fishId;
+          spawned.lineage.speciesId = sp.id;
           spawned.lineage.name = cb.name;
           spawned.lineage.generation = cb.generation;
           spawned.lineage.modelVersion = cb.modelVersion;
@@ -435,7 +447,10 @@ export default function App() {
       eco.removedFishIds = Array.from(mergedRemovedSet).slice(-200);
       eco.acknowledgedDeadFishIds = Array.from(ackDeadSet).slice(-200);
 
-      saveEcosystemStateAsync(eco, 300);
+      // Save immediately to localStorage and reset periodic timers so the game never overwrites this cloud update
+      saveEcosystemState(eco);
+      lastLocalSaveMsRef.current = performance.now();
+      lastFirestoreSyncMsRef.current = performance.now();
       ecosystemRef.current = eco;
       setEcosystem({ ...eco });
 
@@ -574,6 +589,14 @@ export default function App() {
     [canTriggerControllerAction]
   );
 
+  const activeUsername = mypcInfo.profile?.name || mypc.info()?.profile?.name || 'Keeper';
+  const activeProfileId =
+    mypcInfo.profile?.id || mypc.info()?.profile?.id || 'local-caretaker';
+  const activeUsernameRef = useRef<string>(activeUsername);
+  activeUsernameRef.current = activeUsername;
+  const activeProfileIdRef = useRef<string>(activeProfileId);
+  activeProfileIdRef.current = activeProfileId;
+
   // ============================================================================
   // DYNAMIC 24/7 FISH KEEPER HAND-OFF & REAL-TIME ADMIN OVERRIDE SYNC
   // ============================================================================
@@ -581,61 +604,102 @@ export default function App() {
     const syncLatestFromStorage = () => {
       const latest = loadEcosystemState();
       latest.timeMultiplier = 1;
-      if ((latest.adminOverrideAtMs || 0) > lastAppliedAdminOverrideMsRef.current) {
-        lastAppliedAdminOverrideMsRef.current = latest.adminOverrideAtMs || Date.now();
+      const incomingOverrideMs = latest.adminOverrideAtMs || 0;
+      const currentOverrideMs = Math.max(
+        lastAppliedAdminOverrideMsRef.current,
+        ecosystemRef.current.adminOverrideAtMs || 0
+      );
+      // Only adopt storage state if it has a strictly newer adminOverrideAtMs than our current memory
+      if (incomingOverrideMs > currentOverrideMs) {
+        const prevAliveCount = ecosystemRef.current.fishes.filter((f) => f.lineage.alive).length;
+        const nextAliveCount = latest.fishes.filter((f) => f.lineage.alive).length;
+        const prevDeadIds = new Set(
+          ecosystemRef.current.fishes.filter((f) => !f.lineage.alive).map((f) => f.lineage.fishId)
+        );
+        const newlyDead = latest.fishes.filter(
+          (f) => !f.lineage.alive && !prevDeadIds.has(f.lineage.fishId)
+        );
+
+        lastAppliedAdminOverrideMsRef.current = incomingOverrideMs;
+        lastLocalSaveMsRef.current = performance.now();
+        lastFirestoreSyncMsRef.current = performance.now();
+        ecosystemRef.current = latest;
+        setEcosystem({ ...latest });
+
+        if (newlyDead.length > 0) {
+          audioEngine.playDeathWarningTone();
+        } else if (nextAliveCount >= prevAliveCount) {
+          audioEngine.playBirthChime();
+        }
+        if (latest.lastAdminAction) {
+          showToast(`Live Update: ${latest.lastAdminAction}`);
+        }
       }
-      ecosystemRef.current = latest;
-      setEcosystem({ ...latest });
     };
 
     const eco = ecosystemRef.current;
     const currentTank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
-    const username = mypc.info()?.profile?.name || 'Keeper';
-    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const uName = activeUsernameRef.current;
+    const pId = activeProfileIdRef.current;
     const feederCount = eco.autoFeederCountByTank[currentTank.id] || 0;
     const isVisibleAndPlaying =
       screenState === 'playing' &&
       (typeof document === 'undefined' || document.visibilityState === 'visible') &&
       !isForceOfflineOverrideActive();
 
-    if (isVisibleAndPlaying) {
-      const latest = loadEcosystemState();
-      latest.timeMultiplier = 1;
-      ecosystemRef.current = latest;
-      setEcosystem({ ...latest });
+    // Always read Firestore FIRST before writing so any Trainer action done while offline/unfocused is applied, never overwritten!
+    loadUserBrainsFromFirestore(uName).then((cloudRecord) => {
+      if (cloudRecord && Array.isArray(cloudRecord.fishBrains) && cloudRecord.fishBrains.length > 0) {
+        const hasAdminOverride =
+          (cloudRecord.adminOverrideAtMs || 0) > lastAppliedAdminOverrideMsRef.current ||
+          (cloudRecord.adminOverrideAtMs || 0) > (ecosystemRef.current.adminOverrideAtMs || 0);
+        if (hasAdminOverride || (cloudRecord.updatedAtMs || 0) > (ecosystemRef.current.lastSavedAtMs || 0)) {
+          applyCloudRecordToEcosystem(cloudRecord, true);
+        }
+      }
 
-      publishActiveGameSessionLease(currentTank.id, true);
-      // Single event write when game opens (not every second!)
-      syncUserBrainsToFirestore(username, profileId, latest.fishes, true, feederCount, {
-        removedFishIds: latest.removedFishIds,
-      });
-      lastFirestoreSyncMsRef.current = performance.now();
-    } else {
-      publishActiveGameSessionLease(currentTank.id, false);
-      setUserOnlineStatusInFirestore(username, profileId, false, feederCount);
-    }
+      const currentEco = ecosystemRef.current;
+      const tankNow = TANK_TIERS[currentEco.activeTankTier] || TANK_TIERS[0];
+      const fCount = currentEco.autoFeederCountByTank[tankNow.id] || 0;
 
-    // Subscribe to real-time authoritative admin overrides from Firestore (`mypc_user_brains/{username}`)
-    const unsubAdminOverride = subscribeToSingleUserBrainRecord(username, (record) => {
-      if (!record) return;
-      applyCloudRecordToEcosystem(record, true);
+      if (isVisibleAndPlaying) {
+        publishActiveGameSessionLease(tankNow.id, true);
+        syncUserBrainsToFirestore(uName, pId, currentEco.fishes, true, fCount, {
+          adminOverrideAtMs: currentEco.adminOverrideAtMs,
+          removedFishIds: currentEco.removedFishIds,
+        });
+        lastFirestoreSyncMsRef.current = performance.now();
+      } else {
+        publishActiveGameSessionLease(tankNow.id, false);
+        setUserOnlineStatusInFirestore(uName, pId, false, fCount);
+      }
     });
 
-    // Periodic 12-second cloud check so even if WebSockets throttle on TV, any Trainer action
+    // Subscribe to real-time authoritative admin overrides from Firestore (`mypc_user_brains/{username}`)
+    const unsubAdminOverride = subscribeToSingleUserBrainRecord(uName, (record) => {
+      if (!record) return;
+      const hasAdminOverride =
+        (record.adminOverrideAtMs || 0) > lastAppliedAdminOverrideMsRef.current;
+      applyCloudRecordToEcosystem(record, hasAdminOverride);
+    });
+
+    // Fast 4-second cloud poll so even if WebSockets throttle on TV, any Trainer action
     // (kill/starve, give fish, reproduce baby, or replace species) updates the online user ASAP!
     const cloudPollTimer = window.setInterval(() => {
-      const uName = mypc.info()?.profile?.name || 'Keeper';
-      loadUserBrainsFromFirestore(uName).then((cloudRecord) => {
+      const pollUser = activeUsernameRef.current;
+      loadUserBrainsFromFirestore(pollUser).then((cloudRecord) => {
         if (cloudRecord && Array.isArray(cloudRecord.fishBrains)) {
-          applyCloudRecordToEcosystem(cloudRecord, false);
+          const isOverride =
+            (cloudRecord.adminOverrideAtMs || 0) > lastAppliedAdminOverrideMsRef.current;
+          applyCloudRecordToEcosystem(cloudRecord, isOverride);
         }
       });
-    }, 12000);
+    }, 4000);
 
     const handleVisibilityOrFocus = () => {
       const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
-      const uName = mypc.info()?.profile?.name || 'Keeper';
-      const pId = mypc.info()?.profile?.id || 'local-caretaker';
+      const curUser = activeUsernameRef.current;
+      const curPid = activeProfileIdRef.current;
       const visible =
         typeof document !== 'undefined' &&
         document.visibilityState === 'visible' &&
@@ -643,45 +707,39 @@ export default function App() {
         !isForceOfflineOverrideActive();
 
       if (visible) {
-        const latest = loadEcosystemState();
-        latest.timeMultiplier = 1;
-        ecosystemRef.current = latest;
-        setEcosystem({ ...latest });
-        const fCount = latest.autoFeederCountByTank[tankNow.id] || 0;
         publishActiveGameSessionLease(tankNow.id, true);
-        syncUserBrainsToFirestore(uName, pId, latest.fishes, true, fCount, {
-          removedFishIds: latest.removedFishIds,
-        });
-        lastFirestoreSyncMsRef.current = performance.now();
-        loadUserBrainsFromFirestore(uName).then((cloudRecord) => {
+        // Read Firestore FIRST on focus/visibility so we never overwrite a Trainer override!
+        loadUserBrainsFromFirestore(curUser).then((cloudRecord) => {
           if (cloudRecord && Array.isArray(cloudRecord.fishBrains)) {
-            applyCloudRecordToEcosystem(cloudRecord, false);
+            const isOverride =
+              (cloudRecord.adminOverrideAtMs || 0) > lastAppliedAdminOverrideMsRef.current;
+            applyCloudRecordToEcosystem(cloudRecord, isOverride);
           }
+          const latestEco = ecosystemRef.current;
+          const fCount = latestEco.autoFeederCountByTank[tankNow.id] || 0;
+          setUserOnlineStatusInFirestore(curUser, curPid, true, fCount);
+          lastFirestoreSyncMsRef.current = performance.now();
         });
       } else {
         saveEcosystemState(ecosystemRef.current);
         const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
         publishActiveGameSessionLease(tankNow.id, false);
-        syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount, {
-          removedFishIds: ecosystemRef.current.removedFishIds,
-        });
+        setUserOnlineStatusInFirestore(curUser, curPid, false, fCount);
       }
     };
 
     const handlePageHide = () => {
       const tankNow = TANK_TIERS[ecosystemRef.current.activeTankTier] || TANK_TIERS[0];
-      const uName = mypc.info()?.profile?.name || 'Keeper';
-      const pId = mypc.info()?.profile?.id || 'local-caretaker';
+      const curUser = activeUsernameRef.current;
+      const curPid = activeProfileIdRef.current;
       const fCount = ecosystemRef.current.autoFeederCountByTank[tankNow.id] || 0;
       saveEcosystemState(ecosystemRef.current);
       publishActiveGameSessionLease(tankNow.id, false);
-      syncUserBrainsToFirestore(uName, pId, ecosystemRef.current.fishes, false, fCount, {
-        removedFishIds: ecosystemRef.current.removedFishIds,
-      });
+      setUserOnlineStatusInFirestore(curUser, curPid, false, fCount);
     };
 
     const handleStorageEvent = (ev: StorageEvent) => {
-      if (!ev.key || ev.key.includes('ecosystem_v2') || ev.key.includes('abyssal_evo')) {
+      if (ev.key && ev.key.includes('ecosystem_v2')) {
         syncLatestFromStorage();
       }
     };
@@ -714,7 +772,7 @@ export default function App() {
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
       publishActiveGameSessionLease(currentTank.id, false);
     };
-  }, [screenState, ecosystem.activeTankTier, mypc, applyCloudRecordToEcosystem]);
+  }, [screenState, ecosystem.activeTankTier, activeUsername, mypc, applyCloudRecordToEcosystem]);
 
   // Sprinkle food across the TOP water surface (just like a real aquarium owner)
   // 100% non-blocking: no synchronous localStorage JSON.stringify or Firestore writes on food drop!
@@ -837,10 +895,13 @@ export default function App() {
     setEcosystem({ ...eco });
     audioEngine.playBirthChime();
 
-    const username = mypc.info()?.profile?.name || 'Keeper';
-    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const username = activeUsernameRef.current;
+    const profileId = activeProfileIdRef.current;
     const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
-    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount, {
+      adminOverrideAtMs: eco.adminOverrideAtMs,
+      removedFishIds: eco.removedFishIds,
+    });
 
     showToast(
       xpRes.leveledUp
@@ -915,9 +976,12 @@ export default function App() {
     setEcosystem({ ...eco });
     audioEngine.playTankUpgrade();
 
-    const username = mypc.info()?.profile?.name || 'Keeper';
-    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
-    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, currentCount + 1);
+    const username = activeUsernameRef.current;
+    const profileId = activeProfileIdRef.current;
+    syncUserBrainsToFirestore(username, profileId, eco.fishes, true, currentCount + 1, {
+      adminOverrideAtMs: eco.adminOverrideAtMs,
+      removedFishIds: eco.removedFishIds,
+    });
 
     showToast(
       `Installed Top Auto-Feeder #${currentCount + 1} (${
@@ -942,14 +1006,18 @@ export default function App() {
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
     const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
-    const username = mypc.info()?.profile?.name || 'Keeper';
-    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const username = activeUsernameRef.current;
+    const profileId = activeProfileIdRef.current;
     syncUserBrainsToFirestore(
       username,
       profileId,
       eco.fishes,
       true,
-      eco.autoFeederCountByTank[tank.id] || 0
+      eco.autoFeederCountByTank[tank.id] || 0,
+      {
+        adminOverrideAtMs: eco.adminOverrideAtMs,
+        removedFishIds: eco.removedFishIds,
+      }
     );
     showToast('Added a new pair of starter fishes to your aquarium.');
   };
@@ -979,8 +1047,8 @@ export default function App() {
       saveEcosystemState(eco);
       setEcosystem({ ...eco });
       const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
-      const username = mypc.info()?.profile?.name || 'Keeper';
-      const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+      const username = activeUsernameRef.current;
+      const profileId = activeProfileIdRef.current;
       syncUserBrainsToFirestore(
         username,
         profileId,
@@ -1024,8 +1092,8 @@ export default function App() {
     saveEcosystemState(eco);
     setEcosystem({ ...eco });
     const tank = TANK_TIERS[eco.activeTankTier] || TANK_TIERS[0];
-    const username = mypc.info()?.profile?.name || 'Keeper';
-    const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+    const username = activeUsernameRef.current;
+    const profileId = activeProfileIdRef.current;
     syncUserBrainsToFirestore(
       username,
       profileId,
@@ -1527,8 +1595,8 @@ export default function App() {
         });
 
         // 2. Load owner's individual fish brains from Firestore (`mypc_user_brains`)
-        const username = info.profile?.name || 'Keeper';
-        loadUserBrainsFromFirestore(username).then((cloudRecord) => {
+        const initUsername = info.profile?.name || 'Keeper';
+        loadUserBrainsFromFirestore(initUsername).then((cloudRecord) => {
           if (
             cloudRecord &&
             Array.isArray(cloudRecord.fishBrains) &&
@@ -1536,11 +1604,8 @@ export default function App() {
           ) {
             const eco = ecosystemRef.current;
             const hasNewerAdminOverride =
-              (cloudRecord.adminOverrideAtMs || 0) > (eco.adminOverrideAtMs || 0) ||
-              (cloudRecord.adminOverrideAtMs || 0) > (eco.lastSavedAtMs || 0);
-            if (hasNewerAdminOverride || (cloudRecord.updatedAtMs || 0) > (eco.lastSavedAtMs || 0)) {
-              applyCloudRecordToEcosystem(cloudRecord, hasNewerAdminOverride);
-            }
+              (cloudRecord.adminOverrideAtMs || 0) > (eco.adminOverrideAtMs || 0);
+            applyCloudRecordToEcosystem(cloudRecord, hasNewerAdminOverride);
           }
         });
 
@@ -1861,10 +1926,13 @@ export default function App() {
           mypc.submitScore(maxGen * 100 + eco.bioCredits);
           saveEcosystemStateAsync(eco, 400);
           setEcosystem({ ...eco });
-          const username = mypc.info()?.profile?.name || 'Keeper';
-          const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+          const username = activeUsernameRef.current;
+          const profileId = activeProfileIdRef.current;
           const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
-          syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+          syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount, {
+            adminOverrideAtMs: eco.adminOverrideAtMs,
+            removedFishIds: eco.removedFishIds,
+          });
           showToast(
             `${mother.lineage.name} naturally hatched baby ${child.lineage.name} (Gen ${child.lineage.generation})!`
           );
@@ -1877,10 +1945,11 @@ export default function App() {
 
           saveEcosystemStateAsync(eco, 400);
           setEcosystem({ ...eco });
-          const username = mypc.info()?.profile?.name || 'Keeper';
-          const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+          const username = activeUsernameRef.current;
+          const profileId = activeProfileIdRef.current;
           const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
           syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount, {
+            adminOverrideAtMs: eco.adminOverrideAtMs,
             removedFishIds: eco.removedFishIds,
           });
           if (!alreadyWarned) {
@@ -1903,10 +1972,13 @@ export default function App() {
 
       if (nowMs - lastFirestoreSyncMsRef.current > FIRESTORE_CHECKPOINT_INTERVAL_MS) {
         lastFirestoreSyncMsRef.current = nowMs;
-        const username = mypc.info()?.profile?.name || 'Keeper';
-        const profileId = mypc.info()?.profile?.id || 'local-caretaker';
+        const username = activeUsernameRef.current;
+        const profileId = activeProfileIdRef.current;
         const feederCount = eco.autoFeederCountByTank[tank.id] || 0;
-        syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount);
+        syncUserBrainsToFirestore(username, profileId, eco.fishes, true, feederCount, {
+          adminOverrideAtMs: eco.adminOverrideAtMs,
+          removedFishIds: eco.removedFishIds,
+        });
       }
     },
     [
@@ -2362,7 +2434,7 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-400 font-bold">
-                      ABYSSAL EVO v1.7.4 // TV LITE HUD
+                      ABYSSAL EVO v1.7.5 // TV LITE HUD
                     </span>
                     <span className="px-1.5 py-0.5 rounded bg-[#062e22] border border-emerald-400 text-[10px] font-mono font-bold text-emerald-300">
                       CLOUD SYNC
